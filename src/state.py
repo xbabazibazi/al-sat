@@ -23,11 +23,14 @@ class Position:
     symbol: str
     qty: float
     entry_price: float
-    highest_price: float
+    highest_price: float                   # long: en yüksek, short: en düşük görülen fiyat (uç değer)
     trailing_stop: float
-    stop_order_id: Optional[int]          # borsadaki STOP_LOSS_LIMIT emrinin id'si
+    stop_order_id: Optional[int]          # borsadaki STOP_LOSS_LIMIT emrinin id'si (paper modda None)
     entry_time: str                        # ISO-8601 UTC
     entry_fee_usdt: float = 0.0
+    side: str = "LONG"                     # "LONG" | "SHORT"
+    margin: float = 0.0                    # vadeli paper modda kilitli marjin (USDT)
+    funding_acc: float = 0.0               # tahakkuk eden funding maliyeti (USDT)
 
 
 class StateStore:
@@ -57,12 +60,27 @@ class StateStore:
                     qty REAL, pnl_usdt REAL, pnl_pct REAL,
                     exit_reason TEXT
                 );
+                CREATE TABLE IF NOT EXISTS equity_history (
+                    ts TEXT PRIMARY KEY,
+                    equity REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS assessments (
+                    symbol TEXT PRIMARY KEY,
+                    ts TEXT NOT NULL,
+                    data TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS kv (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
                 """
             )
+        # göç: eski kurulumlardaki trades tablosuna side sütunu ekle
+        try:
+            with self._conn:
+                self._conn.execute("ALTER TABLE trades ADD COLUMN side TEXT DEFAULT 'LONG'")
+        except sqlite3.OperationalError:
+            pass  # sütun zaten var
 
     # ---------------------------------------------------------------- pozisyon
     def get_position(self, symbol: str) -> Optional[Position]:
@@ -100,16 +118,65 @@ class StateStore:
     def record_trade(
         self, symbol: str, entry_time: str, exit_time: str,
         entry_price: float, exit_price: float, qty: float, exit_reason: str,
+        side: str = "LONG", pnl_override: Optional[float] = None,
     ) -> tuple[float, float]:
-        pnl_usdt = (exit_price - entry_price) * qty
-        pnl_pct = (exit_price / entry_price - 1.0) * 100.0 if entry_price else 0.0
+        if side == "SHORT":
+            pnl_usdt = (entry_price - exit_price) * qty
+            pnl_pct = (entry_price / exit_price - 1.0) * 100.0 if exit_price else 0.0
+        else:
+            pnl_usdt = (exit_price - entry_price) * qty
+            pnl_pct = (exit_price / entry_price - 1.0) * 100.0 if entry_price else 0.0
+        if pnl_override is not None:
+            pnl_usdt = pnl_override  # komisyon+funding dahil net değer (vadeli paper mod)
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO trades(symbol, entry_time, exit_time, entry_price, exit_price,"
-                " qty, pnl_usdt, pnl_pct, exit_reason) VALUES(?,?,?,?,?,?,?,?,?)",
-                (symbol, entry_time, exit_time, entry_price, exit_price, qty, pnl_usdt, pnl_pct, exit_reason),
+                " qty, pnl_usdt, pnl_pct, exit_reason, side) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (symbol, entry_time, exit_time, entry_price, exit_price, qty, pnl_usdt, pnl_pct,
+                 exit_reason, side),
             )
         return pnl_usdt, pnl_pct
+
+    def recent_trades(self, limit: int = 30) -> list[dict]:
+        cur = self._conn.execute(
+            "SELECT symbol, side, entry_time, exit_time, entry_price, exit_price,"
+            " qty, pnl_usdt, pnl_pct, exit_reason FROM trades ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    # ------------------------------------------------------------ varlık geçmişi
+    def record_equity(self, ts_iso: str, equity: float) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO equity_history(ts, equity) VALUES(?, ?) "
+                "ON CONFLICT(ts) DO UPDATE SET equity=excluded.equity",
+                (ts_iso, equity),
+            )
+
+    def equity_history(self, limit: int = 600) -> list[tuple[str, float]]:
+        cur = self._conn.execute(
+            "SELECT ts, equity FROM equity_history ORDER BY ts DESC LIMIT ?", (limit,)
+        )
+        return list(reversed(cur.fetchall()))
+
+    def all_positions(self) -> list[Position]:
+        cur = self._conn.execute("SELECT data FROM positions")
+        return [Position(**json.loads(r[0])) for r in cur.fetchall()]
+
+    # -------------------------------------------------------- ön değerlendirmeler
+    def save_assessment(self, symbol: str, ts_iso: str, data_json: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO assessments(symbol, ts, data) VALUES(?,?,?) "
+                "ON CONFLICT(symbol) DO UPDATE SET ts=excluded.ts, data=excluded.data",
+                (symbol, ts_iso, data_json),
+            )
+
+    def latest_assessments(self) -> list[dict]:
+        cur = self._conn.execute("SELECT symbol, ts, data FROM assessments ORDER BY symbol")
+        return [{"symbol": s, "ts": t, **json.loads(d)} for s, t, d in cur.fetchall()]
 
     def todays_realized_pnl(self) -> float:
         today = datetime.now(timezone.utc).date().isoformat()

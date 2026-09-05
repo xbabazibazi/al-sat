@@ -41,7 +41,19 @@ class StrategyParams:
 
 @dataclass(frozen=True)
 class Config:
-    mode: str = _env("BOT_MODE", "dry_run").lower()          # dry_run | testnet | live
+    mode: str = _env("BOT_MODE", "dry_run").lower()  # dry_run | testnet | live | futures_paper
+
+    # ---- Vadeli işlem (futures_paper) ayarları ----
+    # Backtest kanıtı (2022-2026): kaldıraç pozisyonu BÜYÜTMEZ (boyutu risk belirler),
+    # yalnızca bakiye tavanını gevşetir; 2x'te BTC +%63/Sharpe 1.00, likidasyon 0.
+    # SHORT tarafı 9/9 konfigürasyonda ZARAR etti -> varsayılan kapalı.
+    leverage: float = float(_env("LEVERAGE", "2"))
+    allow_long: bool = _env("ALLOW_LONG", "true").lower() == "true"
+    allow_short: bool = _env("ALLOW_SHORT", "false").lower() == "true"
+    futures_taker_fee: float = 0.0005          # USDT-M taker %0.05
+    funding_daily_long: float = 0.0003         # long öder: ~%0.01/8s
+    funding_daily_short: float = 0.00015       # muhafazakâr short varsayımı
+    panel_port: int = int(_env("PANEL_PORT", "8484"))
     symbols: tuple[str, ...] = tuple(
         s.strip().upper() for s in _env("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if s.strip()
     )
@@ -81,8 +93,10 @@ class Config:
     strategy: StrategyParams = field(default_factory=StrategyParams)
 
     def validate(self) -> None:
-        if self.mode not in ("dry_run", "testnet", "live"):
+        if self.mode not in ("dry_run", "testnet", "live", "futures_paper"):
             raise ValueError(f"Geçersiz BOT_MODE: {self.mode}")
+        if self.mode == "futures_paper" and not (1 <= self.leverage <= 5):
+            raise ValueError("LEVERAGE 1-5 arasında olmalı — üstü backtest'te değer üretmedi, risk üretti")
         if self.mode == "testnet" and not (self.testnet_key and self.testnet_secret):
             raise ValueError("testnet modu için BINANCE_TESTNET_KEY/SECRET gerekli (testnet.binance.vision)")
         if self.mode == "live" and not (self.live_key and self.live_secret):

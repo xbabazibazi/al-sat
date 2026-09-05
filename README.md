@@ -57,6 +57,29 @@ Aynı taramayı ETHUSDT ve SOLUSDT için de çalıştırıp tutarlılığa bakı
   −25 puan) → varsayılan KAPALI (`USE_DAILY_FILTER=true` ile denenebilir).
 - 1 saatlik dilim her kombinasyonda komisyona yenildi → 4h kullanın.
 
+### 2a. Vadeli işlem paper modu + canlı panel (kaldıraç & long/short)
+
+```bash
+# .env -> BOT_MODE=futures_paper  (varsayılan: 2x kaldıraç, sadece long)
+python -m src.main     # bot
+python -m src.panel    # panel: http://localhost:8484
+```
+
+Gerçek fiyat + gerçek USDT-M komisyon/funding matematiği, sanal 10.000 USDT.
+Panel: anlık pozisyon kâr/zararı, varlık eğrisi, işlem geçmişi ve **ön
+değerlendirme** kartı (5 araçlı analiz — incelemesiz hiçbir işleme girilmez,
+her karar veritabanına yazılır). Stop-loss her pozisyonda zorunludur;
+stop'suz pozisyon yapısal olarak açılamaz.
+
+**Vadeli işlem backtest kararları (2022–2026, 4h):**
+- Kaldıraç pozisyonu BÜYÜTMEZ (boyutu %2 risk kuralı belirler); 2x yalnızca
+  bakiye tavanını gevşetir → BTC +%63/Sharpe 1.00/likidasyon 0. 3x+ hiçbir şey
+  eklemez. `LEVERAGE=2` varsayılan, 5 üstü config tarafından reddedilir.
+- SHORT tarafı 9/9 konfigürasyonda zarar etti (günlük ayı filtresiyle bile) →
+  `ALLOW_SHORT=false` varsayılan. Paper modda `true` yapıp risksiz izleyebilirsiniz.
+- Ön değerlendirme eşiği `ANALYSIS_THRESHOLD` (varsayılan 50 = katı): SOL'da
+  +10p ve DD yarıya, BTC/ETH'de getiri kırpıyor — güvenlik/getiri dengesi.
+
 ### 2. Dry-run — API anahtarı olmadan canlı sinyal takibi
 
 `.env` → `BOT_MODE=dry_run` (varsayılan). Gerçek fiyatlarla sinyal üretir,

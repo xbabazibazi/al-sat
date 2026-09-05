@@ -52,6 +52,10 @@ def compute_indicators(df: pd.DataFrame, p: StrategyParams) -> pd.DataFrame:
     out["atr"] = atr_wilder(out["high"], out["low"], out["close"], p.atr_period)
     # shift(1): kırılım kanalı MEVCUT barı içermez (look-ahead önlenir)
     out["donchian_high"] = out["high"].rolling(p.donchian_period).max().shift(1)
+    out["donchian_low"] = out["low"].rolling(p.donchian_period).min().shift(1)
+    # Ön değerlendirme araçları için: trend eğimi (ATR birimiyle) ve volatilite yüzdesi
+    out["ema_slope"] = (out["ema_trend"] - out["ema_trend"].shift(10)) / out["atr"]
+    out["atr_pct"] = out["atr"] / out["close"] * 100.0
     return out
 
 
@@ -103,6 +107,27 @@ def check_entry(row: pd.Series, p: StrategyParams) -> EntrySignal:
 
     if in_uptrend and breakout and rsi_ok and daily_ok:
         return EntrySignal(True, close, float(row["atr"]), "EMA200 üzeri + Donchian kırılımı + günlük trend")
+    return EntrySignal(False, close, float(row["atr"]))
+
+
+def check_entry_short(row: pd.Series, p: StrategyParams) -> EntrySignal:
+    """Short girişi — long kurallarının aynadaki yansıması:
+    EMA200 ALTINDA trend + Donchian ALT bandı kırılımı + aşırı satımda değil."""
+    close = float(row["close"])
+    needed = (row["ema_trend"], row["rsi"], row["atr"], row["donchian_low"])
+    if any(pd.isna(v) for v in needed):
+        return EntrySignal(False, close, float("nan"), "indikatör ısınması tamamlanmadı")
+
+    in_downtrend = close < float(row["ema_trend"])
+    breakdown = close < float(row["donchian_low"])
+    rsi_ok = float(row["rsi"]) > (100.0 - p.rsi_max_entry)  # dip kapitülasyonunda girme
+
+    daily_ok = True
+    if p.use_daily_filter and "daily_uptrend" in row.index:
+        daily_ok = not bool(row["daily_uptrend"])  # short için günlük trend de aşağı olmalı
+
+    if in_downtrend and breakdown and rsi_ok and daily_ok:
+        return EntrySignal(True, close, float(row["atr"]), "EMA200 altı + Donchian aşağı kırılımı")
     return EntrySignal(False, close, float(row["atr"]))
 
 

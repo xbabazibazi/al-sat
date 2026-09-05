@@ -14,6 +14,7 @@ from logging.handlers import RotatingFileHandler
 
 from .config import CONFIG
 from .exchange import MarketData, build_broker
+from .futures_trader import FuturesPaperTrader, snapshot_equity
 from .notifier import TelegramNotifier
 from .risk import CircuitBreaker
 from .state import StateStore
@@ -53,22 +54,30 @@ def main() -> None:
 
     market = MarketData()
     state = StateStore(CONFIG.db_path)
-    broker = build_broker(CONFIG, market, state)
     notifier = TelegramNotifier(CONFIG.telegram_token, CONFIG.telegram_chat_id)
     breaker = CircuitBreaker(state, CONFIG.max_daily_loss_pct)
 
-    traders = [
-        SymbolTrader(sym, CONFIG, market, broker, state, notifier, breaker)
-        for sym in CONFIG.symbols
-    ]
-
-    # Açılış mutabakatı: kayıtlı durum ile borsa gerçeğini eşitle
-    for t in traders:
-        try:
-            t.reconcile()
-        except Exception as e:
-            log.error("[%s] Mutabakat hatası: %s", t.symbol, e)
-            notifier.send_error(f"{t.symbol} mutabakat hatası: {e}")
+    futures_mode = CONFIG.mode == "futures_paper"
+    if futures_mode:
+        traders = [
+            FuturesPaperTrader(sym, CONFIG, market, state, notifier, breaker)
+            for sym in CONFIG.symbols
+        ]
+        log.info("Vadeli PAPER mod | kaldıraç=%.0fx | long=%s short=%s | panel: python -m src.panel",
+                 CONFIG.leverage, CONFIG.allow_long, CONFIG.allow_short)
+    else:
+        broker = build_broker(CONFIG, market, state)
+        traders = [
+            SymbolTrader(sym, CONFIG, market, broker, state, notifier, breaker)
+            for sym in CONFIG.symbols
+        ]
+        # Açılış mutabakatı: kayıtlı durum ile borsa gerçeğini eşitle
+        for t in traders:
+            try:
+                t.reconcile()
+            except Exception as e:
+                log.error("[%s] Mutabakat hatası: %s", t.symbol, e)
+                notifier.send_error(f"{t.symbol} mutabakat hatası: {e}")
 
     notifier.send(
         f"🤖 *Bot başlatıldı* | mod: `{CONFIG.mode}` | "
@@ -85,9 +94,12 @@ def main() -> None:
             time.sleep(1)  # semboller arası kısa es — rate limit nezaketi
 
         try:
-            maybe_send_daily_report(CONFIG, market, broker, state, notifier)
+            if futures_mode:
+                snapshot_equity(traders, state)  # panel varlık grafiği için
+            else:
+                maybe_send_daily_report(CONFIG, market, broker, state, notifier)
         except Exception as e:
-            log.error("Günlük rapor hatası: %s", e)
+            log.error("Dönem sonu görev hatası: %s", e)
 
         if args.once:
             log.info("--once: tek tur tamamlandı, çıkılıyor.")
