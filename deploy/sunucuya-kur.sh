@@ -49,19 +49,44 @@ echo "[4/5] Veri klasörü hazır"
 # 5) Derle ve başlat
 echo "[5/5] Konteyner derleniyor ve başlatılıyor..."
 docker compose up -d --build
-sleep 6
+
+# Panelin ayağa kalkmasını bekle
+echo -n "      panel bekleniyor"
+for i in $(seq 1 30); do
+  if curl -fsS "http://${TS_IP}:8484/api/state" >/dev/null 2>&1; then
+    echo " -> hazır"
+    break
+  fi
+  echo -n "."
+  sleep 2
+done
+
+# BOTU OTOMATİK BAŞLAT — kullanıcının panele girip BAŞLAT'a basmasına gerek yok.
+# Bir kez başlatılınca watchdog + restart:always sayesinde DURDUR denene kadar çalışır.
+if curl -fsS -X POST "http://${TS_IP}:8484/api/start" >/dev/null 2>&1; then
+  echo "      bot otomatik başlatıldı"
+else
+  echo "      UYARI: bot otomatik başlatılamadı — panelden BAŞLAT'a basın"
+fi
+
+sleep 8
 docker compose ps
+echo
+echo "--- Bot durumu ---"
+curl -fsS "http://${TS_IP}:8484/api/state" 2>/dev/null \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); print(f\"  çalışıyor: {d['bot_running']} | mod: {d['mode']} | {d['leverage']}x | varlık: \${d['equity']}\")" \
+  2>/dev/null || true
 
 echo
 echo "=================================================="
-echo "  KURULUM TAMAM"
+echo "  KURULUM TAMAM — BOT ÇALIŞIYOR"
 echo "=================================================="
 echo "  Panel : http://${TS_IP}:8484"
 echo "  Log   : docker compose logs -f"
 echo
-echo "  Panelde ▶ BAŞLAT'a bas — bot çalışır ve sen DURDUR"
-echo "  demedikçe durmaz. Sunucu yeniden başlasa bile"
-echo "  konteyner + watchdog botu otomatik ayağa kaldırır."
+echo "  Bot zaten başlatıldı. Sen DURDUR demedikçe durmaz."
+echo "  Sunucu yeniden başlasa bile konteyner + watchdog"
+echo "  botu otomatik ayağa kaldırır."
 echo
 echo "  Güvenlik: root olmayan kullanıcı, salt-okunur dosya"
 echo "  sistemi, tüm yetenekler düşürülmüş, port yalnızca"
