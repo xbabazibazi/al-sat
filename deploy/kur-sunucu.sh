@@ -20,33 +20,56 @@ echo "=================================================="
 # ---------- 1) Python bağımlılıkları (sudo YOK) ----------
 echo "[1/5] Python bağımlılıkları kuruluyor..."
 PY=""
+
+# 1a) Sanal ortam denenir (varsa en temizi)
 if python3 -m venv .venv >/dev/null 2>&1 && [ -x .venv/bin/pip ]; then
-  ./.venv/bin/pip install --quiet --upgrade pip >/dev/null 2>&1
-  if ./.venv/bin/pip install --quiet -r requirements.txt; then
+  if ./.venv/bin/pip install --quiet --upgrade pip >/dev/null 2>&1 \
+     && ./.venv/bin/pip install --quiet -r requirements.txt; then
     PY="${PROJE}/.venv/bin/python"
     echo "      sanal ortam kullanılıyor"
   fi
 fi
 
+# 1b) venv yoksa: pip'i kullanıcıya kur (sudo gerekmez), sonra paketleri kur
 if [ -z "$PY" ]; then
   rm -rf .venv 2>/dev/null
-  echo "      sanal ortam yok (python3-venv eksik) -> kullanıcı-yerel kurulum"
-  if python3 -m pip install --user --quiet -r requirements.txt 2>/dev/null; then
-    PY="python3"
-  elif python3 -m pip install --user --break-system-packages --quiet -r requirements.txt 2>/dev/null; then
+  echo "      sanal ortam yok -> kullanıcı-yerel kurulum deneniyor"
+
+  if ! python3 -m pip --version >/dev/null 2>&1; then
+    echo "      pip yok, kullanıcı için kuruluyor (get-pip)..."
+    curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py \
+      && python3 /tmp/get-pip.py --user 2>&1 | tail -n 3
+    export PATH="$HOME/.local/bin:$PATH"
+  fi
+
+  if ! python3 -m pip --version >/dev/null 2>&1; then
+    echo
+    echo "HATA: pip kurulamadı. Sunucuda şunu bir kez çalıştırın:"
+    echo "  sudo apt install -y python3-pip python3-venv"
+    echo "(şifre sorulacak; sonra kurulum komutunu tekrar çalıştırın)"
+    exit 1
+  fi
+
+  echo "      paketler kuruluyor..."
+  if python3 -m pip install --user --quiet -r requirements.txt; then
     PY="python3"
   else
-    echo "HATA: bağımlılıklar kurulamadı."
-    echo "      Sunucuda şunu elle çalıştırın:"
-    echo "        sudo apt install -y python3-venv python3-pip"
-    echo "      sonra bu betiği tekrar çalıştırın."
-    exit 1
+    echo "      (PEP 668 olabilir, --break-system-packages ile tekrar deneniyor)"
+    if python3 -m pip install --user --break-system-packages --quiet -r requirements.txt; then
+      PY="python3"
+    else
+      echo
+      echo "HATA: bağımlılıklar kurulamadı. Yukarıdaki pip çıktısına bakın."
+      exit 1
+    fi
   fi
   echo "      sistem python + kullanıcı paketleri kullanılıyor"
 fi
 
-"$PY" -c "import pandas, requests, dotenv" 2>/dev/null || {
-  echo "HATA: paketler içe aktarılamıyor."; exit 1; }
+if ! "$PY" -c "import pandas, requests, dotenv" 2>&1; then
+  echo "HATA: paketler içe aktarılamıyor (yukarıdaki mesaja bakın)."
+  exit 1
+fi
 echo "      $($PY --version) hazır"
 
 # ---------- 2) .env ----------
