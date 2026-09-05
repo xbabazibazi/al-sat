@@ -28,7 +28,7 @@ class StrategyParams:
     ema_period: int = 200
     rsi_period: int = 14
     atr_period: int = 14
-    donchian_period: int = 20          # kırılım (breakout) kanalı
+    donchian_period: int = int(_env("DONCHIAN_PERIOD", "20"))  # kırılım kanalı (10=aktif, 20=sabırlı)
     atr_multiplier: float = float(_env("ATR_MULTIPLIER", "3.0"))  # 2022-2026 taramasında sağlam bölge
     rsi_max_entry: float = 80.0        # aşırı alımda (blow-off) girişleri engelle
     warmup_bars: int = 220             # EMA200'ün oturması için gereken minimum bar
