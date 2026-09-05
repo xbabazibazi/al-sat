@@ -99,6 +99,20 @@ class FuturesPaperTrader:
                 self._close(pos, pos.trailing_stop * slip, "izleyen stop")
                 pos = None
 
+        # 1b) GÜNLÜK SERMAYE STOP'U: günlük zarar limiti aşıldıysa pozisyonları
+        # kapat ve günü bitir (yalnızca yeni girişleri kesmekle kalmaz).
+        if pos is not None:
+            today = datetime.now(timezone.utc).date().isoformat()
+            allowed, day_pnl = self.breaker.entries_allowed(today, self.account_equity())
+            if not allowed:
+                slip = (1 - SLIPPAGE) if pos.side == "LONG" else (1 + SLIPPAGE)
+                self._close(pos, price * slip, "günlük sermaye stopu")
+                self.notifier.send_error(
+                    f"🛑 GÜNLÜK SERMAYE STOPU: zarar %{-day_pnl*100:.1f} limiti aştı — "
+                    f"{self.symbol} kapatıldı, bugün yeni giriş yok."
+                )
+                pos = None
+
         # 2) Yeni kapanmış mum
         df = self.market.klines(self.symbol, self.cfg.timeframe, limit=500)
         closed = df.iloc[:-1]
