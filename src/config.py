@@ -54,6 +54,9 @@ class Config:
     funding_daily_long: float = 0.0003         # long öder: ~%0.01/8s
     funding_daily_short: float = 0.00015       # muhafazakâr short varsayımı
     panel_port: int = int(_env("PANEL_PORT", "8484"))
+    # Sunucuda çalışırken 0.0.0.0 gerekir (container dışından erişim için).
+    # Yayınlanan portu MUTLAKA Tailscale IP'sine bağlayın — bkz. docker-compose.
+    panel_host: str = _env("PANEL_HOST", "127.0.0.1")
     symbols: tuple[str, ...] = tuple(
         s.strip().upper() for s in _env("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if s.strip()
     )

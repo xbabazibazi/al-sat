@@ -426,9 +426,9 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     threading.Thread(target=watchdog, daemon=True).start()
-    addr = ("127.0.0.1", CONFIG.panel_port)
+    addr = (CONFIG.panel_host, CONFIG.panel_port)
     server = ThreadingHTTPServer(addr, Handler)
-    print(f"Panel hazır: http://localhost:{CONFIG.panel_port}  (Ctrl+C ile durdurun)")
+    print(f"Panel hazır: http://{CONFIG.panel_host}:{CONFIG.panel_port}  (Ctrl+C ile durdurun)")
     print("Sayfadaki BAŞLAT/DURDUR butonlarıyla botu yönetebilirsiniz.")
     try:
         server.serve_forever()

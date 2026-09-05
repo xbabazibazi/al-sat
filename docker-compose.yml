@@ -1,13 +1,49 @@
 services:
-  binance-bot:
+  al-sat:
     build: .
-    container_name: binance_trading_bot
-    restart: always            # çökme/yeniden başlatmada otomatik ayağa kalkar
+    container_name: al_sat_bot
+    restart: always            # sunucu yeniden başlasa da konteyner geri gelir
+
     env_file:
       - .env
+    environment:
+      # Konteyner içinde panel tüm arayüzleri dinler; DIŞARI açılan port
+      # aşağıda Tailscale IP'sine kilitlenir (internete açık değildir).
+      PANEL_HOST: "0.0.0.0"
+      PYTHONDONTWRITEBYTECODE: "1"   # salt-okunur dosya sistemiyle uyum
+
+    ports:
+      # SADECE Tailscale ağından erişilebilir. quonsoftware = 100.85.134.94
+      # (kurulum betiği bunu otomatik günceller). "0.0.0.0:8484" YAPMAYIN.
+      - "100.85.134.94:8484:8484"
+
     volumes:
-      - ./data:/app/data       # SQLite durum + loglar kalıcı: yeniden başlatmada
-                               # pozisyon durumu KAYBOLMAZ (kritik güvenlik katmanı)
+      - ./data:/app/data       # SQLite durum + loglar kalıcı
+
+    # ---- güvenlik sıkılaştırması ----
+    user: "10001:10001"        # root değil
+    read_only: true            # kök dosya sistemi salt-okunur
+    tmpfs:
+      - /tmp:size=64m
+    security_opt:
+      - no-new-privileges:true # ayrıcalık yükseltme kapalı
+    cap_drop:
+      - ALL                    # tüm Linux yetenekleri düşürüldü
+
+    # ---- kaynak sınırları (bot hafif; kaçak tüketimi engeller) ----
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8484/api/state', timeout=5)\""]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
     logging:
       driver: json-file
       options:
