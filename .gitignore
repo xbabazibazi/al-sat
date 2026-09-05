@@ -1,0 +1,15 @@
+# Gizli bilgiler — ASLA versiyon kontrolüne girmemeli
+.env
+
+# Çalışma verileri
+data/
+logs/
+*.log
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

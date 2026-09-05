@@ -1,0 +1,15 @@
+services:
+  binance-bot:
+    build: .
+    container_name: binance_trading_bot
+    restart: always            # çökme/yeniden başlatmada otomatik ayağa kalkar
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data       # SQLite durum + loglar kalıcı: yeniden başlatmada
+                               # pozisyon durumu KAYBOLMAZ (kritik güvenlik katmanı)
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
