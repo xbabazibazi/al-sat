@@ -18,7 +18,9 @@ services:
       - "100.85.134.94:8484:8484"
 
     volumes:
-      - ./data:/app/data       # SQLite durum + loglar kalıcı
+      # Adlandırılmış volume: sahiplik imajdan (uid 10001) devralınır.
+      # Bind mount kullanılsaydı sunucuda chown gerekir, izin hatası olurdu.
+      - alsat_data:/app/data
 
     # ---- güvenlik sıkılaştırması ----
     user: "10001:10001"        # root değil
@@ -49,3 +51,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  alsat_data:
