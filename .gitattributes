@@ -1,0 +1,10 @@
+# Shell betikleri ve Docker dosyalari Linux'ta calisir -> HER ZAMAN LF.
+# Windows'ta CRLF ile kaydedilirse sunucuda "$'\r': command not found" hatasi verir.
+*.sh            text eol=lf
+Dockerfile      text eol=lf
+docker-compose.yml text eol=lf
+*.yml           text eol=lf
+
+# Windows tarafinda kalanlar
+*.bat           text eol=crlf
+*.ps1           text eol=crlf
