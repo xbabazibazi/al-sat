@@ -71,10 +71,10 @@ if ($LASTEXITCODE -ne 0) { Hata ".env gonderilemedi"; exit 1 }
 ssh @sshOpt $Hedef "chmod 600 ~/al-sat/.env"
 Ok ".env yerlestirildi (chmod 600)"
 
-# --- 5) systemd servisi kur + botu otomatik baslat ---
+# --- 5) Kurulum + botu otomatik baslat ---
 Baslik "[5/6] Servis kuruluyor ve bot baslatiliyor..."
-Bilgi "(python venv + systemd - Docker gerekmiyor)"
-ssh @sshOpt $Hedef "cd ~/al-sat ; bash deploy/kur-systemd.sh" 2>&1 | ForEach-Object { Bilgi $_ }
+Bilgi "(sudo gerektirmez: kullanici-yerel python + crontab)"
+ssh @sshOpt $Hedef "cd ~/al-sat ; bash deploy/kur-sunucu.sh" 2>&1 | ForEach-Object { Bilgi $_ }
 
 # --- 6) Dogrula + yerel botu durdur ---
 Baslik "[6/6] Dogrulama..."
@@ -91,8 +91,8 @@ try {
     } catch { Bilgi "Yerel bot zaten kapali" }
 } catch {
     Hata "Panel yanit vermedi: $panelUrl"
-    Bilgi "Servis loglari aliniyor..."
-    ssh @sshOpt $Hedef "sudo systemctl status alsat-panel --no-pager -l | head -n 20 ; echo '--- log ---' ; sudo journalctl -u alsat-panel -n 40 --no-pager" 2>&1 | ForEach-Object { Bilgi $_ }
+    Bilgi "Sunucudaki loglar aliniyor..."
+    ssh @sshOpt $Hedef "cd ~/al-sat ; echo '--- panel log ---' ; tail -n 40 logs/panel.log 2>/dev/null ; echo '--- surecler ---' ; pgrep -af 'src.panel|src.main' || echo 'calisan yok'" 2>&1 | ForEach-Object { Bilgi $_ }
     exit 1
 }
 
