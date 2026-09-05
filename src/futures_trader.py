@@ -261,3 +261,45 @@ def snapshot_equity(traders: list[FuturesPaperTrader], state: StateStore) -> Non
     now = datetime.now(timezone.utc)
     key = now.strftime("%Y-%m-%dT%H:%M")  # dakika çözünürlüğü — PK çakışması update olur
     state.record_equity(key, traders[0].account_equity())
+
+
+def maybe_send_futures_daily_report(cfg, traders: list[FuturesPaperTrader],
+                                    state: StateStore, notifier) -> None:
+    """Vadeli paper modda günlük Telegram özeti — haftalık takip için."""
+    if not traders:
+        return
+    now = datetime.now()  # rapor saati yereldir
+    today = now.date().isoformat()
+    if now.hour < cfg.daily_report_hour or state.get_kv("last_fut_report") == today:
+        return
+    state.set_kv("last_fut_report", today)
+
+    equity = traders[0].account_equity()
+    stats = state.trade_stats()
+    day_pnl = state.todays_realized_pnl()
+    win_rate = (stats["wins"] / stats["count"] * 100) if stats["count"] else 0.0
+
+    lines = []
+    for t in traders:
+        pos = state.get_position(t.symbol)
+        if pos:
+            try:
+                price = t.market.last_price(t.symbol)
+                upnl = t._unrealized(pos, price) - pos.funding_acc
+                arrow = "📈" if pos.side == "LONG" else "📉"
+                lines.append(f"  {arrow} {t.symbol} {pos.side}: `{upnl:+,.2f} USDT`")
+            except Exception:
+                lines.append(f"  · {t.symbol} {pos.side}: fiyat alınamadı")
+    open_txt = "\n".join(lines) if lines else "  · Açık pozisyon yok"
+
+    notifier.send(
+        "📊 *GÜNLÜK ÖZET*\n"
+        f"• Toplam varlık: `${equity:,.2f}` "
+        f"(`{equity - 10000:+,.2f}` / `{(equity/10000-1)*100:+.2f}%`)\n"
+        f"• Bugün gerçekleşen: `{day_pnl:+,.2f} USDT`\n"
+        f"• Açık pozisyonlar:\n{open_txt}\n"
+        f"• Toplam işlem: `{stats['count']}` · kazanma `%{win_rate:.0f}` "
+        f"· kümülatif `{stats['total_pnl']:+,.2f} USDT`\n"
+        f"🤖 `{cfg.mode}` · {cfg.leverage:.0f}x · "
+        f"{'long+short' if cfg.allow_short else 'long'}"
+    )

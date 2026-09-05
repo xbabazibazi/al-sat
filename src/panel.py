@@ -12,16 +12,57 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .config import CONFIG
 from .exchange import MarketData
 from .state import StateStore
+from .strategy import compute_indicators
 
 log = logging.getLogger("panel")
 market = MarketData()
 state = StateStore(CONFIG.db_path)
+
+_trigger_cache: dict[str, tuple[float, float, float]] = {}  # symbol -> (ts, long_trig, short_trig)
+TRIGGER_TTL = 300  # mum 4 saatte bir değişir; 5 dakikada bir yenilemek fazlasıyla yeterli
+
+
+def triggers(symbol: str) -> tuple[float, float]:
+    """(long tetiği, short tetiği) — Donchian bantları, önbellekli."""
+    cached = _trigger_cache.get(symbol)
+    if cached and time.time() - cached[0] < TRIGGER_TTL:
+        return cached[1], cached[2]
+    df = market.klines(symbol, CONFIG.timeframe, limit=250)
+    ind = compute_indicators(df.iloc[:-1], CONFIG.strategy)
+    row = ind.iloc[-1]
+    hi, lo = float(row["donchian_high"]), float(row["donchian_low"])
+    _trigger_cache[symbol] = (time.time(), hi, lo)
+    return hi, lo
+
+
+def build_watchlist(open_symbols: set[str]) -> list[dict]:
+    out = []
+    for sym in CONFIG.symbols:
+        if sym in open_symbols:
+            continue  # pozisyondaysa izleme listesinde gösterilmez
+        try:
+            hi, lo = triggers(sym)
+            price = market.last_price(sym)
+        except Exception as e:
+            log.warning("[%s] izleme verisi alınamadı: %s", sym, e)
+            continue
+        span = hi - lo
+        pos_pct = ((price - lo) / span * 100) if span > 0 else 50
+        out.append({
+            "symbol": sym, "price": price, "long_trig": hi, "short_trig": lo,
+            "long_dist": (hi / price - 1) * 100,
+            "short_dist": (1 - lo / price) * 100,
+            "pos_pct": max(0.0, min(100.0, pos_pct)),
+        })
+    out.sort(key=lambda r: min(r["long_dist"], r["short_dist"]))
+    return out
 
 
 def build_state() -> dict:
@@ -61,6 +102,7 @@ def build_state() -> dict:
         "n_trades": stats["count"], "win_rate": round(win_rate, 1),
         "cum_realized": round(stats["total_pnl"], 2),
         "positions": positions,
+        "watchlist": build_watchlist({p["symbol"] for p in positions}),
         "trades": state.recent_trades(30),
         "equity_history": [{"t": t, "v": round(v, 2)} for t, v in state.equity_history(600)],
         "assessments": state.latest_assessments(),
@@ -127,6 +169,7 @@ PAGE = """<!doctype html>
 <div class="grid" id="stats"></div>
 <div class="card"><h2>Ön Değerlendirme — her mum kapanışında 5 araçlı analiz (incelemesiz giriş yok)</h2><div id="assess"></div></div>
 <div class="card"><h2>Açık Pozisyonlar — anlık kâr/zarar</h2><div id="positions"></div></div>
+<div class="card"><h2>İzleme Listesi — tetiğe uzaklık</h2><div id="watch"></div></div>
 <div class="card"><h2>Varlık Eğrisi</h2><div id="chart"><div class="empty">Veri birikiyor…</div></div></div>
 <div class="card"><h2>Son İşlemler</h2><div id="trades"></div></div>
 <script>
@@ -181,6 +224,30 @@ async function refresh() {
       <td class="${cls(p.upnl)}"><b>${money(p.upnl)}</b></td>
       <td class="${cls(p.upnl)}">${sign(p.upnl_pct)}%</td></tr>`).join("") + "</table>"
     : `<div class="empty">Açık pozisyon yok — bot sinyal bekliyor (${d.symbols.join(", ")})</div>`;
+
+  $("watch").innerHTML = d.watchlist.length ? "<table><tr>" +
+    "<th>Parite</th><th>Fiyat</th><th style='text-align:center'>SHORT ← konum → LONG</th>" +
+    "<th>SHORT tetik</th><th>LONG tetik</th><th>Durum</th></tr>" +
+    d.watchlist.map(w => {
+      const nearest = Math.min(w.long_dist, w.short_dist);
+      const tag = nearest < 0.3 ? "<span style='color:var(--amber);font-weight:700'>TETİKTE</span>"
+        : nearest < 1.5 ? "<span style='color:var(--accent);font-weight:600'>YAKIN</span>"
+        : "<span style='color:var(--mut)'>bekliyor</span>";
+      return `<tr>
+        <td><b>${w.symbol.replace("USDT","")}</b><span style="color:var(--mut);font-size:11px">USDT</span></td>
+        <td>$${w.price.toLocaleString("tr-TR",{maximumFractionDigits:2})}</td>
+        <td style="width:34%">
+          <div style="position:relative;height:6px;background:var(--card2);border-radius:3px">
+            <div style="position:absolute;left:${w.pos_pct}%;top:-4px;width:3px;height:14px;
+              background:var(--ink);border-radius:2px;transform:translateX(-1.5px)"></div>
+          </div></td>
+        <td class="down">$${w.short_trig.toLocaleString("tr-TR",{maximumFractionDigits:2})}
+          <span style="color:var(--mut);font-size:11px">%${w.short_dist.toFixed(2)}</span></td>
+        <td class="up">$${w.long_trig.toLocaleString("tr-TR",{maximumFractionDigits:2})}
+          <span style="color:var(--mut);font-size:11px">%${w.long_dist.toFixed(2)}</span></td>
+        <td>${tag}</td></tr>`;
+    }).join("") + "</table>"
+    : `<div class="empty">Tüm pariteler pozisyonda</div>`;
 
   if (d.equity_history.length > 1) {
     const H = 160, W = 900, pts = d.equity_history;

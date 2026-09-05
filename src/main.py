@@ -14,7 +14,8 @@ from logging.handlers import RotatingFileHandler
 
 from .config import CONFIG
 from .exchange import MarketData, build_broker
-from .futures_trader import FuturesPaperTrader, snapshot_equity
+from .futures_trader import (FuturesPaperTrader, maybe_send_futures_daily_report,
+                             snapshot_equity)
 from .notifier import TelegramNotifier
 from .risk import CircuitBreaker
 from .state import StateStore
@@ -96,6 +97,7 @@ def main() -> None:
         try:
             if futures_mode:
                 snapshot_equity(traders, state)  # panel varlık grafiği için
+                maybe_send_futures_daily_report(CONFIG, traders, state, notifier)
             else:
                 maybe_send_daily_report(CONFIG, market, broker, state, notifier)
         except Exception as e:
