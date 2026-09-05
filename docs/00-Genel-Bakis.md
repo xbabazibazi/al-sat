@@ -31,7 +31,8 @@ veya `BASLAT.bat` dosyasına çift tıkla (bot + panel + tarayıcı).
 
 1. **Her pozisyonda zorunlu stop** — ATR×3.0 mesafesinde, stop'suz pozisyon açılamaz
 2. **İzleyen stop** — kâr yönünde ilerler, asla geri gitmez
-3. **Günlük sermaye stopu** — gün içi %5 zararda tüm pozisyonlar kapanır, o gün giriş yok
+3. **Günlük sermaye stopu** — gün içi %10 zararda tüm pozisyonlar kapanır, o gün giriş yok
+   (4 pozisyon × %2 risk = normalde %8 kayıp mümkün olduğu için eşik bunun üstünde)
 4. **Pozisyon başı risk** — sermayenin %2'si
 5. **Ön değerlendirme kapısı** — 5 araç onaylamadan giriş yok
 6. **Çifte çalışma kilidi** — iki bot aynı anda çalışamaz
