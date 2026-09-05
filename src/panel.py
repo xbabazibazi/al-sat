@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import signal
+import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .config import CONFIG
+from .config import CONFIG, PROJECT_ROOT
 from .exchange import MarketData
 from .state import StateStore
 from .strategy import compute_indicators
@@ -40,6 +44,71 @@ def triggers(symbol: str) -> tuple[float, float]:
     hi, lo = float(row["donchian_high"]), float(row["donchian_low"])
     _trigger_cache[symbol] = (time.time(), hi, lo)
     return hi, lo
+
+
+# --------------------------------------------------------------- bot kontrolü
+HEARTBEAT_STALE_S = 90    # bot 30 sn'de bir atar; 3 atış kaçarsa düşmüş sayılır
+
+
+def bot_alive() -> bool:
+    hb = state.get_kv("bot_heartbeat")
+    if not hb:
+        return False
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(hb)).total_seconds()
+    except ValueError:
+        return False
+    return age < HEARTBEAT_STALE_S
+
+
+def spawn_bot() -> bool:
+    """Botu ayrı, bağımsız bir süreç olarak başlatır (panel kapansa da yaşar)."""
+    if bot_alive():
+        return True
+    try:
+        flags = 0
+        if sys.platform == "win32":
+            flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        p = subprocess.Popen(
+            [sys.executable, "-m", "src.main"],
+            cwd=str(PROJECT_ROOT), creationflags=flags,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        state.set_kv("bot_pid", str(p.pid))
+        log.info("Bot başlatıldı (pid=%s)", p.pid)
+        return True
+    except Exception as e:
+        log.error("Bot başlatılamadı: %s", e)
+        return False
+
+
+def kill_bot() -> bool:
+    pid = state.get_kv("bot_pid")
+    if not pid:
+        return False
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True, timeout=10)
+        else:
+            os.kill(int(pid), signal.SIGTERM)
+        state.set_kv("bot_heartbeat", "")
+        log.info("Bot durduruldu (pid=%s)", pid)
+        return True
+    except Exception as e:
+        log.error("Bot durdurulamadı: %s", e)
+        return False
+
+
+def watchdog() -> None:
+    """'Başlat' dendiyse bot düşse bile geri getirir — bir daha kapanmaz."""
+    while True:
+        time.sleep(20)
+        try:
+            if state.get_kv("bot_should_run") == "1" and not bot_alive():
+                log.warning("Bot düşmüş görünüyor — otomatik yeniden başlatılıyor")
+                spawn_bot()
+        except Exception as e:
+            log.error("Watchdog hatası: %s", e)
 
 
 def build_watchlist(open_symbols: set[str]) -> list[dict]:
@@ -92,6 +161,9 @@ def build_state() -> dict:
     win_rate = stats["wins"] / stats["count"] * 100 if stats["count"] else 0
     return {
         "now": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+        "bot_running": bot_alive(),
+        "should_run": state.get_kv("bot_should_run") == "1",
+        "max_daily_loss": CONFIG.max_daily_loss_pct * 100,
         "mode": CONFIG.mode, "leverage": CONFIG.leverage,
         "allow_short": CONFIG.allow_short,
         "symbols": list(CONFIG.symbols),
@@ -156,15 +228,32 @@ PAGE = """<!doctype html>
   svg { display:block; width:100%; }
   .pulse { animation:pulse 2s infinite; display:inline-block; width:7px; height:7px;
     border-radius:50%; background:var(--up); margin-right:6px; vertical-align:1px; }
+  .pulse.off { background:var(--mut); animation:none; }
   @keyframes pulse { 50% { opacity:.35; } }
   @media (prefers-reduced-motion: reduce) { .pulse { animation:none; } }
+  .ctrl { display:flex; gap:8px; align-items:center; margin-bottom:14px; flex-wrap:wrap; }
+  button { font:600 14px system-ui,-apple-system,"Segoe UI",sans-serif; cursor:pointer;
+    border:none; border-radius:8px; padding:10px 22px; color:#fff; transition:opacity .15s; }
+  button:hover:not(:disabled) { opacity:.87; }
+  button:disabled { opacity:.35; cursor:not-allowed; }
+  button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  #btnStart { background:var(--up); } #btnStop { background:var(--down); }
+  .ctrl .state { font-size:13px; color:var(--ink2); }
+  .ctrl .state b.on { color:var(--up); } .ctrl .state b.offc { color:var(--down); }
+  .ctrl .note { font-size:12px; color:var(--mut); margin-left:auto; }
 </style></head><body>
 <div class="top">
-  <h1><span class="pulse"></span>AL-SAT Paneli</h1>
+  <h1><span class="pulse" id="pulse"></span>AL-SAT Paneli</h1>
   <span class="chip" id="mode"></span>
   <span class="chip" id="lev"></span>
   <span class="chip warn" id="paper">PAPER — gerçek para riski yok</span>
   <span id="clock"></span>
+</div>
+<div class="ctrl">
+  <button id="btnStart" onclick="ctrl('start')">▶ BAŞLAT</button>
+  <button id="btnStop" onclick="ctrl('stop')">■ DURDUR</button>
+  <span class="state" id="botstate"></span>
+  <span class="note" id="dailynote"></span>
 </div>
 <div class="grid" id="stats"></div>
 <div class="card"><h2>Ön Değerlendirme — her mum kapanışında 5 araçlı analiz (incelemesiz giriş yok)</h2><div id="assess"></div></div>
@@ -184,6 +273,15 @@ async function refresh() {
   catch { $("clock").textContent = "bağlantı koptu — yeniden denenecek"; return; }
 
   $("clock").textContent = d.now;
+  $("pulse").className = "pulse" + (d.bot_running ? "" : " off");
+  $("btnStart").disabled = d.bot_running;
+  $("btnStop").disabled = !d.bot_running;
+  $("botstate").innerHTML = d.bot_running
+    ? "Bot <b class='on'>ÇALIŞIYOR</b> — otomatik yeniden başlatma açık, kapanmaz"
+    : (d.should_run ? "Bot <b class='offc'>DÜŞTÜ</b> — otomatik başlatılıyor…"
+                    : "Bot <b class='offc'>DURDURULDU</b>");
+  $("dailynote").textContent = "Günlük sermaye stopu: %" + d.max_daily_loss +
+    " zararda tüm pozisyonlar kapanır";
   $("mode").textContent = "mod: " + d.mode;
   $("lev").textContent = d.leverage + "x kaldıraç" + (d.allow_short ? " · long+short" : " · sadece long");
   $("paper").style.display = d.mode.includes("paper") || d.mode === "dry_run" ? "" : "none";
@@ -277,6 +375,12 @@ async function refresh() {
       <td style="color:var(--mut)">${(t.exit_time||"").slice(0,16).replace("T"," ")}</td></tr>`).join("") + "</table>"
     : `<div class="empty">Henüz kapanan işlem yok</div>`;
 }
+async function ctrl(action) {
+  $("btnStart").disabled = $("btnStop").disabled = true;
+  $("botstate").textContent = action === "start" ? "Başlatılıyor…" : "Durduruluyor…";
+  try { await fetch("/api/" + action, { method: "POST" }); } catch {}
+  setTimeout(refresh, 1500);
+}
 refresh();
 setInterval(refresh, 5000);
 </script></body></html>"""
@@ -296,6 +400,18 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "text/plain", b"404")
 
+    def do_POST(self):
+        if self.path == "/api/start":
+            state.set_kv("bot_should_run", "1")
+            ok = spawn_bot()
+            self._send(200, "application/json", json.dumps({"ok": ok}).encode())
+        elif self.path == "/api/stop":
+            state.set_kv("bot_should_run", "0")
+            ok = kill_bot()
+            self._send(200, "application/json", json.dumps({"ok": ok}).encode())
+        else:
+            self._send(404, "text/plain", b"404")
+
     def _send(self, code: int, ctype: str, body: bytes) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -309,9 +425,11 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    threading.Thread(target=watchdog, daemon=True).start()
     addr = ("127.0.0.1", CONFIG.panel_port)
     server = ThreadingHTTPServer(addr, Handler)
     print(f"Panel hazır: http://localhost:{CONFIG.panel_port}  (Ctrl+C ile durdurun)")
+    print("Sayfadaki BAŞLAT/DURDUR butonlarıyla botu yönetebilirsiniz.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

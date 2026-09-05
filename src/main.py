@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
 from .config import CONFIG
@@ -85,7 +87,25 @@ def main() -> None:
         f"semboller: `{', '.join(CONFIG.symbols)}` | tf: `{CONFIG.timeframe}`"
     )
 
+    # ÇİFTE ÇALIŞMA KİLİDİ: başka bir bot canlıysa (kalp atışı taze) çık.
+    # İki bot aynı DB'ye yazarsa çifte pozisyon açılabilir.
+    hb = state.get_kv("bot_heartbeat")
+    other_pid = state.get_kv("bot_pid")
+    if hb and other_pid != str(os.getpid()):
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(hb)).total_seconds()
+        except ValueError:
+            age = 1e9
+        if age < 120 and not args.once:
+            log.error("Zaten çalışan bir bot var (pid=%s, kalp atışı %.0f sn önce). "
+                      "Çifte işlem riski nedeniyle çıkılıyor.", other_pid, age)
+            sys.exit(1)
+
+    # Panelin "çalışıyor mu" bilmesi için kalp atışı + süreç kimliği
+    state.set_kv("bot_pid", str(os.getpid()))
+
     while True:
+        state.set_kv("bot_heartbeat", datetime.now(timezone.utc).isoformat())
         for t in traders:
             try:
                 t.poll()
