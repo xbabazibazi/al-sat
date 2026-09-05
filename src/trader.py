@@ -13,16 +13,18 @@ Sohbetteki örnek kodların aksine buradaki tasarım şu garantileri verir:
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 
 import pandas as pd
 
 from .config import Config
-from .exchange import Broker, BinanceBroker, MarketData, SymbolFilters, floor_to_step
+from .exchange import Broker, BinanceBroker, Fill, MarketData, SymbolFilters, floor_to_step
 from .notifier import TelegramNotifier
 from .risk import CircuitBreaker, position_size
 from .state import Position, StateStore
-from .strategy import check_entry, compute_indicators, initial_stop, updated_trailing_stop
+from .strategy import (check_entry, compute_indicators, ema, initial_stop,
+                       updated_trailing_stop)
 
 log = logging.getLogger("trader")
 
@@ -158,12 +160,32 @@ class SymbolTrader:
         self.state.set_last_candle(self.symbol, last_closed_time)
 
         ind = compute_indicators(closed, self.cfg.strategy)
-        row = ind.iloc[-1]
+        row = ind.iloc[-1].copy()
+
+        # Günlük trend teyidi (yalnızca girişte gerekli; pozisyondayken sorgulanmaz)
+        if pos is None and self.cfg.strategy.use_daily_filter:
+            row["daily_uptrend"] = self._daily_uptrend()
 
         if pos is not None:
             self._on_candle_with_position(pos, row)
         else:
             self._on_candle_flat(row)
+
+    def _daily_uptrend(self) -> bool:
+        """Son KAPANMIŞ günlük mum, günlük EMA200'ün üzerinde mi?
+        Veri alınamazsa muhafazakâr davranır (giriş engellenir)."""
+        try:
+            d = self.market.klines(self.symbol, "1d", limit=400)
+            d_closed = d.iloc[:-1]  # tamamlanmamış bugünkü mum hariç
+            if len(d_closed) < self.cfg.strategy.daily_ema_period:
+                log.warning("[%s] Günlük veri kısa (%d bar) — filtre geçti sayılıyor",
+                            self.symbol, len(d_closed))
+                return True
+            daily_ema = ema(d_closed["close"], self.cfg.strategy.daily_ema_period)
+            return float(d_closed["close"].iloc[-1]) > float(daily_ema.iloc[-1])
+        except Exception as e:
+            log.warning("[%s] Günlük filtre verisi alınamadı (%s) — giriş engellendi", self.symbol, e)
+            return False
 
     def _on_candle_with_position(self, pos: Position, row: pd.Series) -> None:
         candle_high = float(row["high"])
@@ -202,7 +224,7 @@ class SymbolTrader:
             log.info("[%s] Sinyal var ama boyutlandırma engelledi: %s", self.symbol, sizing.reason)
             return
 
-        fill = self.broker.market_buy(self.symbol, sizing.qty)
+        fill = self._execute_entry(sizing.qty, sig.close)
         if fill is None or fill.executed_qty <= 0:
             self.notifier.send_error(f"{self.symbol}: ALIM emri başarısız oldu.")
             return
@@ -230,6 +252,37 @@ class SymbolTrader:
         log.info("[%s] ALIM: fiyat=%.2f qty=%s stop=%.2f",
                  self.symbol, fill.avg_price, fill.executed_qty,
                  pos.trailing_stop if pos else float("nan"))
+
+    def _execute_entry(self, qty: float, ref_price: float) -> Fill | None:
+        """Girişi gerçekleştirir. use_limit_entry açıksa önce maker limit dener
+        (%0.075 maker vs %0.10 taker komisyonu); timeout'ta market'e döner."""
+        if not self.cfg.use_limit_entry:
+            return self.broker.market_buy(self.symbol, qty)
+
+        limit_p = floor_to_step(ref_price, self.filters.tick_size)
+        oid = self.broker.limit_buy(self.symbol, qty, limit_p)
+        if oid is None:
+            log.info("[%s] Limit alım kurulamadı — market emrine dönülüyor", self.symbol)
+            return self.broker.market_buy(self.symbol, qty)
+
+        deadline = time.time() + self.cfg.limit_entry_timeout_s
+        while time.time() < deadline:
+            status, fill = self.broker.order_status(self.symbol, oid)
+            if status == "FILLED" and fill:
+                log.info("[%s] Limit alım MAKER olarak doldu @ %.2f", self.symbol, fill.avg_price)
+                return fill
+            time.sleep(3)
+
+        # Timeout: iptal et, kısmi dolum varsa onunla yetin (güvenli), yoksa market
+        self.broker.cancel_order(self.symbol, oid)
+        status, fill = self.broker.order_status(self.symbol, oid)
+        if fill and fill.executed_qty > 0:
+            log.info("[%s] Limit alım kısmen doldu (%.6f) — kalan iptal edildi",
+                     self.symbol, fill.executed_qty)
+            return fill
+        log.info("[%s] Limit alım %ds içinde dolmadı — market emrine dönülüyor",
+                 self.symbol, self.cfg.limit_entry_timeout_s)
+        return self.broker.market_buy(self.symbol, qty)
 
     # ------------------------------------------------------------------ mutabakat
     def reconcile(self) -> None:

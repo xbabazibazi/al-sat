@@ -55,6 +55,27 @@ def compute_indicators(df: pd.DataFrame, p: StrategyParams) -> pd.DataFrame:
     return out
 
 
+def add_daily_trend_filter(ind: pd.DataFrame, daily_df: pd.DataFrame, p: StrategyParams) -> pd.DataFrame:
+    """Bar-içi (örn. 4h) DataFrame'e `daily_uptrend` sütunu ekler.
+
+    Look-ahead önleme: her bar-içi mum, yalnızca KENDİ AÇILIŞINDAN ÖNCE
+    KAPANMIŞ günlük mumun (close_time <= open_time) EMA durumunu görür.
+    daily_df sütunları: open_time, close_time, close.
+    """
+    d = daily_df.copy()
+    d["daily_ema"] = ema(d["close"].astype(float), p.daily_ema_period)
+    d["daily_uptrend"] = d["close"].astype(float) > d["daily_ema"]
+    d = d[["close_time", "daily_uptrend"]].rename(columns={"close_time": "d_close"})
+    d = d.sort_values("d_close")
+
+    out = ind.copy().sort_values("open_time")
+    merged = pd.merge_asof(
+        out, d, left_on="open_time", right_on="d_close", direction="backward"
+    )
+    merged["daily_uptrend"] = merged["daily_uptrend"].fillna(False).astype(bool)
+    return merged.drop(columns=["d_close"])
+
+
 # ------------------------------------------------------------------- sinyaller
 @dataclass(frozen=True)
 class EntrySignal:
@@ -75,8 +96,13 @@ def check_entry(row: pd.Series, p: StrategyParams) -> EntrySignal:
     breakout = close > float(row["donchian_high"])
     rsi_ok = float(row["rsi"]) < p.rsi_max_entry
 
-    if in_uptrend and breakout and rsi_ok:
-        return EntrySignal(True, close, float(row["atr"]), "EMA200 üzeri + Donchian kırılımı")
+    # Günlük trend teyidi (sütun yoksa filtre uygulanmaz — geriye uyumlu)
+    daily_ok = True
+    if p.use_daily_filter and "daily_uptrend" in row.index:
+        daily_ok = bool(row["daily_uptrend"])
+
+    if in_uptrend and breakout and rsi_ok and daily_ok:
+        return EntrySignal(True, close, float(row["atr"]), "EMA200 üzeri + Donchian kırılımı + günlük trend")
     return EntrySignal(False, close, float(row["atr"]))
 
 

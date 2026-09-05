@@ -32,6 +32,11 @@ class StrategyParams:
     atr_multiplier: float = float(_env("ATR_MULTIPLIER", "3.0"))  # 2022-2026 taramasında sağlam bölge
     rsi_max_entry: float = 80.0        # aşırı alımda (blow-off) girişleri engelle
     warmup_bars: int = 220             # EMA200'ün oturması için gereken minimum bar
+    # Günlük trend teyidi: yalnızca GÜNLÜK kapanış da günlük EMA'nın üzerindeyse gir.
+    # A/B testi (2022-2026): SOL'da belirgin fayda, BTC/ETH'de belirgin ZARAR →
+    # tutarsız olduğu için varsayılan KAPALI. Denemek isteyen .env'den açabilir.
+    use_daily_filter: bool = _env("USE_DAILY_FILTER", "false").lower() == "true"
+    daily_ema_period: int = 200
 
 
 @dataclass(frozen=True)
@@ -46,6 +51,14 @@ class Config:
     risk_pct: float = float(_env("RISK_PCT", "0.02"))                 # işlem başına risk: bakiyenin %2'si
     max_daily_loss_pct: float = float(_env("MAX_DAILY_LOSS_PCT", "0.05"))  # günlük devre kesici: %5
     max_balance_usage: float = 0.95    # bakiyenin en fazla %95'i tek pozisyona girebilir
+
+    # Komisyon optimizasyonu:
+    # - Binance'te "BNB ile komisyon öde" açıksa spot ücret %0.10 → %0.075 düşer.
+    #   (Bunu borsa arayüzünden açmanız ve az miktar BNB tutmanız gerekir.)
+    # - use_limit_entry: girişte önce maker limit emri dener (taker yerine maker ücreti);
+    #   dolmazsa timeout sonunda iptal edip market emrine döner.
+    use_limit_entry: bool = _env("USE_LIMIT_ENTRY", "true").lower() == "true"
+    limit_entry_timeout_s: int = int(_env("LIMIT_ENTRY_TIMEOUT_S", "45"))
 
     # API anahtarları
     testnet_key: str = _env("BINANCE_TESTNET_KEY")

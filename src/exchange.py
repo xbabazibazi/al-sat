@@ -122,6 +122,7 @@ class Broker:
     def free_balance(self, asset: str) -> float: ...
     def market_buy(self, symbol: str, qty: float) -> Optional[Fill]: ...
     def market_sell(self, symbol: str, qty: float) -> Optional[Fill]: ...
+    def limit_buy(self, symbol: str, qty: float, price: float) -> Optional[int]: ...
     def place_stop(self, symbol: str, qty: float, stop_price: float, limit_price: float) -> Optional[int]: ...
     def cancel_order(self, symbol: str, order_id: int) -> bool: ...
     def order_status(self, symbol: str, order_id: int) -> tuple[str, Optional[Fill]]: ...
@@ -177,6 +178,19 @@ class BinanceBroker(Broker):
             log.error("[%s] MARKET SELL hatası: %s", symbol, e)
             return None
 
+    def limit_buy(self, symbol: str, qty: float, price: float) -> Optional[int]:
+        """Maker komisyonu için limit alım (GTC). Dolmayan emir trader
+        tarafında timeout sonrası iptal edilip market emrine dönülür."""
+        try:
+            order = self.client.order_limit_buy(
+                symbol=symbol, quantity=qty,
+                price=f"{price:.8f}".rstrip("0").rstrip("."),
+            )
+            return int(order["orderId"])
+        except Exception as e:
+            log.error("[%s] LIMIT BUY hatası (fiyat=%s): %s", symbol, price, e)
+            return None
+
     def place_stop(self, symbol: str, qty: float, stop_price: float, limit_price: float) -> Optional[int]:
         try:
             order = self.client.create_order(
@@ -205,7 +219,10 @@ class BinanceBroker(Broker):
         try:
             order = self.client.get_order(symbol=symbol, orderId=order_id)
             status = order["status"]
-            fill = self._fill_from_order(order) if status == "FILLED" else None
+            # Kısmi dolumda da fill bilgisini döndür (iptal sonrası eldeki miktar bilinsin)
+            fill = self._fill_from_order(order)
+            if fill.executed_qty <= 0:
+                fill = None
             return status, fill
         except Exception as e:
             log.error("[%s] Emir sorgu hatası (id=%s): %s", symbol, order_id, e)
@@ -226,7 +243,8 @@ class DryRunBroker(Broker):
     tarafı stop davranışına yakınsar (30 sn çözünürlükle).
     """
 
-    FEE = 0.001          # %0.1 komisyon
+    FEE = 0.001          # %0.1 taker komisyonu
+    MAKER_FEE = 0.00075  # limit dolumları için maker komisyonu
     SLIPPAGE = 0.0005    # %0.05 kayma
 
     def __init__(self, market: MarketData, state):
@@ -279,6 +297,24 @@ class DryRunBroker(Broker):
         self._set_base(symbol, self._get_base(symbol) - qty)
         return Fill(avg_price=price, executed_qty=qty)
 
+    def limit_buy(self, symbol: str, qty: float, price: float) -> Optional[int]:
+        self._next_order_id += 1
+        oid = self._next_order_id
+        last = self.market.last_price(symbol)
+        if last <= price:
+            # anında maker dolumu simülasyonu
+            cost = price * qty
+            fee = cost * self.MAKER_FEE
+            if cost + fee > self._get_usdt():
+                log.error("[%s] DRY-RUN: limit alım için yetersiz sanal bakiye", symbol)
+                return None
+            self._set_usdt(self._get_usdt() - cost - fee)
+            self._set_base(symbol, self._get_base(symbol) + qty)
+            self.state.set_kv(f"dry_limit_{symbol}_{oid}", f"{price}|{qty}|FILLED")
+        else:
+            self.state.set_kv(f"dry_limit_{symbol}_{oid}", f"{price}|{qty}|OPEN")
+        return oid
+
     def place_stop(self, symbol: str, qty: float, stop_price: float, limit_price: float) -> Optional[int]:
         self._next_order_id += 1
         oid = self._next_order_id
@@ -286,15 +322,34 @@ class DryRunBroker(Broker):
         return oid
 
     def cancel_order(self, symbol: str, order_id: int) -> bool:
-        key = f"dry_stop_{symbol}_{order_id}"
-        raw = self.state.get_kv(key)
-        if raw and raw.endswith("OPEN"):
-            stop, qty, _ = raw.split("|")
-            self.state.set_kv(key, f"{stop}|{qty}|CANCELED")
-            return True
+        for prefix in ("dry_stop", "dry_limit"):
+            key = f"{prefix}_{symbol}_{order_id}"
+            raw = self.state.get_kv(key)
+            if raw and raw.endswith("OPEN"):
+                price, qty, _ = raw.split("|")
+                self.state.set_kv(key, f"{price}|{qty}|CANCELED")
+                return True
         return False
 
     def order_status(self, symbol: str, order_id: int) -> tuple[str, Optional[Fill]]:
+        # Limit alım emri mi?
+        lkey = f"dry_limit_{symbol}_{order_id}"
+        raw = self.state.get_kv(lkey)
+        if raw:
+            price_s, qty_s, status = raw.split("|")
+            if status == "FILLED":
+                return "FILLED", Fill(avg_price=float(price_s), executed_qty=float(qty_s))
+            if status == "OPEN" and self.market.last_price(symbol) <= float(price_s):
+                # limit seviyesine gelindi — maker dolumu simüle et
+                price, qty = float(price_s), float(qty_s)
+                cost = price * qty
+                self._set_usdt(self._get_usdt() - cost * (1 + self.MAKER_FEE))
+                self._set_base(symbol, self._get_base(symbol) + qty)
+                self.state.set_kv(lkey, f"{price_s}|{qty_s}|FILLED")
+                return "FILLED", Fill(avg_price=price, executed_qty=qty)
+            return ("NEW", None) if status == "OPEN" else (status, None)
+
+        # Stop satış emri mi?
         key = f"dry_stop_{symbol}_{order_id}"
         raw = self.state.get_kv(key)
         if not raw:

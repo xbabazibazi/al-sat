@@ -31,14 +31,31 @@ copy .env.example .env        # sonra .env içini doldurun
 
 ```bash
 # Tek backtest
-python -m backtest.run --symbol BTCUSDT --start 2023-01-01 --end 2026-01-01
+python -m backtest.run --symbol BTCUSDT --start 2022-01-01 --end 2026-01-01
+
+# İyileştirmelerin katkısını gösteren A/B tablosu
+python -m backtest.run --symbol BTCUSDT --start 2022-01-01 --end 2026-01-01 --compare
 
 # Parametre taraması + out-of-sample doğrulama (%70 eğitim / %30 test)
 python -m backtest.run --symbol BTCUSDT --start 2022-01-01 --end 2026-01-01 --optimize
+
+# Walk-forward: 12 ay eğit → 6 ay test, kaydırarak (EN güvenilir doğrulama)
+python -m backtest.run --symbol BTCUSDT --start 2022-01-01 --end 2026-01-01 --walkforward
 ```
 
 Test diliminde zarar eden parametreyi canlıya almayın — overfitting'dir.
 Aynı taramayı ETHUSDT ve SOLUSDT için de çalıştırıp tutarlılığa bakın.
+
+**Doğrulanmış bulgular (2022–2026, 4h):**
+
+- Walk-forward bileşik OOS getiri: BTC **+%33**, ETH **+%34**, SOL **+%43**
+  (18 pencerenin 14'ü pozitif). Parametreler ATR×2.5–3.5 / Donchian 10–40
+  bölgesinde kümeleniyor.
+- Komisyon iyileştirmeleri (BNB indirimi + maker giriş) üç paritede de
+  tutarlı +2 ilâ +4 puan katkı sağladı → varsayılan AÇIK.
+- Günlük EMA200 trend filtresi TUTARSIZ çıktı (SOL'da +10 puan, ETH'de
+  −25 puan) → varsayılan KAPALI (`USE_DAILY_FILTER=true` ile denenebilir).
+- 1 saatlik dilim her kombinasyonda komisyona yenildi → 4h kullanın.
 
 ### 2. Dry-run — API anahtarı olmadan canlı sinyal takibi
 
@@ -73,6 +90,9 @@ ve işlem geçmişi kaybolmaz.
 
 - Binance API anahtarında **Enable Withdrawals KAPALI** olmalı; sadece
   "Enable Reading" + "Enable Spot Trading".
+- Binance hesap ayarlarından **"BNB ile komisyon öde"** seçeneğini açın ve
+  cüzdanda az miktar BNB tutun — komisyon %0.10 → %0.075 düşer; backtest'te
+  bunun tek başına +2-3 puan katkısı doğrulandı.
 - Sabit IP'niz yoksa (CGNAT) IP whitelist kullanamazsınız — bu durumda
   anahtar güvenliği tamamen "çekim izni kapalı" + `.env` gizliliğine dayanır.
 - `.env` → `BOT_MODE=live`, küçük bir bakiyeyle başlayın.

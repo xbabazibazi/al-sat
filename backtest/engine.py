@@ -17,9 +17,14 @@ import numpy as np
 import pandas as pd
 
 from src.config import StrategyParams
-from src.strategy import check_entry, compute_indicators, initial_stop, updated_trailing_stop
+from src.strategy import (add_daily_trend_filter, check_entry, compute_indicators,
+                          initial_stop, updated_trailing_stop)
 
-FEE = 0.001         # %0.1 Binance spot komisyonu (taraf başına)
+# Komisyon senaryoları (taraf başına):
+#   varsayılan     : %0.100 taker
+#   BNB indirimi   : %0.075 (Binance'te "BNB ile öde" açık)
+#   BNB + maker    : %0.0563 giriş (limit emir maker dolumu varsayımı)
+FEE = 0.001
 SLIPPAGE = 0.0005   # %0.05 kayma (taraf başına)
 
 
@@ -98,8 +103,13 @@ def run_backtest(
     max_balance_usage: float = 0.95,
     label: dict | None = None,
     bars_per_year: float = 8760.0,
+    entry_fee: float = FEE,
+    exit_fee: float = FEE,
+    daily_df: pd.DataFrame | None = None,
 ) -> BacktestResult:
     ind = compute_indicators(df, params)
+    if daily_df is not None and params.use_daily_filter:
+        ind = add_daily_trend_filter(ind, daily_df, params)
 
     cash = start_cash
     qty = 0.0
@@ -124,9 +134,9 @@ def run_backtest(
                 exit_price = stop
             if exit_price is not None:
                 exit_price *= (1 - SLIPPAGE)
-                cash += qty * exit_price * (1 - FEE)
+                cash += qty * exit_price * (1 - exit_fee)
                 # PnL komisyon DAHİL (net) — metrikler gerçeği yansıtsın
-                net_pnl = qty * (exit_price * (1 - FEE) - entry_price * (1 + FEE))
+                net_pnl = qty * (exit_price * (1 - exit_fee) - entry_price * (1 + entry_fee))
                 trades.append(Trade(entry_i, i, entry_price, exit_price, qty, net_pnl))
                 qty = 0.0
 
@@ -147,7 +157,7 @@ def run_backtest(
                             (cash * max_balance_usage) / fill)
                     cost = q * fill
                     if q > 0 and cost >= 10:  # minNotional benzeri alt sınır
-                        cash -= cost * (1 + FEE)
+                        cash -= cost * (1 + entry_fee)
                         qty = q
                         entry_price = fill
                         highest = fill
@@ -159,8 +169,8 @@ def run_backtest(
     # açık pozisyonu son kapanışta kapat
     if qty > 0:
         exit_price = closes[-1] * (1 - SLIPPAGE)
-        cash += qty * exit_price * (1 - FEE)
-        net_pnl = qty * (exit_price * (1 - FEE) - entry_price * (1 + FEE))
+        cash += qty * exit_price * (1 - exit_fee)
+        net_pnl = qty * (exit_price * (1 - exit_fee) - entry_price * (1 + entry_fee))
         trades.append(Trade(entry_i, len(ind) - 1, entry_price, exit_price, qty, net_pnl))
 
     eq_series = pd.Series(equity).dropna()
