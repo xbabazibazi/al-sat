@@ -1,81 +1,69 @@
-# Sunucu Kurulumu (7/24 çalışma)
+# Sunucu Kurulumu (7/24 çalışma) — UYGULANAN YÖNTEM
 
-Bot kendi PC'nde değil, **quonsoftware** sunucusunda çalışır; PC'n kapansa bile
-işlem taramaya devam eder. Panel Tailscale üzerinden her cihazdan erişilebilir.
+Bot **quonsoftware** sunucusunda çalışır; PC kapalı olsa bile işlem taramaya
+devam eder. Panel Tailscale üzerinden her cihazdan (telefon dahil) erişilebilir.
 
-## Mimari
+## Ortam
+
+| | |
+|---|---|
+| Sunucu | Ubuntu 26.04 LTS, fiziksel laptop |
+| Erişim | `quon@100.85.134.94` (Tailscale) / `quon@192.168.2.83` (yerel ağ) |
+| SSH anahtarı | `~/.ssh/id_ed25519_vaultwarden` |
+| Proje yolu | `/home/quon/al-sat` |
+| Panel | http://100.85.134.94:8484 |
+
+## Mimari (Docker YOK, systemd YOK — sudo gerektirmez)
 
 ```
-[ quonsoftware sunucusu (Linux, Tailscale 100.85.134.94) ]
-        │
-        └── Docker konteyneri (restart: always)
-              └── Panel (8484)  ──►  BAŞLAT/DURDUR + watchdog
-                    └── Bot (alt süreç)  ──►  Binance API + Telegram
-        │
-        └── Veri: ./data (SQLite — pozisyon, işlem geçmişi kalıcı)
-
-Erişim:  https://100.85.134.94:8484  (yalnızca Tailscale ağından)
+crontab (@reboot + 5 dakikalık nöbetçi)
+   └── paneli-baslat.sh
+         └── Panel (venv python, 8484)
+               └── Bot (alt süreç, watchdog ile ayakta)
+                     └── Binance API + Telegram
 ```
 
 **Üç katmanlı süreklilik:**
-1. `restart: always` — sunucu yeniden başlasa konteyner geri gelir
-2. Watchdog — bot düşerse 45 saniyede yeniden başlatılır
-3. `bot_should_run` bayrağı — BAŞLAT dedikten sonra DURDUR diyene kadar açık kalır
+1. `@reboot` — sunucu yeniden başlarsa 30 saniyede panel açılır
+2. Nöbetçi cron (5 dk) — panel ölürse yeniden başlatır
+3. Panel watchdog (20 sn) — bot ölürse yeniden başlatır, `bot_should_run`
+   bayrağı SQLite'ta olduğu için DURDUR denene kadar açık kalır
 
-## Kurulum adımları
+Docker denendi (izin/grup/volume sorunları), systemd denendi (SSH'ta sudo TTY
+sorunu) — ikisi de elendi. Sudo'suz yöntem sorunsuz çalıştı.
 
-### 1. Repoyu sunucuya al
-
-```bash
-ssh quonsoftware
-git clone https://github.com/xbabazibazi/al-sat.git ~/al-sat
-cd ~/al-sat
-```
-
-(veya Gitea'dan: `git clone https://quonsoftware.tail1d1724.ts.net:3002/<kullanici>/al-sat.git ~/al-sat`)
-
-### 2. .env dosyasını kopyala
-
-`.env` repoda **yoktur** (Telegram token ve ayarlar içerir). Yerel makinenden gönder:
+## Kurulum / güncelleme (tek komut)
 
 ```powershell
-scp "D:\Projeler2\AL SAT BOT\.env" quonsoftware:~/al-sat/.env
+cd "D:\Projeler2\AL SAT BOT"
+.\deploy\SUNUCUYA-KUR.ps1
 ```
 
-### 3. Kurulum betiğini çalıştır
+Betik: kodu GitHub'a gönderir → sunucuda repoyu günceller → `.env` gönderir
+→ venv kurar → paneli başlatır → botu otomatik çalıştırır → PC'deki botu durdurur.
 
-```bash
-cd ~/al-sat
-bash deploy/sunucuya-kur.sh
+## Yönetim
+
+```powershell
+$k = "$env:USERPROFILE\.ssh\id_ed25519_vaultwarden"
+$s = "quon@100.85.134.94"
+
+ssh -i $k $s "tail -n 40 ~/al-sat/logs/panel.log"      # panel logu
+ssh -i $k $s "pgrep -af 'src.panel|src.main'"          # süreçler
+ssh -i $k $s "crontab -l"                              # otomatik başlatma
+ssh -i $k $s "cat ~/al-sat/data/bot_state.db > /dev/null; echo DB_OK"
 ```
 
-Betik: Docker'ı kurar (yoksa), Tailscale IP'sini bulup porta bağlar,
-konteyneri derleyip başlatır.
+Botu durdurmak/başlatmak için panelin **BAŞLAT / DURDUR** butonları kullanılır.
 
-### 4. Paneli aç ve başlat
+## Yedekleme
 
-Tarayıcıda **http://100.85.134.94:8484** → **▶ BAŞLAT**
-
-## Yönetim komutları
-
-```bash
-docker compose logs -f          # canlı log
-docker compose ps               # durum
-docker compose restart          # yeniden başlat
-docker compose down             # tamamen durdur
-docker compose up -d --build    # kod güncellemesinden sonra
+```powershell
+scp -i $k ${s}:~/al-sat/data/bot_state.db "D:\Projeler2\AL SAT BOT\data\yedek.db"
 ```
 
-## Güvenlik notları
+## Notlar
 
-- Panel portu **Tailscale IP'sine kilitlidir** (`100.85.134.94:8484:8484`) —
-  internete açık değildir, yalnızca kendi cihazlarından erişilir.
-- `.env` dosyası repoya girmez (`.gitignore`). Sunucuda `chmod 600 .env` yap.
-- Bot `futures_paper` modunda sanal parayla çalışır — gerçek borsa emri göndermez.
-
-## PC'deki botu kapatmayı unutma
-
-Sunucuda çalışmaya başladıktan sonra PC'ndeki botu durdur (çifte işlem olmasın):
-yerel panelde **■ DURDUR** veya BASLAT.bat pencerelerini kapat.
-Not: iki bot aynı `data/bot_state.db` dosyasını paylaşmadığı için çifte
-çalışma kilidi bu durumda korumaz — biri PC'de biri sunucuda ayrı hesaplar olur.
+- `.env` repoda yoktur, `scp` ile gönderilir (`chmod 600`)
+- Panel yalnızca Tailscale IP'sini dinler (`PANEL_HOST`), internete kapalıdır
+- PC'de bot çalıştırmayın — iki bot ayrı veritabanı kullanır, çakışır
