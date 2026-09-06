@@ -44,10 +44,18 @@ class Config:
     mode: str = _env("BOT_MODE", "dry_run").lower()  # dry_run | testnet | live | futures_paper
 
     # ---- Vadeli işlem (futures_paper) ayarları ----
-    # Backtest kanıtı (2022-2026): kaldıraç pozisyonu BÜYÜTMEZ (boyutu risk belirler),
-    # yalnızca bakiye tavanını gevşetir; 2x'te BTC +%63/Sharpe 1.00, likidasyon 0.
-    # SHORT tarafı 9/9 konfigürasyonda ZARAR etti -> varsayılan kapalı.
-    leverage: float = float(_env("LEVERAGE", "2"))
+    # Kaldıraç neden 1? (2026-09-06 ölçümü — backtest/ayar_etkisi.py)
+    # 10 paritede 1x ve 2x satırları BİREBİR ÖZDEŞ çıktı: %10.8 getiri,
+    # Sharpe 0.46, 31.4 işlem/yıl. Sebep: pozisyon boyutunu risk kuralı
+    # (RISK_PCT / stop mesafesi) belirler; kaldıraç yalnızca bakiye tavanını
+    # gevşetir ve o tavana hiç değinilmez. Yani 2x, karşılığında hiçbir getiri
+    # vermeden likidasyon riski taşıyordu -> 1x'e indirildi (bedelsiz güvenlik).
+    # RISK_PCT belirgin artırılırsa tavan bağlayıcı olabilir; o zaman gözden geçir.
+    #
+    # SHORT: eski 3-parite testinde 9/9 zarar etmişti, ama 10 paritelik yeni
+    # ölçümde short tarafı KÂRLI ve getirinin ana kaynağı (sadece-long %4.8'e
+    # karşı long+short %11.8). .env'de ALLOW_SHORT=true ile açık.
+    leverage: float = float(_env("LEVERAGE", "1"))
     allow_long: bool = _env("ALLOW_LONG", "true").lower() == "true"
     allow_short: bool = _env("ALLOW_SHORT", "false").lower() == "true"
     futures_taker_fee: float = 0.0005          # USDT-M taker %0.05

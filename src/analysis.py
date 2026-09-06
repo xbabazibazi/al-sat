@@ -28,11 +28,27 @@ import pandas as pd
 
 from .config import StrategyParams
 
-# Eşik ayarlanabilir: 50 = katı (4s trend tek başına yetmez, teyit ister),
-# 30 = gevşek (4s trend yeterli, diğer araçlar karşı çıkmadıkça).
-# A/B (2022-2026, 2x): katı mod SOL'u +10p iyileştirip DD'yi yarılarken
-# BTC/ETH getirisini kırptı — getiri/güvenlik dengesi kullanıcı tercihi.
-SCORE_THRESHOLD = int(os.getenv("ANALYSIS_THRESHOLD", "50"))
+# Eşik neden 20? (2026-09-06 ölçümü — bkz. docs/03-Karar-Gunlugu.md)
+#
+# Giriş sinyali ZATEN fiyatın EMA200'ün doğru tarafında olmasını şart koşar,
+# dolayısıyla "4s Trend" oyu bir LONG sinyalinde her zaman +30, SHORT'ta −30
+# gelir. Eşik 50 iken diğer araçlardan ±20 daha gerekir; günlük trend ters
+# yöndeyse (∓20) kalan iki aracın toplamı (max ±35) buna asla yetişemez.
+# Sonuç: eşik 50, günlük trend ters yönde olduğunda girişi TAMAMEN yasaklar —
+# yani A/B testinde tutarsız bulunup USE_DAILY_FILTER=false ile kapatılan
+# günlük EMA filtresini arka kapıdan geri sokar.
+#
+# Çürütülebilir kanıt (backtest/esik_saglamlik.py, 10 parite, 2022-2026):
+#   eşik 50 -> günlük filtreyi AÇMAK sonucu 0.00pp değiştirir (10/10 parite aynı)
+#   eşik 20 -> günlük filtreyi AÇMAK −8.03pp götürür (0/10 parite aynı)
+# Yani 50'de filtre zaten uygulanıyordu.
+#
+# Üç kapılı sağlamlık: plato 0-25 arası düz (uçurum 30'da) · 9/10 paritede
+# üstün · her iki dönemde de üstün. Getiri %11.8->%19.8, Sharpe 0.45->0.58,
+# bedeli MaxDD %10.6->%12.0. Plato ORTASI seçildi (kenarı değil).
+#
+# Katman KALDIRILMADI: volatilite vetosu ve karşı-yön reddi aynen çalışır.
+SCORE_THRESHOLD = int(os.getenv("ANALYSIS_THRESHOLD", "20"))
 ATR_PCT_MIN = 0.3   # bunun altı: ölü piyasa, kırılımlar sahte olur
 ATR_PCT_MAX = 6.0   # bunun üstü: kaos/haber şoku, stoplar anlamsızlaşır
 

@@ -83,3 +83,55 @@ XRP (−%17), LINK (−%8), AVAX (~0), ADA (+%3.7), DOGE (+%7.1) — zayıf/nega
 | + Maker limit girişi | +%41.1* |
 
 *Günlük filtre açıkken ölçüldü; komisyon katkısı üç paritede de +2-4 puan.
+
+---
+
+## GÜNCEL CANLI KONFİGÜRASYON (2026-09-06 sonrası)
+
+En üstteki tablo **spot / Donchian 20 / risk %2** ile üretilmişti ve canlı botla
+karşılaştırılamaz. Canlı bot vadeli, long+short, analiz katmanlı çalışıyor.
+Güncel ayarın 10 paritedeki gerçek ölçümü:
+
+**Ayar:** 4h · Donchian 10 · ATR×3.0 · kaldıraç 1x · risk %1 · long+short ·
+analiz eşiği 20 · günlük sermaye stopu %10 (seçici)
+
+| Parite | Getiri (4 yıl) | MaxDD | Sharpe | İşlem | Kazanma | PF | Likid. |
+|---|---|---|---|---|---|---|---|
+| BTCUSDT | +%6.6 | −%17.0 | 0.22 | 263 | %35.4 | 1.06 | 0 |
+| ETHUSDT | +%30.0 | −%12.2 | 0.79 | 261 | %39.5 | 1.30 | 0 |
+| SOLUSDT | +%25.9 | −%9.8 | 0.71 | 252 | %38.9 | 1.26 | 0 |
+| BNBUSDT | +%32.6 | −%9.1 | 0.83 | 245 | %39.2 | 1.37 | 0 |
+| DOTUSDT | +%10.5 | −%12.6 | 0.35 | 251 | %40.6 | 1.12 | 0 |
+| FILUSDT | +%19.1 | −%13.7 | 0.53 | 252 | %38.9 | 1.19 | 0 |
+| DOGEUSDT | +%22.6 | −%14.2 | 0.61 | 260 | %39.6 | 1.25 | 0 |
+| INJUSDT | +%19.3 | −%8.3 | 0.57 | 232 | %39.7 | 1.24 | 0 |
+| ARBUSDT | +%17.4 | −%14.9 | 0.72 | 180 | %41.7 | 1.29 | 0 |
+| OPUSDT | +%14.2 | −%8.7 | 0.50 | 223 | %39.0 | 1.18 | 0 |
+| **ORTALAMA** | **+%19.8** | **−%12.1** | **0.58** | 242 | **%39.3** | **1.23** | **0** |
+
+10/10 parite pozitif. Likidasyon yok.
+
+**Canlı takip için beklenen bant** (Faz 1 kapısı — bkz. yol haritası):
+- Kazanma oranı: %32–46 (ölçüm %39.3)
+- Ortalama kazanç ÷ ortalama kayıp: ≥ 1.8
+- En derin düşüş: ≤ %20 (ölçüm %12.1; iki katı aşılırsa varsayım bozulmuştur)
+- Likidasyon 0 · stopsuz pozisyon 0
+
+**UYARI — backtest her pariteyi AYRI $10.000 ile çalıştırır.** Canlı bot 10
+pariteyi TEK bakiyeyle paylaşır. Getiriler paritelerin ortalamasına yakın
+seyretmeli ama birebir aynı olmaz. Ayrıca geçmiş performans gelecek getiriyi
+garanti etmez; bu tablo bir beklenti bandıdır, taahhüt değil.
+
+### Reddedilen alternatifler (kâr realizasyonu araştırması)
+
+| Şema | Ort. getiri | Neden reddedildi |
+|---|---|---|
+| Kısmi çıkış %50 @1R | %7.9 | Net zararlı — büyük kazananları kesiyor |
+| Kısmi çıkış %50 @2R | %9.7 | Net zararlı |
+| Sert kâr hedefi @5R | %12.9 | Parite (5/10) ve dönem (3/10) testlerinde çakıldı |
+| Sert kâr hedefi @3R | %13.5 | Yalnızca 8/10 pozitif; dönem tutarlılığı zayıf |
+| 2R sonrası stop sıkılaştırma | %10.1 | Baz senaryodan kötü |
+| **Saf iz süren stop (korundu)** | **%11.8** \* | 10/10 pozitif — tek tutarlı şema |
+
+\* Bu sütun eski eşik 50 ile ölçülmüştür; şemalar arası karşılaştırma aynı
+zeminde kalsın diye. Eşik 20 ile aynı şema %19.8 verir.
