@@ -82,10 +82,45 @@ class FuturesPaperTrader:
     def _stop_hit(self, pos: Position, price: float) -> bool:
         return price <= pos.trailing_stop if pos.side == "LONG" else price >= pos.trailing_stop
 
+    # --------------------------------------------------------- manuel komutlar
+    def _process_manual_commands(self, pos: Position | None, price: float) -> Position | None:
+        """Panelden gelen manuel AÇ/KAPAT komutlarını işler.
+
+        Panel doğrudan pozisyona dokunmaz; komutu SQLite'a yazar, bot burada
+        uygular. Böylece pozisyon/bakiye üzerinde tek yazıcı bot kalır
+        (iki süreç aynı anda yazarsa tutarsızlık olurdu).
+        """
+        key = f"cmd_{self.symbol}"
+        cmd = self.state.get_kv(key)
+        if not cmd:
+            return pos
+        self.state.set_kv(key, "")  # komutu hemen tüket (tekrar işlenmesin)
+
+        if cmd == "CLOSE":
+            if pos is None:
+                log.info("[%s] Manuel kapatma istendi ama açık pozisyon yok", self.symbol)
+                return None
+            slip = (1 - SLIPPAGE) if pos.side == "LONG" else (1 + SLIPPAGE)
+            log.info("[%s] MANUEL KAPATMA uygulanıyor", self.symbol)
+            self._close(pos, price * slip, "manuel kapatma")
+            return None
+
+        if cmd in ("OPEN_LONG", "OPEN_SHORT"):
+            if pos is not None:
+                log.info("[%s] Manuel açma istendi ama zaten pozisyon var", self.symbol)
+                return pos
+            side = "LONG" if cmd == "OPEN_LONG" else "SHORT"
+            log.info("[%s] MANUEL %s açılıyor", self.symbol, side)
+            self._open(side, manual=True)
+            return self.state.get_position(self.symbol)
+
+        return pos
+
     # ------------------------------------------------------------------ ana akış
     def poll(self) -> None:
         price = self.market.last_price(self.symbol)
         pos = self.state.get_position(self.symbol)
+        pos = self._process_manual_commands(pos, price)
 
         # 1) Funding tahakkuku + canlı stop kontrolü (her poll)
         if pos is not None:
@@ -99,19 +134,29 @@ class FuturesPaperTrader:
                 self._close(pos, pos.trailing_stop * slip, "izleyen stop")
                 pos = None
 
-        # 1b) GÜNLÜK SERMAYE STOP'U: günlük zarar limiti aşıldıysa pozisyonları
-        # kapat ve günü bitir (yalnızca yeni girişleri kesmekle kalmaz).
+        # 1b) GÜNLÜK SERMAYE STOP'U — SEÇİCİ KAPATMA
+        # Limit aşıldığında YALNIZCA zarardaki pozisyonlar kapatılır.
+        # Kârdaki pozisyonlar açık kalır çünkü:
+        #   - stratejinin kârı, kazanan işlemlerin uzun sürmesinden gelir
+        #   - kazanan pozisyon "suçlu" değil; başkası kaybetti diye kesmek mantıksız
+        #   - zaten izleyen stop'u var, kâr geri verilse bile korumalı
+        # Yeni girişler her hâlükârda durur (breaker.entries_allowed).
         if pos is not None:
             today = datetime.now(timezone.utc).date().isoformat()
             allowed, day_pnl = self.breaker.entries_allowed(today, self.account_equity())
             if not allowed:
-                slip = (1 - SLIPPAGE) if pos.side == "LONG" else (1 + SLIPPAGE)
-                self._close(pos, price * slip, "günlük sermaye stopu")
-                self.notifier.send_error(
-                    f"🛑 GÜNLÜK SERMAYE STOPU: zarar %{-day_pnl*100:.1f} limiti aştı — "
-                    f"{self.symbol} kapatıldı, bugün yeni giriş yok."
-                )
-                pos = None
+                upnl = self._unrealized(pos, price) - pos.funding_acc
+                if upnl < 0:
+                    slip = (1 - SLIPPAGE) if pos.side == "LONG" else (1 + SLIPPAGE)
+                    self._close(pos, price * slip, "günlük sermaye stopu")
+                    self.notifier.send_error(
+                        f"🛑 GÜNLÜK SERMAYE STOPU (%{-day_pnl*100:.1f}) — "
+                        f"{self.symbol} ZARARDA olduğu için kapatıldı. Bugün yeni giriş yok."
+                    )
+                    pos = None
+                else:
+                    log.info("[%s] Devre kesici aktif ama pozisyon KÂRDA (%+.2f USDT) — "
+                             "açık bırakılıyor, izleyen stop koruyor", self.symbol, upnl)
 
         # 2) Yeni kapanmış mum
         df = self.market.klines(self.symbol, self.cfg.timeframe, limit=500)
@@ -195,29 +240,50 @@ class FuturesPaperTrader:
                      self.symbol, side, assessment.decision, assessment.score)
             return
 
+        self._open(side, atr=sig.atr, reason=sig.reason)
+
+    def _open(self, side: str, atr: float | None = None,
+              reason: str = "", manual: bool = False) -> None:
+        """Pozisyon açar. Otomatik sinyalde de manuel komutta da burası çalışır —
+        risk yönetimi, stop kurulumu ve devre kesici HER İKİSİNDE de geçerli."""
+        if atr is None:  # manuel açılışta ATR'yi taze veriden hesapla
+            df = self.market.klines(self.symbol, self.cfg.timeframe, limit=300)
+            ind = compute_indicators(df.iloc[:-1], self.cfg.strategy)
+            atr = float(ind.iloc[-1]["atr"])
+            if pd.isna(atr) or atr <= 0:
+                log.warning("[%s] Manuel açılış: ATR hesaplanamadı", self.symbol)
+                return
+
         today = datetime.now(timezone.utc).date().isoformat()
         equity = self.account_equity()
         allowed, day_pnl = self.breaker.entries_allowed(today, equity)
         if not allowed:
             log.warning("[%s] Devre kesici aktif (günlük %%%.1f) — giriş yok",
                         self.symbol, day_pnl * 100)
+            if manual:
+                self.notifier.send_error(
+                    f"{self.symbol}: manuel açılış reddedildi — günlük sermaye stopu aktif."
+                )
             return
 
         balance = self._balance()
-        stop_distance = sig.atr * self.cfg.strategy.atr_multiplier
+        stop_distance = atr * self.cfg.strategy.atr_multiplier
         if stop_distance <= 0:
             return
+        ref_price = self.market.last_price(self.symbol)
         qty = min((balance * self.cfg.risk_pct) / stop_distance,
-                  (balance * self.cfg.max_balance_usage * self.cfg.leverage) / sig.close)
+                  (balance * self.cfg.max_balance_usage * self.cfg.leverage) / ref_price)
         qty = floor_to_step(qty, self.filters.step_size)
-        price = self.market.last_price(self.symbol)
-        fill = price * (1 + SLIPPAGE) if side == "LONG" else price * (1 - SLIPPAGE)
+        fill = ref_price * (1 + SLIPPAGE) if side == "LONG" else ref_price * (1 - SLIPPAGE)
         notional = qty * fill
         margin = notional / self.cfg.leverage
         entry_fee = notional * self.cfg.futures_taker_fee
 
         if qty < self.filters.min_qty or notional < 10 or margin + entry_fee > balance:
-            log.info("[%s] %s sinyali var ama boyut/bakiye yetersiz", self.symbol, side)
+            log.info("[%s] %s: boyut/bakiye yetersiz (qty=%s notional=%.2f)",
+                     self.symbol, side, qty, notional)
+            if manual:
+                self.notifier.send_error(f"{self.symbol}: manuel açılış — bakiye/miktar yetersiz.")
             return
 
         self._set_balance(balance - margin - entry_fee)
@@ -230,8 +296,9 @@ class FuturesPaperTrader:
         )
         self.state.save_position(pos)
         arrow = "📈 LONG" if side == "LONG" else "📉 SHORT"
+        etiket = "🖐 MANUEL" if manual else reason
         self.notifier.send(
-            f"{arrow} *{self.symbol} AÇILDI* ({sig.reason})\n"
+            f"{arrow} *{self.symbol} AÇILDI* ({etiket})\n"
             f"• Giriş: `${fill:,.2f}`  Miktar: `{qty}`  Kaldıraç: `{self.cfg.leverage}x`\n"
             f"• Marjin: `${margin:,.2f}`  Stop: `${stop:,.2f}`"
         )

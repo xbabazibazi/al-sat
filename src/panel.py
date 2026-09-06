@@ -241,6 +241,11 @@ PAGE = """<!doctype html>
   .ctrl .state { font-size:13px; color:var(--ink2); }
   .ctrl .state b.on { color:var(--up); } .ctrl .state b.offc { color:var(--down); }
   .ctrl .note { font-size:12px; color:var(--mut); margin-left:auto; }
+  button.mini { font-size:11px; font-weight:700; padding:3px 9px; border-radius:5px;
+    margin-left:5px; letter-spacing:.02em; }
+  button.mini.close { background:var(--down); }
+  button.mini.long  { background:var(--up); padding:3px 7px; }
+  button.mini.short { background:var(--down); padding:3px 7px; }
 </style></head><body>
 <div class="top">
   <h1><span class="pulse" id="pulse"></span>AL-SAT Paneli</h1>
@@ -311,7 +316,7 @@ async function refresh() {
     : `<div class="empty">İlk mum kapanışı bekleniyor — analiz her 4 saatte bir yenilenir</div>`;
 
   $("positions").innerHTML = d.positions.length ? "<table><tr>" +
-    "<th>Parite</th><th>Yön</th><th>Giriş</th><th>Anlık</th><th>Stop</th><th>Marjin</th><th>Funding</th><th>Anlık PnL</th><th>%</th></tr>" +
+    "<th>Parite</th><th>Yön</th><th>Giriş</th><th>Anlık</th><th>Stop</th><th>Marjin</th><th>Funding</th><th>Anlık PnL</th><th>%</th><th>Manuel</th></tr>" +
     d.positions.map(p => `<tr>
       <td><b>${p.symbol}</b> <span style="color:var(--mut);font-size:11px">${p.since}</span></td>
       <td><span class="side ${p.side[0]}">${p.side}</span></td>
@@ -320,7 +325,8 @@ async function refresh() {
       <td>$${p.stop.toLocaleString("tr-TR",{maximumFractionDigits:2})}</td>
       <td>${money(p.margin)}</td><td>${money(p.funding)}</td>
       <td class="${cls(p.upnl)}"><b>${money(p.upnl)}</b></td>
-      <td class="${cls(p.upnl)}">${sign(p.upnl_pct)}%</td></tr>`).join("") + "</table>"
+      <td class="${cls(p.upnl)}">${sign(p.upnl_pct)}%</td>
+      <td><button class="mini close" onclick="manuel('close','${p.symbol}',${p.upnl.toFixed(2)})">KAPAT</button></td></tr>`).join("") + "</table>"
     : `<div class="empty">Açık pozisyon yok — bot sinyal bekliyor (${d.symbols.join(", ")})</div>`;
 
   $("watch").innerHTML = d.watchlist.length ? "<table><tr>" +
@@ -332,7 +338,9 @@ async function refresh() {
         : nearest < 1.5 ? "<span style='color:var(--accent);font-weight:600'>YAKIN</span>"
         : "<span style='color:var(--mut)'>bekliyor</span>";
       return `<tr>
-        <td><b>${w.symbol.replace("USDT","")}</b><span style="color:var(--mut);font-size:11px">USDT</span></td>
+        <td><b>${w.symbol.replace("USDT","")}</b><span style="color:var(--mut);font-size:11px">USDT</span>
+          <button class="mini long" onclick="manuel('long','${w.symbol}')">L</button>
+          <button class="mini short" onclick="manuel('short','${w.symbol}')">S</button></td>
         <td>$${w.price.toLocaleString("tr-TR",{maximumFractionDigits:2})}</td>
         <td style="width:34%">
           <div style="position:relative;height:6px;background:var(--card2);border-radius:3px">
@@ -375,6 +383,27 @@ async function refresh() {
       <td style="color:var(--mut)">${(t.exit_time||"").slice(0,16).replace("T"," ")}</td></tr>`).join("") + "</table>"
     : `<div class="empty">Henüz kapanan işlem yok</div>`;
 }
+async function manuel(eylem, sembol, pnl) {
+  const isim = sembol.replace("USDT","");
+  let soru;
+  if (eylem === "close") {
+    soru = `${isim} pozisyonunu ŞİMDİ kapat?\n\n` +
+           `Anlık kâr/zarar: ${pnl >= 0 ? "+" : ""}${pnl} USDT\n\n` +
+           `Not: Stratejinin kârı, kazanan işlemlerin uzun sürmesinden gelir.\n` +
+           `Erken kapatmak uzun vadeli getiriyi düşürür.`;
+  } else {
+    soru = `${isim} için MANUEL ${eylem.toUpperCase()} pozisyon aç?\n\n` +
+           `Bot sinyal vermedi — bu senin kararın.\n` +
+           `Risk yönetimi ve ATR stop yine uygulanacak.`;
+  }
+  if (!confirm(soru)) return;
+  try {
+    await fetch(`/api/manual/${eylem}/${sembol}`, { method: "POST" });
+    alert("Komut gönderildi. Bot 30 saniye içinde uygulayacak.");
+  } catch { alert("Komut gönderilemedi."); }
+  setTimeout(refresh, 2000);
+}
+
 async function ctrl(action) {
   $("btnStart").disabled = $("btnStop").disabled = true;
   $("botstate").textContent = action === "start" ? "Başlatılıyor…" : "Durduruluyor…";
@@ -401,6 +430,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "text/plain", b"404")
 
     def do_POST(self):
+        # Manuel komutlar: panel pozisyona DOKUNMAZ, komutu kuyruğa yazar;
+        # bot bir sonraki turunda (≤30 sn) uygular. Tek yazıcı ilkesi korunur.
+        if self.path.startswith("/api/manual/"):
+            parts = self.path.split("/")  # ['', 'api', 'manual', <eylem>, <sembol>]
+            if len(parts) == 5:
+                eylem, sembol = parts[3].upper(), parts[4].upper()
+                gecerli = {"CLOSE": "CLOSE", "LONG": "OPEN_LONG", "SHORT": "OPEN_SHORT"}
+                if eylem in gecerli and sembol in CONFIG.symbols:
+                    state.set_kv(f"cmd_{sembol}", gecerli[eylem])
+                    log.info("Manuel komut kuyruğa alındı: %s %s", sembol, gecerli[eylem])
+                    self._send(200, "application/json",
+                               json.dumps({"ok": True, "queued": gecerli[eylem]}).encode())
+                    return
+            self._send(400, "application/json", b'{"ok":false}')
+            return
+
         if self.path == "/api/start":
             state.set_kv("bot_should_run", "1")
             ok = spawn_bot()
