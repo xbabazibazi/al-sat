@@ -57,6 +57,9 @@ class Poz:
     funding: float = 0.0
     risk_birimi: float = 0.0
     entry_fee: float = 0.0
+    orig_qty: float = 0.0          # kısmi çıkış oranları buna göre hesaplanır
+    realize_kismi: float = 0.0     # kısmi çıkışlardan bankaya yazılan net
+    kismi_bitti: set = field(default_factory=set)
 
 
 @dataclass
@@ -138,6 +141,8 @@ def run_portfoy(
     max_positions: int | None = None,
     max_ayni_yon: int | None = None,
     tam_cikis_r: float | None = None,
+    kismi_hedefler: tuple[tuple[float, float], ...] = (),
+    kismi_sonrasi_basabas: bool = False,
 ) -> PortfoySonuc:
     semboller = list(veri.keys())
     zamanlar = sorted(set().union(*[set(d.index) for d in veri.values()]))
@@ -168,19 +173,40 @@ def run_portfoy(
             e += p.margin + upnl - p.funding
         return e
 
+    def kapat_kismi(s, oran, hedef):
+        """Orijinal miktarın `oran` kadarını `hedef` fiyattan kapatır."""
+        nonlocal cash, gun_realize
+        p = poz[s]
+        q = min(p.orig_qty * oran, p.qty)
+        if q <= 0:
+            return
+        fill = hedef * (1 - SLIPPAGE) if p.side == "LONG" else hedef * (1 + SLIPPAGE)
+        raw = q * (fill - p.entry) if p.side == "LONG" else q * (p.entry - fill)
+        pay = q / p.qty
+        m_ser = p.margin * pay
+        f_ser = p.funding * pay
+        cikis_fee = q * fill * fee
+        cash += m_ser + raw - cikis_fee - f_ser
+        net = raw - cikis_fee - f_ser
+        p.realize_kismi += net
+        gun_realize += net
+        p.margin -= m_ser
+        p.funding -= f_ser
+        p.qty -= q
+
     def kapat(s, fiyat, reason, t):
         nonlocal cash, gun_realize
         p = poz[s]
         if reason == "liq":
-            pnl = -p.margin - p.entry_fee - p.funding
+            pnl = p.realize_kismi - p.margin - p.entry_fee - p.funding
         else:
             raw = p.qty * (fiyat - p.entry) if p.side == "LONG" else p.qty * (p.entry - fiyat)
             cikis_fee = p.qty * fiyat * fee
             cash += p.margin + raw - cikis_fee - p.funding
-            pnl = raw - cikis_fee - p.funding - p.entry_fee
+            pnl = p.realize_kismi + raw - cikis_fee - p.funding - p.entry_fee
         islemler.append({"symbol": s, "side": p.side, "pnl": pnl,
                          "reason": reason, "time": t})
-        gun_realize += pnl
+        gun_realize += pnl - p.realize_kismi   # kısmiler zaten sayılmıştı
         del poz[s]
 
     for t in zamanlar:
@@ -228,6 +254,27 @@ def run_portfoy(
                 if ulasti:
                     slip = (1 - SLIPPAGE) if p.side == "LONG" else (1 + SLIPPAGE)
                     kapat(s, hedef * slip, "kâr hedefi", t)
+                    continue
+
+            # kısmi çıkışlar ("yarısını al, kalanı devam etsin")
+            if kismi_hedefler and p.risk_birimi > 0:
+                for idx, (r_sev, oran) in enumerate(kismi_hedefler):
+                    if idx in p.kismi_bitti:
+                        continue
+                    hedef = (p.entry + r_sev * p.risk_birimi if p.side == "LONG"
+                             else p.entry - r_sev * p.risk_birimi)
+                    ulasti = h >= hedef if p.side == "LONG" else lo <= hedef
+                    if not ulasti:
+                        continue
+                    kapat_kismi(s, oran, hedef)
+                    p.kismi_bitti.add(idx)
+                    # kalan için stop en azından başabaşa çekilir (kullanıcının
+                    # "stop'u yukarı al, kârdan devam et" dediği davranış)
+                    if kismi_sonrasi_basabas:
+                        p.stop = (max(p.stop, p.entry) if p.side == "LONG"
+                                  else min(p.stop, p.entry))
+                if p.qty <= 1e-12:
+                    kapat(s, float(d.at[t, "close"]), "kısmi tamam", t)
                     continue
 
             if not np.isnan(atr):
@@ -302,7 +349,7 @@ def run_portfoy(
                 cash -= m + entry_fee
                 poz[s] = Poz(yon, q, fill, m,
                              fill - stop_mesafe if yon == "LONG" else fill + stop_mesafe,
-                             fill, 0.0, stop_mesafe, entry_fee)
+                             fill, 0.0, stop_mesafe, entry_fee, orig_qty=q)
 
         # ---------- ölçüm ----------
         n = len(poz)
