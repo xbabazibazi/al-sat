@@ -117,6 +117,25 @@ rm -f "$CRON_TMP"
 echo "[4/5] Otomatik başlatma kuruldu (açılışta + 5 dakikalık nöbetçi)"
 
 # ---------- 5) Şimdi başlat ----------
+# GÜNCELLEME DURUMU: panel/bot zaten çalışıyorsa yeni kodu almaları için
+# ikisini de yeniden başlatmak gerekir. Açık pozisyonlar SQLite'ta durduğu
+# için kaybolmaz; bot açılışta kaldığı yerden devam eder.
+if pgrep -f "src.panel" >/dev/null 2>&1 || pgrep -f "src.main" >/dev/null 2>&1; then
+  echo "      mevcut süreçler yeni kod için yeniden başlatılıyor..."
+  echo "      (açık pozisyonlar korunur — durum veritabanında)"
+  pkill -f "src.main"  >/dev/null 2>&1
+  pkill -f "src.panel" >/dev/null 2>&1
+  sleep 3
+  # Kalp atışını temizle: yoksa panel botu "hâlâ canlı" sanıp yenisini başlatmaz
+  "$PY" - <<'PYEOF' 2>/dev/null || true
+import sqlite3
+c = sqlite3.connect("data/bot_state.db")
+c.execute("UPDATE kv SET value='' WHERE key='bot_heartbeat'")
+c.commit()
+c.close()
+PYEOF
+fi
+
 echo -n "[5/5] Panel başlatılıyor"
 ./paneli-baslat.sh
 HAZIR=0
