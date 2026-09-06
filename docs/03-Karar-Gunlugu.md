@@ -66,3 +66,70 @@ pozisyon riski). Artık taze kalp atışı varsa ikinci bot başlamayı reddediy
 
 **Wiki/dokümantasyon** — `docs/` klasörü oluşturuldu; GitHub ve Gitea
 wiki'lerinde de yayınlanabilir.
+
+## 2026-09-06 (ikinci oturum) — kâr realizasyonu araştırması
+
+Kullanıcı sorusu: "kârı nasıl realize edelim?" İki ayrı şey ölçüldü:
+işlem seviyesinde çıkış şeması, ve ayarların getiriye etkisi.
+
+**Önce bir düzeltme:** önceki oturumda "kısmi çıkış getiriyi düşürür" denmişti
+ama bu ÖLÇÜLMEMİŞ bir varsayımdı. Ölçüldü; yönü doğruymuş ama gerekçe eksikti.
+
+### Ölçüm altyapısı
+- `backtest/kar_cikis.py` — 10 çıkış şemasını aynı varsayımlarla karşılaştırır.
+  Bar içi sıralama KARAMSAR: aynı barda stop ve kâr hedefi mümkünse stop
+  önce sayılır, böylece kâr hedefi şemaları kayrılmaz.
+  Motor `futures_engine` ile birebir doğrulandı (3 paritede $0.0000 fark).
+- `backtest/ayar_etkisi.py` — canlı ayardan tek tek sapma etkisi.
+- `backtest/kar_hedefi_saglamlik.py`, `backtest/esik_saglamlik.py` — üç
+  kapılı sağlamlık çıtası: geniş plato + ≥7/10 parite + her iki dönemde üstünlük.
+
+### Karar 1: Kâr hedefi EKLENMEDİ (sağlamlık testinden geçemedi)
+10 parite ortalaması sert kâr hedefini cazip gösterdi (2R: +3.8pp, 5R: +1.1pp)
+ve plato testini geçti (2R–8R arası hepsi bazı yener). Ancak:
+- Parite kırılımı: 5R yalnızca 5/10 paritede kazandı; BTC ve ETH kötüleşti.
+- Dönem testi: 5R ilk yarıda 3/10 (3.5% vs baz 3.8%) — üstünlük yok.
+Üç kapıdan ikisinde çakıldı → REDDEDİLDİ. Saf iz süren stop korundu.
+İz süren stop 10/10 paritede pozitif; bulunan alternatiflerin hiçbiri bu
+tutarlılığı sağlamadı.
+
+Kısmi çıkışlar da net zararlı: %50@1R getiriyi %11.8'den %7.9'a düşürdü.
+Erken kâr alma, tüm kaybedenleri finanse eden büyük kazananları kesiyor.
+
+### Karar 2: ANALYSIS_THRESHOLD 50 -> 20 (üç testi de geçti)
+**Mekanizma:** giriş sinyali zaten fiyatın EMA200'ün doğru tarafında olmasını
+şart koşuyor, dolayısıyla "4s Trend" oyu LONG'da her zaman +30. Eşik 50 iken
+diğer araçlardan +20 daha gerekir; günlük trend aşağıysa (-20) kalan iki aracın
+maksimumu +35 olduğundan toplam asla +20'ye ulaşamaz. Yani **eşik 50, günlük
+trend aşağıyken LONG'u tamamen yasaklar** — bu, A/B testinde tutarsız bulunup
+`USE_DAILY_FILTER=false` ile kapatılan günlük EMA filtresinin ta kendisidir.
+Analiz katmanı onu arka kapıdan geri sokmuş.
+
+**Falsifiye edilebilir kanıt** (`esik_saglamlik.py`):
+| Eşik | Günlük filtre KAPALI | AÇIK | Fark | Değişmeyen parite |
+|---|---|---|---|---|
+| 50 | %11.8 | %11.8 | 0.00pp | 10/10 |
+| 20 | %19.8 | %11.8 | −8.03pp | 0/10 |
+| 0  | %20.5 | %11.8 | −8.71pp | 0/10 |
+Eşik 50'de günlük filtreyi açmak hiçbir şeyi değiştirmiyor — çünkü zaten
+uygulanıyor. İddia doğrulandı.
+
+**Sağlamlık (10 parite, 4h, 2022-2026, 2x, risk %1):**
+- Plato: eşik 0/10/20/25 hepsi ~%19.8–20.5; uçurum 30'da. Tek nokta değil.
+- Parite: eşik 20, 9/10 paritede eşik 50'yi yendi (ETH +25pp, BNB +18pp;
+  yalnızca DOT −4.5pp).
+- Dönem: ilk yarı %3.8→%7.5, ikinci yarı %9.1→%13.6. İkisinde de üstün.
+
+Bedeli: MaxDD %10.6 → %12.0 (1.4pp kötüleşme), işlem/yıl 41 → 60.
+Getiri neredeyse ikiye katlanırken Sharpe 0.45 → 0.58 yükseliyor; takas iyi.
+
+Plato ortası seçildi (kenar değil, eğri uydurmaya karşı): **20**.
+Analiz katmanı KALDIRILMADI — kullanıcı şartı ("inceleme olmadan hiçbir işleme
+girme") korunuyor: volatilite vetosu ve karşı-yön reddi aynen çalışıyor.
+
+### Yan bulgu: kaldıraç 2x, 1x ile BİREBİR AYNI sonucu veriyor
+Donchian 20'de 1x ve 2x satırları özdeş (%10.8, Sharpe 0.46, 31.4 işlem/yıl).
+Pozisyon boyutunu risk belirlediği için kaldıraç yalnızca bakiye tavanını
+gevşetiyor; o tavana hiç değilmiyor. Yani 2x, karşılığında hiçbir getiri
+vermeden likidasyon riski taşıyor. Backtest'te 0 likidasyon görüldü, ama
+1x'e inmek bedelsiz bir güvenlik kazancı olurdu — kullanıcı onayına bırakıldı.
