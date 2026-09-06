@@ -178,6 +178,9 @@ def build_state() -> dict:
         "trades": state.recent_trades(30),
         "equity_history": [{"t": t, "v": round(v, 2)} for t, v in state.equity_history(600)],
         "assessments": state.latest_assessments(),
+        "r_events": state.recent_r_events(12),
+        "max_positions": CONFIG.max_concurrent_positions,
+        "r_level": CONFIG.r_notify_level,
     }
 
 
@@ -265,6 +268,7 @@ PAGE = """<!doctype html>
 <div class="card"><h2>Açık Pozisyonlar — anlık kâr/zarar</h2><div id="positions"></div></div>
 <div class="card"><h2>İzleme Listesi — tetiğe uzaklık</h2><div id="watch"></div></div>
 <div class="card"><h2>Varlık Eğrisi</h2><div id="chart"><div class="empty">Veri birikiyor…</div></div></div>
+<div class="card"><h2>Kâr Kilometre Taşları <span id="rbaslik" style="font-weight:400;color:var(--mut);font-size:13px"></span></h2><div id="revents"></div></div>
 <div class="card"><h2>Son İşlemler</h2><div id="trades"></div></div>
 <script>
 const $ = id => document.getElementById(id);
@@ -370,6 +374,21 @@ async function refresh() {
       <text x="${X(pts.length-1)-8}" y="${Y(vs.at(-1))-8}" text-anchor="end" font-size="11"
         fill="var(--ink)" font-weight="600">$${vs.at(-1).toLocaleString("tr-TR")}</text></svg>`;
   }
+
+  $("rbaslik").textContent = `— ${d.r_level}R'de bildirim gider, pozisyon kapanmaz`;
+  $("revents").innerHTML = (d.r_events && d.r_events.length) ? "<table><tr>" +
+    "<th>Parite</th><th>Yön</th><th>Eşik</th><th>Gerçek</th><th>Fiyat</th>" +
+    "<th>O anki kâr</th><th>Stop kilidi</th><th>Zaman</th></tr>" +
+    d.r_events.map(e => `<tr>
+      <td><b>${e.symbol}</b></td>
+      <td><span class="side ${(e.side||"LONG")[0]}">${e.side||"LONG"}</span></td>
+      <td>${(+e.r_level).toFixed(0)}R</td>
+      <td>${(+e.r_actual).toFixed(1)}R</td>
+      <td>$${(+e.price).toLocaleString("tr-TR")}</td>
+      <td class="${cls(e.upnl_usdt)}"><b>${money(e.upnl_usdt)}</b></td>
+      <td class="${cls(e.locked_usdt)}">${money(e.locked_usdt)}</td>
+      <td style="color:var(--mut)">${(e.ts||"").slice(0,16).replace("T"," ")}</td></tr>`).join("") + "</table>"
+    : `<div class="empty">Henüz ${d.r_level}R kârına ulaşan pozisyon olmadı</div>`;
 
   $("trades").innerHTML = d.trades.length ? "<table><tr>" +
     "<th>Parite</th><th>Yön</th><th>Giriş → Çıkış</th><th>Net PnL</th><th>%</th><th>Neden</th><th>Kapanış</th></tr>" +

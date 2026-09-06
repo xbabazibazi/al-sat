@@ -82,6 +82,62 @@ class FuturesPaperTrader:
     def _stop_hit(self, pos: Position, price: float) -> bool:
         return price <= pos.trailing_stop if pos.side == "LONG" else price >= pos.trailing_stop
 
+    # ------------------------------------------------------- kâr kilometre taşı
+    def _check_r_notify(self, pos: Position, price: float) -> None:
+        """Pozisyon N×R kâra ulaştığında Telegram'a haber verir — KAPATMAZ.
+
+        Otomatik kâr hedefi bilerek konulmadı: mevcut parite listesiyle
+        sağlamlık testini geçemedi. Karar kullanıcıda; bildirim gelir,
+        dilerse panelden KAPAT'a basar, basmazsa izleyen stop işine devam eder.
+
+        Bildirimde 'kilitli kâr' de gösterilir çünkü asıl güven verici bilgi
+        odur: 3×ATR izleyen stop ile 4R'ye ulaşıldığında stop zaten giriş+3R
+        civarındadır, yani kârın büyük kısmı garanti altındadır.
+        """
+        seviye = self.cfg.r_notify_level
+        if seviye <= 0 or pos.qty <= 0:
+            return
+
+        # Bu özellikten ÖNCE açılmış pozisyonlarda risk_unit kayıtlı değil.
+        # Uydurmak yerine mevcut izleyen stop mesafesinden türetilir; bu,
+        # giriş anındaki ATR ile bugünkü ATR aynıysa birebir, değilse
+        # yaklaşıktır (bu yüzden mesajda "≈" kullanılır).
+        yaklasik = False
+        if pos.risk_unit <= 0:
+            tahmin = abs(pos.highest_price - pos.trailing_stop)
+            if tahmin <= 0:
+                return
+            pos.risk_unit = tahmin
+            yaklasik = True
+            self.state.save_position(pos)
+
+        kar_mesafe = ((price - pos.entry_price) if pos.side == "LONG"
+                      else (pos.entry_price - price))
+        r = kar_mesafe / pos.risk_unit
+        ulasilan = int(r / seviye) * seviye          # 4R, 8R, 12R...
+        if ulasilan < seviye or ulasilan <= pos.r_notified:
+            return
+
+        upnl = self._unrealized(pos, price) - pos.funding_acc
+        kilitli = pos.qty * ((pos.trailing_stop - pos.entry_price) if pos.side == "LONG"
+                             else (pos.entry_price - pos.trailing_stop))
+        pos.r_notified = ulasilan
+        self.state.save_position(pos)
+        self.state.record_r_event(
+            self.symbol, datetime.now(timezone.utc).isoformat(), pos.side,
+            ulasilan, r, price, upnl, kilitli,
+        )
+
+        isaret = "≈" if yaklasik else ""
+        self.notifier.send(
+            f"🎯 *{self.symbol} {isaret}{r:.1f}R KÂRA ULAŞTI*\n"
+            f"• Anlık kâr: `{upnl:+,.2f}` USDT\n"
+            f"• Stop kilidi: `${pos.trailing_stop:,.6g}` → `{kilitli:+,.2f}` USDT garantide\n"
+            f"• Pozisyon DEVAM ediyor — kapatmak istersen panelden KAPAT."
+        )
+        log.info("[%s] %.1fR kâr bildirimi gönderildi (upnl=%.2f kilitli=%.2f)",
+                 self.symbol, r, upnl, kilitli)
+
     # --------------------------------------------------------- manuel komutlar
     def _process_manual_commands(self, pos: Position | None, price: float) -> Position | None:
         """Panelden gelen manuel AÇ/KAPAT komutlarını işler.
@@ -133,6 +189,9 @@ class FuturesPaperTrader:
                 slip = (1 - SLIPPAGE) if pos.side == "LONG" else (1 + SLIPPAGE)
                 self._close(pos, pos.trailing_stop * slip, "izleyen stop")
                 pos = None
+            else:
+                # Kâr kilometre taşı bildirimi (stop çalışmadıysa anlamlı)
+                self._check_r_notify(pos, price)
 
         # 1b) GÜNLÜK SERMAYE STOP'U — SEÇİCİ KAPATMA
         # Limit aşıldığında YALNIZCA zarardaki pozisyonlar kapatılır.
@@ -266,6 +325,25 @@ class FuturesPaperTrader:
                 )
             return
 
+        # PORTFÖY KORUMASI: eşzamanlı pozisyon tavanı (gerekçe: Config'te).
+        # Korelasyon 0.68 olduğu için sınırsız eşzamanlı pozisyon "10 ayrı %1
+        # risk" değil, tek yönde ~%8.4 risk demektir. Manuel açılış engellenmez
+        # ama uyarılır — manuel, kullanıcının bilinçli kararıdır.
+        tavan = self.cfg.max_concurrent_positions
+        if tavan > 0:
+            diger = [p for p in self.state.all_positions() if p.symbol != self.symbol]
+            if len(diger) >= tavan:
+                if manual:
+                    self.notifier.send_error(
+                        f"⚠️ {self.symbol} manuel açılıyor ama zaten {len(diger)} pozisyon "
+                        f"açık (tavan {tavan}) — portföy riski tavanın üstüne çıkıyor."
+                    )
+                else:
+                    log.info("[%s] %s sinyali var ama eşzamanlı pozisyon tavanı dolu "
+                             "(%d/%d) — GİRİŞ ERTELENDİ",
+                             self.symbol, side, len(diger), tavan)
+                    return
+
         balance = self._balance()
         stop_distance = atr * self.cfg.strategy.atr_multiplier
         if stop_distance <= 0:
@@ -293,6 +371,7 @@ class FuturesPaperTrader:
             trailing_stop=stop, stop_order_id=None,
             entry_time=datetime.now(timezone.utc).isoformat(),
             entry_fee_usdt=entry_fee, side=side, margin=margin, funding_acc=0.0,
+            risk_unit=stop_distance,   # 1R — kâr bildirimi bunun katlarına bakar
         )
         self.state.save_position(pos)
         arrow = "📈 LONG" if side == "LONG" else "📉 SHORT"

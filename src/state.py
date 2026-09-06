@@ -31,6 +31,11 @@ class Position:
     side: str = "LONG"                     # "LONG" | "SHORT"
     margin: float = 0.0                    # vadeli paper modda kilitli marjin (USDT)
     funding_acc: float = 0.0               # tahakkuk eden funding maliyeti (USDT)
+    # --- kâr bildirimi (R = giriş anındaki stop mesafesi) ---
+    # Eski kayıtlarda bu alanlar yoktur; dataclass varsayılanı sayesinde
+    # Position(**eski_json) sorunsuz yüklenir.
+    risk_unit: float = 0.0                 # giriş anındaki ATR×çarpan mesafesi = 1R
+    r_notified: float = 0.0                # son bildirilen R seviyesi (tekrar bildirmemek için)
 
 
 class StateStore:
@@ -72,6 +77,20 @@ class StateStore:
                 CREATE TABLE IF NOT EXISTS kv (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                );
+                -- Kâr kilometre taşları: pozisyon N×R kâra ulaştığında yazılır.
+                -- Amaç: ileride "bildirim gelince kapattıklarım mı daha iyiydi,
+                -- bıraktıklarım mı" sorusunu VERİYLE cevaplayabilmek.
+                CREATE TABLE IF NOT EXISTS r_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    ts TEXT NOT NULL,
+                    side TEXT,
+                    r_level REAL,            -- bildirim eşiği (4, 8, ...)
+                    r_actual REAL,           -- o andaki gerçek R çokluğu
+                    price REAL,
+                    upnl_usdt REAL,          -- o anki açık kâr
+                    locked_usdt REAL         -- stop'un garantilediği kâr
                 );
                 """
             )
@@ -164,6 +183,24 @@ class StateStore:
     def all_positions(self) -> list[Position]:
         cur = self._conn.execute("SELECT data FROM positions")
         return [Position(**json.loads(r[0])) for r in cur.fetchall()]
+
+    # ------------------------------------------------------- kâr kilometre taşları
+    def record_r_event(self, symbol: str, ts: str, side: str, r_level: float,
+                       r_actual: float, price: float, upnl: float, locked: float) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO r_events(symbol, ts, side, r_level, r_actual, price,"
+                " upnl_usdt, locked_usdt) VALUES(?,?,?,?,?,?,?,?)",
+                (symbol, ts, side, r_level, r_actual, price, upnl, locked),
+            )
+
+    def recent_r_events(self, limit: int = 20) -> list[dict]:
+        cur = self._conn.execute(
+            "SELECT symbol, ts, side, r_level, r_actual, price, upnl_usdt, locked_usdt"
+            " FROM r_events ORDER BY id DESC LIMIT ?", (limit,))
+        cols = ("symbol", "ts", "side", "r_level", "r_actual", "price",
+                "upnl_usdt", "locked_usdt")
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
 
     # -------------------------------------------------------- ön değerlendirmeler
     def save_assessment(self, symbol: str, ts_iso: str, data_json: str) -> None:

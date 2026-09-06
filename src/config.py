@@ -75,6 +75,30 @@ class Config:
     max_daily_loss_pct: float = float(_env("MAX_DAILY_LOSS_PCT", "0.05"))  # günlük devre kesici: %5
     max_balance_usage: float = 0.95    # bakiyenin en fazla %95'i tek pozisyona girebilir
 
+    # PORTFÖY KORUMASI — eşzamanlı pozisyon tavanı (0 = sınırsız)
+    # Neden: 10 paritenin ortalama ikili korelasyonu 0.681 ölçüldü. Bu yüzden
+    # "10 ayrı pozisyonda %1 risk" aslında BAĞIMSIZ 10 bahis değil; formül
+    #   gerçek risk = r×√(N + N(N−1)ρ) = %1×√(10+90×0.681) ≈ %8.4
+    #   bağımsız bahis = N/(1+(N−1)ρ) = 1.4
+    # yani tek yönde ~%8.4'lük TEK bir bahis. Portföy backtest'i (tek bakiye,
+    # backtest/portfoy.py) bunu doğruladı: tavansız MaxDD %31.5 — oysa ayrı
+    # bakiyeli eski ölçümler %12 gösteriyordu.
+    # Ölçüm: tavan 4 ile MaxDD %31.5→%27.8, Sharpe 0.74→0.86, getiri %99.9→%94.7.
+    # Bu bir GETİRİ optimizasyonu değil, kuyruk riski kontrolüdür.
+    # NOT: YÖN tavanı (aynı yönde en fazla N) ayrıca test edildi ve ZARARLI
+    # çıktı (Sharpe 0.86→0.57) — stratejinin kârı baskın yönde olmaktan geliyor.
+    # Sayıyı sınırla, yönü değil.
+    max_concurrent_positions: int = int(_env("MAX_CONCURRENT_POSITIONS", "4"))
+
+    # KÂR BİLDİRİMİ — pozisyon N×R kâra ulaşınca Telegram'a haber ver (0 = kapalı).
+    # KAPATMAZ. Otomatik kâr hedefi test edildi ve mevcut parite listesiyle
+    # sağlamlık çıtasını geçemedi (ilk yarıda berabere), o yüzden karar
+    # kullanıcıda: bildirim gelir, dilerse panelden KAPAT'a basar.
+    # Zaten 3×ATR iz süren stop ile 4R'ye ulaşıldığında stop matematiksel olarak
+    # giriş+3R'de kilitlidir (tepe−3ATR = giriş+12ATR−3ATR), yani kârın dörtte
+    # üçü garanti altındadır — "stop'u yukarı çek" ihtiyacı otomatik karşılanır.
+    r_notify_level: float = float(_env("R_NOTIFY_LEVEL", "4.0"))
+
     # Komisyon optimizasyonu:
     # - Binance'te "BNB ile komisyon öde" açıksa spot ücret %0.10 → %0.075 düşer.
     #   (Bunu borsa arayüzünden açmanız ve az miktar BNB tutmanız gerekir.)
