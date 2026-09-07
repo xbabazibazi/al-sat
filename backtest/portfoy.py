@@ -60,6 +60,7 @@ class Poz:
     orig_qty: float = 0.0          # kısmi çıkış oranları buna göre hesaplanır
     realize_kismi: float = 0.0     # kısmi çıkışlardan bankaya yazılan net
     kismi_bitti: set = field(default_factory=set)
+    basabas_yapildi: bool = False  # başabaş çekme bir kez uygulanır
 
 
 @dataclass
@@ -143,6 +144,7 @@ def run_portfoy(
     tam_cikis_r: float | None = None,
     kismi_hedefler: tuple[tuple[float, float], ...] = (),
     kismi_sonrasi_basabas: bool = False,
+    basabas_r: float | None = None,   # N×R'ye ulaşınca stop'u girişe çek
 ) -> PortfoySonuc:
     semboller = list(veri.keys())
     zamanlar = sorted(set().union(*[set(d.index) for d in veri.values()]))
@@ -276,6 +278,19 @@ def run_portfoy(
                 if p.qty <= 1e-12:
                     kapat(s, float(d.at[t, "close"]), "kısmi tamam", t)
                     continue
+
+            # BAŞABAŞ ÇEKME — "N×R kâra ulaşınca stop'u girişe al"
+            # Kullanıcının elle yapacağı hareketin birebir simülasyonu.
+            # Stop kontrolünden SONRA uygulanır: aynı barda hem hedefe değip hem
+            # geri gelmişse, stop'un YENİ seviyeden çalışması bir sonraki bara
+            # kalır (karamsar sıralama, gerçekte de bar içi anlık göremezsin).
+            if basabas_r and p.risk_birimi > 0 and not p.basabas_yapildi:
+                hedef = (p.entry + basabas_r * p.risk_birimi if p.side == "LONG"
+                         else p.entry - basabas_r * p.risk_birimi)
+                if (h >= hedef) if p.side == "LONG" else (lo <= hedef):
+                    p.stop = (max(p.stop, p.entry) if p.side == "LONG"
+                              else min(p.stop, p.entry))
+                    p.basabas_yapildi = True
 
             if not np.isnan(atr):
                 if p.side == "LONG":
