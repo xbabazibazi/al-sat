@@ -175,3 +175,53 @@ Dönem ayrımı (üç kapı): 1. yarı %5.8→%12.4, 2. yarı %93.0→%114.0, ta
 %94.7→%128.7. Her üçünde de 2x > 1x.
 
 Gerekçe ve 3x/5x'in neden seçilmediği: `src/config.py` içindeki `leverage` notu.
+
+---
+
+## GENİŞ COIN TARAMASI (2026-09-07) — sonuç: EKLEME YOK
+
+Araçlar: `backtest/aday_tarama.py` (evren + izole ölçüm) →
+`backtest/marjinal_katki.py` (portföyde beş sorgu).
+
+Evren: 516 USDT-M kalıcı vadeli parite → 353'ünün spot verisi var →
+24s hacim ≥ $20M ve ≥2 yıl geçmiş şartıyla **43 varlık ölçüldü**.
+
+### İzole tarama yanıltır — kanıt
+| Varlık | İzole Sharpe | Portföye ΔSharpe |
+|---|---|---|
+| WLD | **1.01** (listenin 1.'si, BNB'yi geçiyor) | **+0.03** (1. yarıda negatif) |
+| FET | 0.66 (6. sıra) | +0.15 |
+
+İzole kriteri geçen 10 adaydan **9'u portföye zarar verdi.** Sebep: ortalama
+ikili korelasyon 0.68 — "iyi varlık" eklemek çeşitlendirme değil, aynı bahsi
+bir yerden daha oynamak.
+
+### FET dört sorguyu geçti, beşincisinde düştü
+| Sorgu | Sonuç |
+|---|---|
+| Üç kapı (TAM / 1.yarı / 2.yarı) | ✔ +0.15 / +0.27 / +0.06 |
+| Placebo (kriteri geçemeyen 8 varlık) | ✔ grubun en iyisi +0.02, FET 7.5 katı |
+| Sıralama duyarlılığı | ✔ yayılım 0.03 (baş/orta/son fark etmiyor) |
+| Yoğunlaşma (top-5 işlemin payı) | ✔ %81 — portföyün EN DÜŞÜĞÜ (medyan %178) |
+| **Etkileşim** | **✘ REDDEDİLDİ** |
+
+| Senaryo | Sharpe |
+|---|---|
+| A: mevcut 10 | 0.93 |
+| B: +FET (11) | 1.08 |
+| C: −BTC (9) | 1.03 |
+| **D: −BTC +FET (10)** | **1.01** ← B ve C'nin ikisinden de kötü |
+
+İki etki gerçek ve bağımsız olsaydı D ≈ +0.25 olmalıydı. BTC çıkınca FET'in
+katkısı negatife dönüyor (1.03 → 1.01). Yani FET'in görünen değeri kendi
+kenarından değil, **BTC'nin kötü işlemlerini slot rekabetinde engellemesinden**
+geliyor. Bu kırılgan bir gerekçe: BTC'nin kötü kalmasına bağlı.
+
+**Karar: parite listesi DEĞİŞMEDİ.** Faz 1 kapısına (~100 kapanmış işlem)
+0 işlemle duruyoruz; listeyi şimdi değiştirmek toplanan kanıtın sayacını sıfırlar.
+
+### Yan bulgu — araç hatası ve düzeltmesi
+İlk çalıştırmada WIF'in 2022-2024 verisi 0 satırdı (WIF 2024'te listelendi) ve
+motor sessizce ΔSharpe=0.00 üretiyordu; bu "katkı vermedi" diye okunuyordu, oysa
+doğrusu "SINANAMADI". `veri_var_mi()` eklendi: geçmişi yetmeyen aday o dönemde
+kapıyı GEÇEMEMİŞ sayılır ve tabloda `(eksik geçmiş)` diye işaretlenir.
