@@ -194,11 +194,16 @@ PAGE = """<!doctype html>
     --bg:#0c0e12; --card:#14171d; --card2:#191d24; --line:#242a33;
     --ink:#e8eaed; --ink2:#9aa3ad; --mut:#5c6570;
     --up:#2fbf71; --down:#e5544b; --accent:#4d9fec; --amber:#e0a63c;
+    /* STOP butonu zemini — metin daima koyu (#15181d) olduğu için bu ton AÇIK
+       kalmalı. --amber'ı doğrudan kullanamayız: açık temada koyulaşıyor ve
+       koyu-üstüne-koyu kontrastı 4.5'e düşüyor. */
+    --amber-btn:#e0a63c;
   }
   @media (prefers-color-scheme: light) {
     :root { --bg:#f4f5f7; --card:#ffffff; --card2:#f0f1f4; --line:#e2e4e9;
       --ink:#15181d; --ink2:#555c66; --mut:#8a919b;
-      --up:#188952; --down:#c73e36; --accent:#2472c8; --amber:#a8731a; }
+      --up:#188952; --down:#c73e36; --accent:#2472c8; --amber:#a8731a;
+      --amber-btn:#f0b429; }
   }
   * { box-sizing:border-box; margin:0; }
   body { background:var(--bg); color:var(--ink);
@@ -250,6 +255,11 @@ PAGE = """<!doctype html>
   button.mini.close { background:var(--down); }
   button.mini.long  { background:var(--up); padding:3px 7px; }
   button.mini.short { background:var(--down); padding:3px 7px; }
+  /* STOP ikincil bir eylem: kehribar zemin + KOYU yazı. Beyaz yazı kullanılamaz —
+     genel `button{color:#fff}` kuralı kehribarın üstünde okunmaz (kontrast ~1.9).
+     Koyu yazıyla iki temada da 8:1 üzeri. Renk KAPAT'ın kırmızısından ayrışsın
+     diye seçildi; ikisi yan yana duruyor ve yanlış tıklanmamalı. */
+  button.mini.stop  { background:var(--amber-btn); color:#15181d; }
 </style></head><body>
 <div class="top">
   <h1><span class="pulse" id="pulse"></span>AL-SAT Paneli</h1>
@@ -328,11 +338,11 @@ async function refresh() {
       <td>$${p.entry.toLocaleString("tr-TR")}</td>
       <td>$${p.price.toLocaleString("tr-TR")}</td>
       <td>$${p.stop.toLocaleString("tr-TR",{maximumFractionDigits:6})}${
-          p.stop_kilit > 0 ? ` <span title="Manuel gevşetme kilidi açık — iz süren stop durduruldu" style="color:var(--warn,#e0a030)">🔓</span>` : ""}</td>
+          p.stop_kilit > 0 ? ` <span title="Manuel gevşetme kilidi açık — iz süren stop durduruldu" style="color:var(--amber)">🔓</span>` : ""}</td>
       <td>${money(p.margin)}</td><td>${money(p.funding)}</td>
       <td class="${cls(p.upnl)}"><b>${money(p.upnl)}</b></td>
       <td class="${cls(p.upnl)}">${sign(p.upnl_pct)}%</td>
-      <td><button class="mini" onclick="stopDegistir('${p.symbol}','${p.side}',${p.stop},${p.price},${p.entry},${p.qty})">STOP</button>
+      <td><button class="mini stop" onclick="stopDegistir('${p.symbol}','${p.side}',${p.stop},${p.price},${p.entry},${p.qty})">STOP</button>
           <button class="mini close" onclick="manuel('close','${p.symbol}',${p.upnl.toFixed(2)})">KAPAT</button></td></tr>`).join("") + "</table>"
     : `<div class="empty">Açık pozisyon yok — bot sinyal bekliyor (${d.symbols.join(", ")})</div>`;
 
