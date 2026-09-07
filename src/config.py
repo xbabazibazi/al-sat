@@ -44,13 +44,37 @@ class Config:
     mode: str = _env("BOT_MODE", "dry_run").lower()  # dry_run | testnet | live | futures_paper
 
     # ---- Vadeli işlem (futures_paper) ayarları ----
-    # Kaldıraç neden 1? (2026-09-06 ölçümü — backtest/ayar_etkisi.py)
-    # 10 paritede 1x ve 2x satırları BİREBİR ÖZDEŞ çıktı: %10.8 getiri,
-    # Sharpe 0.46, 31.4 işlem/yıl. Sebep: pozisyon boyutunu risk kuralı
-    # (RISK_PCT / stop mesafesi) belirler; kaldıraç yalnızca bakiye tavanını
-    # gevşetir ve o tavana hiç değinilmez. Yani 2x, karşılığında hiçbir getiri
-    # vermeden likidasyon riski taşıyordu -> 1x'e indirildi (bedelsiz güvenlik).
-    # RISK_PCT belirgin artırılırsa tavan bağlayıcı olabilir; o zaman gözden geçir.
+    # Kaldıraç neden 2? (2026-09-07 ölçümü — PORTFÖY motoru, backtest/portfoy.py)
+    #
+    # ÖNCEKİ KARAR GEÇERSİZ ÇIKTI. 2026-09-06'da ayar_etkisi.py ile 1x ve 2x
+    # BİREBİR ÖZDEŞ ölçülmüş ve "2x bedelsiz risk" diye 1x'e inilmişti. O test
+    # AYRI BAKİYELİYDİ (her parite kendi $10.000'i) — orada tek pozisyon marj
+    # tavanına hiç değmez, dolayısıyla kaldıraç ölü değişkendi. Canlı bot ise
+    # TEK bakiyeyi paylaşıyor ve aynı anda 4 pozisyon tutuyor; orada marj
+    # gerçekten bağlayıcı. Ortak bakiyeli portföy motorunda yeniden ölçüldü:
+    #
+    #        Getiri   MaxDD   Sharpe  İşlem  Kazanma  Likid.
+    #   1x   %94.7   -%27.8    0.86    1356   %39.1     0
+    #   2x  %128.7   -%29.6    0.93    1356   %39.1     0     <- seçildi
+    #   3x  %144.6   -%31.2    0.96    1356   %39.1     0
+    #   5x  %149.4   -%33.3    0.95    1356   %39.1     8     <- duvar
+    #
+    # MEKANİZMA: işlem sayısı ve kazanma oranı değişmiyor (1356 / %39.1) —
+    # aynı işlemler, farklı boyut. 1x'te açık pozisyon nakdin tamamını kilitler,
+    # 2./3./4. pozisyon kalan cılız nakitten boyutlanır. $10k equity + 3 açık
+    # pozisyon örneğinde 1x nakdi $5.500'e düşürür (4. işlem equity'nin %0.55'i
+    # kadar risk alır), 2x'te marj yarıya inip nakit $7.750 olur (%0.78). Yani
+    # 1x "daha az risk" değil, NİYET EDİLEN %1'in altında kalmak.
+    # Üç kapı da geçildi: 1. yarı %5.8->%12.4, 2. yarı %93.0->%114.0, tam dönem.
+    #
+    # NEDEN 3x/5x DEĞİL: likidasyon tamponu = %90/kaldıraç (LIQ_BUFFER).
+    # 1x->%90, 2x->%45, 3x->%30, 5x->%18. 3x'in %30 tamponu 1356 işlemde hiç
+    # delinmedi; 2x onun 1.5 katı pay bırakıyor. 5x'te 8 likidasyon = sınır.
+    # Kâğıt aşamasında marj bırakmayı tercih ediyoruz; canlı veriyle (Faz 1
+    # kapısı, ~100 kapanmış işlem) 3x yeniden değerlendirilebilir.
+    #
+    # AÇIK POZİSYONLARA ETKİSİ YOK: leverage yalnızca _open() içinde okunur;
+    # açık pozisyonlar kendi `margin` değerlerini kayıtta taşır.
     #
     # SHORT: eski 3-parite testinde 9/9 zarar etmişti, ama 10 paritelik yeni
     # ölçümde short tarafı KÂRLI ve getirinin ana kaynağı (sadece-long %4.8'e

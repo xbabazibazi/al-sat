@@ -36,6 +36,13 @@ class Position:
     # Position(**eski_json) sorunsuz yüklenir.
     risk_unit: float = 0.0                 # giriş anındaki ATR×çarpan mesafesi = 1R
     r_notified: float = 0.0                # son bildirilen R seviyesi (tekrar bildirmemek için)
+    # --- manuel stop gevşetme kilidi ---
+    # Panelden stop GEVŞETİLDİĞİNDE, o anki algoritmik aday (uç değer∓3×ATR)
+    # buraya yazılır. Kilit açıkken (>0) iz süren stop güncellemesi ATLANIR,
+    # yoksa bot bir sonraki mumda gevşetmeyi geri alır ve verdiğimiz nefes payı
+    # 4 saat yaşar. Kilit, işlem YENİ İLERLEME kaydettiğinde (aday bu referansı
+    # geçtiğinde) kendiliğinden açılır — yani unutulup kalmaz.
+    stop_manual_ref: float = 0.0           # 0 = kilit yok
 
 
 class StateStore:

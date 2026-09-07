@@ -155,6 +155,7 @@ def build_state() -> dict:
             "upnl_pct": round(upnl / p.margin * 100, 2) if p.margin else 0,
             "notional": round(pos_notional, 2),
             "since": p.entry_time[:16].replace("T", " "),
+            "stop_kilit": p.stop_manual_ref,   # >0 = manuel gevşetme kilidi açık
         })
 
     stats = state.trade_stats()
@@ -326,11 +327,13 @@ async function refresh() {
       <td><span class="side ${p.side[0]}">${p.side}</span></td>
       <td>$${p.entry.toLocaleString("tr-TR")}</td>
       <td>$${p.price.toLocaleString("tr-TR")}</td>
-      <td>$${p.stop.toLocaleString("tr-TR",{maximumFractionDigits:2})}</td>
+      <td>$${p.stop.toLocaleString("tr-TR",{maximumFractionDigits:6})}${
+          p.stop_kilit > 0 ? ` <span title="Manuel gevşetme kilidi açık — iz süren stop durduruldu" style="color:var(--warn,#e0a030)">🔓</span>` : ""}</td>
       <td>${money(p.margin)}</td><td>${money(p.funding)}</td>
       <td class="${cls(p.upnl)}"><b>${money(p.upnl)}</b></td>
       <td class="${cls(p.upnl)}">${sign(p.upnl_pct)}%</td>
-      <td><button class="mini close" onclick="manuel('close','${p.symbol}',${p.upnl.toFixed(2)})">KAPAT</button></td></tr>`).join("") + "</table>"
+      <td><button class="mini" onclick="stopDegistir('${p.symbol}','${p.side}',${p.stop},${p.price},${p.entry},${p.qty})">STOP</button>
+          <button class="mini close" onclick="manuel('close','${p.symbol}',${p.upnl.toFixed(2)})">KAPAT</button></td></tr>`).join("") + "</table>"
     : `<div class="empty">Açık pozisyon yok — bot sinyal bekliyor (${d.symbols.join(", ")})</div>`;
 
   $("watch").innerHTML = d.watchlist.length ? "<table><tr>" +
@@ -402,6 +405,42 @@ async function refresh() {
       <td style="color:var(--mut)">${(t.exit_time||"").slice(0,16).replace("T"," ")}</td></tr>`).join("") + "</table>"
     : `<div class="empty">Henüz kapanan işlem yok</div>`;
 }
+async function stopDegistir(sembol, yon, stop, fiyat, giris, qty) {
+  const isim = sembol.replace("USDT","");
+  const uzun = yon === "LONG";
+  const ham = prompt(
+    `${isim} ${yon} — yeni stop seviyesi\n\n` +
+    `Giriş  : $${giris}\nAnlık  : $${fiyat}\nŞu anki stop: $${stop}\n\n` +
+    (uzun ? `LONG: stop anlık fiyatın ALTINDA olmalı.` : `SHORT: stop anlık fiyatın ÜSTÜNDE olmalı.`),
+    String(stop));
+  if (ham === null) return;
+  const yeni = parseFloat(String(ham).replace(",", "."));
+  if (!(yeni > 0)) { alert("Geçersiz sayı."); return; }
+  if (uzun ? yeni >= fiyat : yeni <= fiyat) {
+    alert(`Bu seviye pozisyonu ANINDA kapatır.\nİstediğin buysa KAPAT düğmesini kullan.`);
+    return;
+  }
+  const sik = uzun ? yeni > stop : yeni < stop;
+  const risk = qty * (uzun ? fiyat - yeni : yeni - fiyat);
+  const kilit = qty * (uzun ? yeni - giris : giris - yeni);
+  const ozet = `Risktekiler: ${risk.toFixed(2)} USDT\n` +
+               `Stop'un garantilediği: ${kilit >= 0 ? "+" : ""}${kilit.toFixed(2)} USDT`;
+  const soru = sik
+    ? `${isim}: stop SIKILIYOR\n\n$${stop} → $${yeni}\n\n${ozet}\n\n` +
+      `İz süren stop buradan yukarı devam edecek.`
+    : `⚠️ ${isim}: stop GEVŞETİLİYOR\n\n$${stop} → $${yeni}\n\n${ozet}\n\n` +
+      `DİKKAT: Zararı büyütme iznidir. Botun kendine yasakladığı hareket bu —\n` +
+      `iz süren stop asla geri gevşemez.\n\n` +
+      `İz sürme DURDURULACAK; işlem verdiğin payı geri kazanıp aday\n` +
+      `$${(2*stop - yeni).toFixed(6).replace(/0+$/,"").replace(/\\.$/,"")} seviyesini geçince kendiliğinden devam eder.\n\nEmin misin?`;
+  if (!confirm(soru)) return;
+  try {
+    await fetch(`/api/manual/stop/${sembol}/${yeni}`, { method: "POST" });
+    alert("Komut gönderildi. Bot 30 saniye içinde uygulayacak.");
+  } catch { alert("Komut gönderilemedi."); }
+  setTimeout(refresh, 2000);
+}
+
 async function manuel(eylem, sembol, pnl) {
   const isim = sembol.replace("USDT","");
   let soru;
@@ -461,6 +500,20 @@ class Handler(BaseHTTPRequestHandler):
                     log.info("Manuel komut kuyruğa alındı: %s %s", sembol, gecerli[eylem])
                     self._send(200, "application/json",
                                json.dumps({"ok": True, "queued": gecerli[eylem]}).encode())
+                    return
+            # /api/manual/stop/<sembol>/<fiyat> — geçerlilik denetimi BOTTA yapılır
+            # (tek yazıcı ilkesi: panel pozisyonu okumaz, yalnızca komut bırakır).
+            if len(parts) == 6 and parts[3].upper() == "STOP":
+                sembol = parts[4].upper()
+                try:
+                    fiyat = float(parts[5])
+                except ValueError:
+                    fiyat = 0.0
+                if sembol in CONFIG.symbols and fiyat > 0:
+                    state.set_kv(f"cmd_{sembol}", f"STOP:{fiyat!r}")
+                    log.info("Manuel STOP kuyruğa alındı: %s → %s", sembol, fiyat)
+                    self._send(200, "application/json",
+                               json.dumps({"ok": True, "queued": f"STOP:{fiyat}"}).encode())
                     return
             self._send(400, "application/json", b'{"ok":false}')
             return

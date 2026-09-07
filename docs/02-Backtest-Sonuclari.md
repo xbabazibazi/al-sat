@@ -95,6 +95,11 @@ Güncel ayarın 10 paritedeki gerçek ölçümü:
 **Ayar:** 4h · Donchian 10 · ATR×3.0 · kaldıraç 1x · risk %1 · long+short ·
 analiz eşiği 20 · günlük sermaye stopu %10 (seçici)
 
+> Bu tablo AYRI BAKİYELİ ölçümdür ve kaldıraç 1x ile üretilmiştir. Canlı kaldıraç
+> 2026-09-07'de 2x yapıldı ama bu tablo DEĞİŞMEZ: ayrı bakiyede tek pozisyon marj
+> tavanına hiç değmez, 1x ve 2x özdeş çıkar. Kaldıracın gerçek etkisi yalnızca
+> ORTAK bakiyede görünür — aşağıdaki portföy bölümüne bakın.
+
 | Parite | Getiri (4 yıl) | MaxDD | Sharpe | İşlem | Kazanma | PF | Likid. |
 |---|---|---|---|---|---|---|---|
 | BTCUSDT | +%6.6 | −%17.0 | 0.22 | 263 | %35.4 | 1.06 | 0 |
@@ -135,3 +140,38 @@ garanti etmez; bu tablo bir beklenti bandıdır, taahhüt değil.
 
 \* Bu sütun eski eşik 50 ile ölçülmüştür; şemalar arası karşılaştırma aynı
 zeminde kalsın diye. Eşik 20 ile aynı şema %19.8 verir.
+
+---
+
+## ORTAK BAKİYE (portföy) ölçümü — `backtest/portfoy.py`
+
+Yukarıdaki tabloların hepsi her pariteye AYRI $10.000 verir. Canlı bot tek
+bakiyeyi paylaştığı için korelasyon, sermaye rekabeti ve portföy geneli devre
+kesici oradaki sayılarda GÖRÜNMEZ. Ortak bakiyeli motor bu üçünü de modeller.
+
+10 paritenin ortalama ikili 4h korelasyonu **0.681**. Bu yüzden "10 pozisyonda
+%1 risk" bağımsız 10 bahis değil:
+- gerçek risk = r×√(N + N(N−1)ρ) = %1×√(10+90×0.681) ≈ **%8.4**
+- bağımsız bahis sayısı = N/(1+(N−1)ρ) ≈ **1.4**
+
+Sonuç: tavansız gerçek MaxDD **−%31.5** — ayrı bakiyeli tablo −%12.1 gösteriyordu.
+`MAX_CONCURRENT_POSITIONS=4` ile −%27.8'e iniyor (Sharpe 0.74→0.86, getiri
+%99.9→%94.7). Bu bir getiri optimizasyonu değil, kuyruk riski kontrolüdür.
+
+### Kaldıraç — ortak bakiyede (2026-09-07, tavan 4, risk %1, eşik 20)
+
+| Kaldıraç | Getiri | MaxDD | Sharpe | İşlem | Kazanma | PF | Likidasyon | Liq. tamponu |
+|---|---|---|---|---|---|---|---|---|
+| 1x | %94.7 | −%27.8 | 0.86 | 1356 | %39.1 | 1.23 | 0 | %90 |
+| **2x (canlı)** | **%128.7** | **−%29.6** | **0.93** | 1356 | %39.1 | 1.25 | 0 | %45 |
+| 3x | %144.6 | −%31.2 | 0.96 | 1356 | %39.1 | 1.26 | 0 | %30 |
+| 5x | %149.4 | −%33.3 | 0.95 | 1356 | %39.1 | 1.26 | **8** | %18 |
+
+İşlem sayısı ve kazanma oranı tüm satırlarda AYNI (1356 / %39.1) — aynı işlemler,
+farklı boyut. Kaldıraç marjı serbest bırakıp sonraki pozisyonların niyet edilen
+%1 riske yaklaşmasını sağlıyor; 1x sistematik olarak 2./3./4. işlemi küçültüyordu.
+
+Dönem ayrımı (üç kapı): 1. yarı %5.8→%12.4, 2. yarı %93.0→%114.0, tam dönem
+%94.7→%128.7. Her üçünde de 2x > 1x.
+
+Gerekçe ve 3x/5x'in neden seçilmediği: `src/config.py` içindeki `leverage` notu.

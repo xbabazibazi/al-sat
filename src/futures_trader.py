@@ -161,6 +161,9 @@ class FuturesPaperTrader:
             self._close(pos, price * slip, "manuel kapatma")
             return None
 
+        if cmd.startswith("STOP:"):
+            return self._set_manual_stop(pos, price, cmd[5:])
+
         if cmd in ("OPEN_LONG", "OPEN_SHORT"):
             if pos is not None:
                 log.info("[%s] Manuel açma istendi ama zaten pozisyon var", self.symbol)
@@ -170,6 +173,80 @@ class FuturesPaperTrader:
             self._open(side, manual=True)
             return self.state.get_position(self.symbol)
 
+        return pos
+
+    def _set_manual_stop(self, pos: Position | None, price: float, ham: str) -> Position | None:
+        """Panelden gelen manuel stop seviyesini uygular.
+
+        Kural: stop seviyesi SERBEST (sıkabilir de gevşetebilir de), ama
+        pozisyonu ANINDA tetikleyecek bir seviye reddedilir — o "kapat"
+        demektir ve bunun için KAPAT düğmesi var. Stop'un tamamen kaldırılması
+        hiçbir koşulda mümkün değil ("stop loss daima olacak").
+        """
+        if pos is None:
+            log.info("[%s] Manuel stop istendi ama açık pozisyon yok", self.symbol)
+            return None
+        try:
+            yeni = float(ham)
+        except ValueError:
+            log.warning("[%s] Manuel stop okunamadı: %r", self.symbol, ham)
+            return pos
+        if not (yeni > 0):
+            self.notifier.send_error(f"{self.symbol}: stop 0 veya negatif olamaz — reddedildi.")
+            return pos
+
+        # anında tetiklenir mi?
+        tetikler = yeni >= price if pos.side == "LONG" else yeni <= price
+        if tetikler:
+            self.notifier.send_error(
+                f"⛔️ {self.symbol}: stop `${yeni:,.6g}` anlık fiyatın "
+                f"({'üstünde' if pos.side == 'LONG' else 'altında'}, `${price:,.6g}`) — "
+                f"bu pozisyonu anında kapatır. İstediğin buysa KAPAT düğmesini kullan."
+            )
+            return pos
+
+        eski = pos.trailing_stop
+        if abs(yeni - eski) < 1e-12:
+            return pos
+        sikilastir = yeni > eski if pos.side == "LONG" else yeni < eski
+
+        pos.trailing_stop = yeni
+        if sikilastir:
+            # Cırcır mantığı zaten daha sıkı stop'u korur; kilide gerek yok.
+            pos.stop_manual_ref = 0.0
+        else:
+            # Gevşetme: iz sürmeyi durdur, yoksa bot bir sonraki mumda geri alır.
+            # Kilit ne zaman açılsın? "Eski seviyeyi geçince" DEĞİL — o zaman
+            # 1 kuruşluk yeni tepe bile izni iptal eder ve tam kaçınmak istediğin
+            # yerde stop yersin. Doğrusu: işlem VERDİĞİN NEFES PAYINI GERİ
+            # KAZANMALI. ref = eski + (eski − yeni) = 2×eski − yeni (iki yön için
+            # de aynı formül). Ne kadar çok pay istediysen, algoritmanın kontrolü
+            # geri alması için işlemin o kadar çok ilerlemesi gerekir.
+            ref = 2 * eski - yeni
+            pos.stop_manual_ref = ref if ref > 0 else 1e-9  # 0 = "kilit yok" nöbetçisi
+        self.state.save_position(pos)
+
+        risk = pos.qty * (price - yeni if pos.side == "LONG" else yeni - price)
+        kilitli = pos.qty * ((yeni - pos.entry_price) if pos.side == "LONG"
+                             else (pos.entry_price - yeni))
+        log.info("[%s] MANUEL STOP %s: %.6g → %.6g (kilit ref=%.6g)",
+                 self.symbol, "sıkıldı" if sikilastir else "GEVŞETİLDİ",
+                 eski, yeni, pos.stop_manual_ref)
+        if sikilastir:
+            self.notifier.send(
+                f"🔒 *{self.symbol} stop sıkıldı* (manuel)\n"
+                f"• `${eski:,.6g}` → `${yeni:,.6g}`\n"
+                f"• Garantilenen: `{kilitli:+,.2f}` USDT · risktekiler: `{risk:,.2f}` USDT\n"
+                f"• İz süren stop buradan yukarı devam eder."
+            )
+        else:
+            self.notifier.send(
+                f"⚠️ *{self.symbol} stop GEVŞETİLDİ* (manuel)\n"
+                f"• `${eski:,.6g}` → `${yeni:,.6g}`\n"
+                f"• Garantilenen: `{kilitli:+,.2f}` USDT · risktekiler: `{risk:,.2f}` USDT\n"
+                f"• İz süren stop DURDURULDU — işlem verdiğin payı geri kazanıp "
+                f"aday `${pos.stop_manual_ref:,.6g}`'i geçtiğinde kendiliğinden devam eder."
+            )
         return pos
 
     # ------------------------------------------------------------------ ana akış
@@ -265,6 +342,16 @@ class FuturesPaperTrader:
         if pos.side == "LONG":
             if float(row["high"]) > pos.highest_price:
                 pos.highest_price = float(row["high"])
+            aday = pos.highest_price - atr * self.cfg.strategy.atr_multiplier
+            # Manuel gevşetme kilidi: işlem, gevşetme anındaki adayı geçene kadar
+            # dokunma. Geçtiyse kilidi aç ve normal iz sürmeye dön.
+            if pos.stop_manual_ref > 0:
+                if aday <= pos.stop_manual_ref:
+                    self.state.save_position(pos)   # yalnızca uç değeri kaydet
+                    return
+                log.info("[%s] Manuel stop kilidi açıldı (aday %.6g > ref %.6g)",
+                         self.symbol, aday, pos.stop_manual_ref)
+                pos.stop_manual_ref = 0.0
             new_stop = updated_trailing_stop(pos.trailing_stop, pos.highest_price, atr, self.cfg.strategy)
             if new_stop > pos.trailing_stop:
                 log.info("[%s] LONG stop yükseltildi: %.2f → %.2f", self.symbol, pos.trailing_stop, new_stop)
@@ -272,8 +359,15 @@ class FuturesPaperTrader:
         else:
             if float(row["low"]) < pos.highest_price:  # short'ta uç değer = en düşük
                 pos.highest_price = float(row["low"])
-            new_stop = min(pos.trailing_stop,
-                           pos.highest_price + atr * self.cfg.strategy.atr_multiplier)
+            aday = pos.highest_price + atr * self.cfg.strategy.atr_multiplier
+            if pos.stop_manual_ref > 0:
+                if aday >= pos.stop_manual_ref:
+                    self.state.save_position(pos)
+                    return
+                log.info("[%s] Manuel stop kilidi açıldı (aday %.6g < ref %.6g)",
+                         self.symbol, aday, pos.stop_manual_ref)
+                pos.stop_manual_ref = 0.0
+            new_stop = min(pos.trailing_stop, aday)
             if new_stop < pos.trailing_stop:
                 log.info("[%s] SHORT stop indirildi: %.2f → %.2f", self.symbol, pos.trailing_stop, new_stop)
                 pos.trailing_stop = new_stop

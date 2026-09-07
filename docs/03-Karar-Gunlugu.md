@@ -133,3 +133,87 @@ Pozisyon boyutunu risk belirlediği için kaldıraç yalnızca bakiye tavanını
 gevşetiyor; o tavana hiç değilmiyor. Yani 2x, karşılığında hiçbir getiri
 vermeden likidasyon riski taşıyor. Backtest'te 0 likidasyon görüldü, ama
 1x'e inmek bedelsiz bir güvenlik kazancı olurdu — kullanıcı onayına bırakıldı.
+
+---
+
+## 2026-09-07 — Kaldıraç 1x → 2x (önceki kararın ÖLÇÜMÜ GEÇERSİZ ÇIKTI)
+
+**Bir gün önceki "1x ve 2x birebir aynı" bulgusu yanlış genellemeydi.** O ölçüm
+`ayar_etkisi.py` ile AYRI BAKİYELİ yapılmıştı: her parite kendi $10.000'i ile
+çalışıyor, tek pozisyon marj tavanına asla değmiyor, dolayısıyla kaldıraç ölü
+bir değişken. Canlı bot ise TEK bakiyeyi paylaşıyor ve `MAX_CONCURRENT_POSITIONS=4`
+ile aynı anda dört pozisyon tutuyor — orada marj gerçekten bağlayıcı.
+
+Ortak bakiyeli portföy motorunda (`backtest/portfoy.py`) yeniden ölçüldü
+(10 parite, 4h, 2022-2026, Donchian 10, ATR×3.0, risk %1, eşik 20, tavan 4):
+
+| Kaldıraç | Getiri | MaxDD | Sharpe | İşlem | Kazanma | PF | Likidasyon |
+|---|---|---|---|---|---|---|---|
+| 1x | %94.7 | −%27.8 | 0.86 | 1356 | %39.1 | 1.23 | 0 |
+| **2x** | **%128.7** | **−%29.6** | **0.93** | 1356 | %39.1 | 1.25 | 0 |
+| 3x | %144.6 | −%31.2 | 0.96 | 1356 | %39.1 | 1.26 | 0 |
+| 5x | %149.4 | −%33.3 | 0.95 | 1356 | %39.1 | 1.26 | **8** |
+
+**Mekanizma (getiri artışı nereden geliyor):** İşlem sayısı ve kazanma oranı
+TÜM kaldıraçlarda birebir aynı (1356 / %39.1). Yani yeni bir strateji değil —
+aynı işlemler, farklı boyut. 1x'te açılan pozisyon nakdin tamamını kilitler;
+2., 3. ve 4. pozisyon kalan cılız nakitten boyutlanır. $10k equity + 3 açık
+pozisyon örneğinde: 1x nakdi $5.500'e düşürür → 4. işlem equity'nin %0.55'i
+kadar risk alır. 2x'te marj yarıya iner, nakit $7.750 → %0.78. Yani 1x
+"daha az risk" değil, **niyet edilen %1'in altında kalmak.**
+
+**Üç kapı da geçildi:** tam dönem %94.7→%128.7, 1. yarı %5.8→%12.4,
+2. yarı %93.0→%114.0. Her dönemde 2x, 1x'i geçiyor.
+
+**Neden 3x/5x değil:** likidasyon tamponu = %90/kaldıraç (`LIQ_BUFFER`).
+1x→%90, 2x→%45, 3x→%30, 5x→%18. 3x'in %30'luk tamponu 1356 işlemde hiç
+delinmedi; 2x onun 1.5 katı pay bırakıyor. 5x'te 8 likidasyon = duvar orada.
+Kâğıt aşamasında marj bırakmayı seçtik; 3x, Faz 1 kapısından (~100 kapanmış
+işlem) sonra canlı veriyle yeniden değerlendirilebilir.
+
+**Açık pozisyonlara etkisi yok:** `leverage` yalnızca `_open()` içinde okunur;
+açık pozisyonlar kendi `margin` değerlerini kayıtta taşır.
+
+---
+
+## 2026-09-07 — Panelden manuel stop değiştirme
+
+Kullanıcı isteği: pozisyonun stop'unu panelden elle taşıyabilmek (4R'de
+"DEVAM" senaryosunun tamamlayıcısı). Seçim: **tam serbest + onay** — hem
+sıkma hem gevşetme mümkün, gevşetmede sert uyarı çıkar.
+
+**Kaldırılamayan tek şey stop'un kendisi.** İki giriş koşulsuz reddedilir:
+- stop ≤ 0 → "stop loss daima olacak" kuralı,
+- pozisyonu ANINDA tetikleyecek seviye (LONG'da fiyatın üstü, SHORT'ta altı)
+  → bu "kapat" demektir, onun için KAPAT düğmesi var.
+
+**Sıkma tarafı bedava geldi:** `updated_trailing_stop` zaten cırcır
+(`max(current_stop, aday)`), yani manuel sıkılan seviyeyi bot asla geri
+gevşetmez. Kod değişikliği gerekmedi.
+
+**Gevşetme tarafında gizli tuzak vardı.** İz süren stop her mumda
+`uç değer ∓ 3×ATR` hesaplıyor. Gevşetme yapılırsa bot bunu bir sonraki mumda
+geri alır ve verilen nefes payı en fazla 4 saat yaşar — verilen söz tutulmaz.
+Çözüm: `Position.stop_manual_ref` kilidi. Kilit açıkken iz sürme atlanır
+(uç değer takibi sürer).
+
+**Kilit ne zaman açılmalı? İlk tasarım YANLIŞTI ve test yakaladı.** İlk kural
+"aday eski stop'u geçince aç" idi. Test 10 bunu çürüttü: stop 109→105
+gevşetildikten sonra fiyatın 112→113 yapması (1 dolarlık tepe, aday 110 > 109)
+kilidi açıyor ve stop 110'a fırlıyordu — yani kullanıcının kaçınmak istediği
+seviyeye geri dönülüyordu. Marjinal bir tik izni iptal ediyor.
+
+Düzeltilmiş kural: **işlem, verilen nefes payını geri kazanmalı.**
+`ref = eski + (eski − yeni) = 2×eski − yeni` (iki yön için de aynı formül).
+Ne kadar pay istendiyse, algoritmanın kontrolü geri alması için işlemin o kadar
+ilerlemesi gerekir. Örnek: 109→105 (4$ pay) → ref 113 → uç değer 116'yı
+geçmeden kilit açılmaz. Kilit kendiliğinden açıldığı için "unutulup iz sürmesi
+kapalı kalan pozisyon" riski de yok.
+
+Mimari: panel pozisyona DOKUNMAZ, `cmd_<SEMBOL>` = `STOP:<fiyat>` yazar; tüm
+geçerlilik denetimi botta yapılır (tek yazıcı ilkesi, mevcut KAPAT/manuel
+aç akışıyla aynı).
+
+Test: 19/19 geçti — geriye uyumluluk (eski JSON kaydı, `stop_manual_ref` yok),
+reddedilen girişler (3), sıkma + cırcır koruması (3), gevşetme kilidi (4),
+SHORT tarafı (5), aşırı gevşetmede ref≤0 nöbetçisi, komut kuyruğu (3).
