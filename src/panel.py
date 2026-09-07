@@ -147,6 +147,24 @@ def build_state() -> dict:
                 else p.qty * (p.entry_price - price)) - p.funding_acc
         pos_notional = p.qty * p.entry_price
         equity += p.margin + upnl
+        # --- R ilerlemesi ---
+        # 1R = GİRİŞ ANINDAKİ stop mesafesi (risk_unit), bugünkü stop mesafesi
+        # DEĞİL. İz süren stop yükseldikçe bugünkü mesafe daralır; onu 1R sanmak
+        # kârı olduğundan büyük gösterir. (2026-09-07'de tam bu hatayı yaptım:
+        # INJ'yi 4.13R sandım, gerçekte 0.96R'ydi.) Bu yüzden panelde gösteriliyor.
+        birim = p.risk_unit
+        r_simdi = r_hedef = None
+        if birim > 0:
+            r_simdi = round(((price - p.entry_price) if p.side == "LONG"
+                             else (p.entry_price - price)) / birim, 2)
+            seviye = CONFIG.r_notify_level
+            if seviye > 0:
+                r_hedef = (p.entry_price + seviye * birim if p.side == "LONG"
+                           else p.entry_price - seviye * birim)
+        # Stop şu an tetiklenirse gerçekleşecek K/Z — "anlık kâr" ile karıştırılmasın,
+        # asıl bankaya girecek olan budur.
+        stop_pnl = p.qty * ((p.trailing_stop - p.entry_price) if p.side == "LONG"
+                            else (p.entry_price - p.trailing_stop))
         positions.append({
             "symbol": p.symbol, "side": p.side, "qty": p.qty,
             "entry": p.entry_price, "price": price, "stop": p.trailing_stop,
@@ -156,6 +174,10 @@ def build_state() -> dict:
             "notional": round(pos_notional, 2),
             "since": p.entry_time[:16].replace("T", " "),
             "stop_kilit": p.stop_manual_ref,   # >0 = manuel gevşetme kilidi açık
+            "r_simdi": r_simdi,                # None = eski pozisyon, risk_unit yok
+            "r_hedef": r_hedef,                # bildirim eşiğine karşılık gelen fiyat
+            "r_notified": p.r_notified,
+            "stop_pnl": round(stop_pnl, 2),
         })
 
     stats = state.trade_stats()
@@ -286,6 +308,20 @@ const $ = id => document.getElementById(id);
 const money = v => (v<0?"−$":"$") + Math.abs(v).toLocaleString("tr-TR",{minimumFractionDigits:2,maximumFractionDigits:2});
 const cls = v => v > 0 ? "up" : v < 0 ? "down" : "";
 const sign = v => (v>0?"+":"") + v.toLocaleString("tr-TR",{maximumFractionDigits:2});
+const kisa = v => (+v).toLocaleString("tr-TR",{maximumSignificantDigits:6});
+// R ilerlemesi. 1R = GİRİŞ anındaki stop mesafesi; iz süren stop yükseldikçe
+// bugünkü mesafe daralır ve onu 1R sanmak kârı olduğundan büyük gösterir.
+// risk_unit'i olmayan (özellikten önce açılmış) pozisyonlarda "—" gösterilir,
+// tahmin uydurulmaz.
+function rHucre(p) {
+  if (p.r_simdi === null || p.r_simdi === undefined)
+    return `<span style="color:var(--mut)" title="Bu pozisyon R takibinden önce açıldı">—</span>`;
+  const ulasti = p.r_notified > 0 && p.r_simdi >= p.r_notified;
+  const renk = ulasti ? "var(--up)" : p.r_simdi > 0 ? "var(--ink)" : "var(--mut)";
+  const hedef = p.r_hedef
+    ? `<div style="font-size:10px;color:var(--mut)">hedef $${kisa(p.r_hedef)}</div>` : "";
+  return `<b style="color:${renk}">${sign(p.r_simdi)}R</b>${ulasti ? " 🎯" : ""}${hedef}`;
+}
 
 async function refresh() {
   let d;
@@ -331,7 +367,10 @@ async function refresh() {
     : `<div class="empty">İlk mum kapanışı bekleniyor — analiz her 4 saatte bir yenilenir</div>`;
 
   $("positions").innerHTML = d.positions.length ? "<table><tr>" +
-    "<th>Parite</th><th>Yön</th><th>Giriş</th><th>Anlık</th><th>Stop</th><th>Marjin</th><th>Funding</th><th>Anlık PnL</th><th>%</th><th>Manuel</th></tr>" +
+    "<th>Parite</th><th>Yön</th><th>Giriş</th><th>Anlık</th><th>Stop</th>" +
+    "<th title='Giriş anındaki stop mesafesi 1R kabul edilir'>R</th>" +
+    "<th title='Stop şu an tetiklenirse bankaya girecek gerçek tutar'>Stop olursa</th>" +
+    "<th>Marjin</th><th>Funding</th><th>Anlık PnL</th><th>%</th><th>Manuel</th></tr>" +
     d.positions.map(p => `<tr>
       <td><b>${p.symbol}</b> <span style="color:var(--mut);font-size:11px">${p.since}</span></td>
       <td><span class="side ${p.side[0]}">${p.side}</span></td>
@@ -339,6 +378,8 @@ async function refresh() {
       <td>$${p.price.toLocaleString("tr-TR")}</td>
       <td>$${p.stop.toLocaleString("tr-TR",{maximumFractionDigits:6})}${
           p.stop_kilit > 0 ? ` <span title="Manuel gevşetme kilidi açık — iz süren stop durduruldu" style="color:var(--amber)">🔓</span>` : ""}</td>
+      <td>${rHucre(p)}</td>
+      <td class="${cls(p.stop_pnl)}">${money(p.stop_pnl)}</td>
       <td>${money(p.margin)}</td><td>${money(p.funding)}</td>
       <td class="${cls(p.upnl)}"><b>${money(p.upnl)}</b></td>
       <td class="${cls(p.upnl)}">${sign(p.upnl_pct)}%</td>
