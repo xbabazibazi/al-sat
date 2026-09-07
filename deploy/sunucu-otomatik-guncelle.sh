@@ -30,10 +30,29 @@ set -uo pipefail
 PROJE="${HOME}/al-sat"
 LOG="${PROJE}/logs/otomatik-guncelle.log"
 DAL="${DEPLOY_DAL:-main}"
-PANEL="http://127.0.0.1:8484"
 
 mkdir -p "${PROJE}/logs"
 kayit() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
+
+PY="${PROJE}/.venv/bin/python"
+[ -x "$PY" ] || PY="python3"
+
+# PANEL ADRESI SABIT YAZILAMAZ. deploy/kur-sunucu.sh, .env icindeki PANEL_HOST'u
+# Tailscale IP'sine sabitler; yani panel 127.0.0.1'de DINLEMEZ. Ilk surumde
+# adres 127.0.0.1 sabit yazilmisti ve sonuc sinsi oldu: pozisyon dogrulamasi
+# hep basarisiz oldu, guvenlik kapisi her seferinde devreye girdi ve guncelleme
+# SESSIZCE ertelendi. Adres artik .env'den okunuyor.
+PANEL=$("$PY" - <<PYEOF 2>/dev/null
+import sys
+sys.path.insert(0, "${PROJE}")
+from src.config import CONFIG
+h = CONFIG.panel_host
+if h in ("0.0.0.0", "", "::"):     # her arayuzde dinliyorsa yerelden sor
+    h = "127.0.0.1"
+print(f"http://{h}:{CONFIG.panel_port}")
+PYEOF
+)
+[ -n "$PANEL" ] || PANEL="http://127.0.0.1:8484"
 
 # Telegram bildirimi. Anahtarlar .env'de; onlari kabuga tasimayalim diye
 # mesaj ortam degiskeniyle gecirilir ve Python .env'i kendisi okur.
@@ -76,9 +95,6 @@ UZAK=$(git rev-parse "origin/${DAL}")
 
 kayit "Yeni surum: ${YEREL:0:7} -> ${UZAK:0:7}"
 
-PY="${PROJE}/.venv/bin/python"
-[ -x "$PY" ] || PY="python3"
-
 # --------------------------------------------------- guncelleme ONCESI durum kaydi
 # Acik pozisyonlarin "SEMBOL:giris" ozeti. Guncelleme sonrasi bu dizgi BIREBIR
 # ayni cikmali — kullanicinin degismez sarti: "guncelleme pozisyonu kapatmasin".
@@ -98,11 +114,26 @@ PYX
 }
 
 ONCE=$(pozisyon_ozeti)
+kayit "Panel adresi: ${PANEL}"
 kayit "Once acik pozisyonlar: ${ONCE:-yok}"
+
+# SESSIZ ERTELEME OLMAZ. Ilk surumde panel adresi yanlisti; kapi her seferinde
+# devreye girdi, guncelleme hic yapilmadi ve KIMSE HABERI OLMADI. Erteleme artik
+# Telegram'a bildirilir — ama her 5 dakikada bir degil, sadece ilk seferinde
+# (damga dosyasi). Panel geri gelince damga silinir.
+DAMGA="${PROJE}/logs/.panel-erisilemedi"
 if [ "$ONCE" = "OKUNAMADI" ]; then
-  kayit "!! Panel okunamadi — pozisyon dogrulamasi yapilamayacagi icin guncelleme ERTELENDI"
+  kayit "!! Panel okunamadi (${PANEL}) — pozisyon dogrulanamayacagi icin guncelleme ERTELENDI"
+  if [ ! -f "$DAMGA" ]; then
+    touch "$DAMGA"
+    BILDIR_MESAJ="⚠️ Otomatik guncelleme ERTELENDI
+Panel okunamiyor: ${PANEL}
+Acik pozisyonlar dogrulanamadigi icin yeni kod uygulanmadi.
+Bot eski surumde calismaya devam ediyor." BILDIR_TIP=send_error bildir
+  fi
   exit 0
 fi
+rm -f "$DAMGA"
 
 # ------------------------------------------------------------- kodu al ve SINA
 # Once gecici olarak al; testler gecmezse GERI DON.
