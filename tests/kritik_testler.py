@@ -17,6 +17,7 @@ Kapsam (gerçek DB'ye DOKUNMAZ, geçici dosya kullanır):
   - Manuel stop: geçersiz girişlerin reddi, sıkma, gevşetme kilidi
   - SHORT tarafı
   - Komut kuyruğu (panel → bot tek yazıcı akışı)
+  - Komut SONUCU: her komut ok/red/bilgi izi bırakır (sessiz yutma yok)
 
     python -m tests.kritik_testler
 """
@@ -27,9 +28,9 @@ import sqlite3
 import sys
 import tempfile
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
@@ -314,13 +315,133 @@ def test_komut_kuyrugu():
     ok("CLOSE komutu bozulmadı [regresyon]")
 
 
+def test_komut_sonucu():
+    """Her komut bir iz bırakmalı — 'sessizce yutuldu' hâli KALMAMALI.
+
+    Bot komutu kabul etse de reddetse de kuyruktan siliyor. Sonuç yazılmazsa
+    panelin ⏳ rozeti söner ve kullanıcı bunu 'uygulandı' sanar. Bu test tam
+    olarak o yanlış izlenimin geri gelmesini engeller.
+    """
+    print("\nKOMUT SONUCU (panelin ⏳ → ✅/⛔ şeridi)")
+
+    def sonuc(state):
+        ham = state.get_kv("cmdres_SOLUSDT", "")
+        durum, _, kalan = ham.partition("|")
+        ts, _, mesaj = kalan.partition("|")
+        datetime.fromisoformat(ts)          # panel bunu ayrıştırabilmeli
+        return durum, mesaj
+
+    state, _, t, _ = kur()
+    poz(state)
+    state.set_kv("cmd_SOLUSDT", "STOP:106.25")
+    t._process_manual_commands(state.get_position("SOLUSDT"), 112.0)
+    durum, mesaj = sonuc(state)
+    assert durum == "ok" and "106" in mesaj, (durum, mesaj)
+    ok("stop sıkma → 'ok' + seviye mesajı")
+
+    state.set_kv("cmdres_SOLUSDT", "")
+    state.set_kv("cmd_SOLUSDT", "STOP:113")
+    t._process_manual_commands(state.get_position("SOLUSDT"), 112.0)
+    durum, mesaj = sonuc(state)
+    assert durum == "red" and "KAPAT" in mesaj, (durum, mesaj)
+    assert state.get_position("SOLUSDT").trailing_stop == 106.25
+    ok("anında tetikleyen stop → 'red' + sebep (stop değişmedi)")
+
+    state.set_kv("cmdres_SOLUSDT", "")
+    state.set_kv("cmd_SOLUSDT", "STOP:106.25")
+    t._process_manual_commands(state.get_position("SOLUSDT"), 112.0)
+    durum, _ = sonuc(state)
+    assert durum == "bilgi", durum
+    ok("aynı seviye tekrar → 'bilgi' (sessizce yutulmuyor)")
+
+    state.set_kv("cmdres_SOLUSDT", "")
+    state.clear_position("SOLUSDT")
+    state.set_kv("cmd_SOLUSDT", "STOP:50")
+    t._process_manual_commands(None, 112.0)
+    durum, _ = sonuc(state)
+    assert durum == "red", durum
+    ok("pozisyon yokken STOP → 'red' (eskiden tamamen sessizdi)")
+
+    state.set_kv("cmdres_SOLUSDT", "")
+    state.set_kv("cmd_SOLUSDT", "CLOSE")
+    t._process_manual_commands(None, 112.0)
+    durum, _ = sonuc(state)
+    assert durum == "red", durum
+    ok("pozisyon yokken CLOSE → 'red'")
+
+    state.set_kv("cmdres_SOLUSDT", "")
+    poz(state)
+    state.set_kv("cmd_SOLUSDT", "CLOSE")
+    t._process_manual_commands(state.get_position("SOLUSDT"), 112.0)
+    durum, _ = sonuc(state)
+    assert durum == "ok" and state.get_position("SOLUSDT") is None
+    ok("başarılı CLOSE → 'ok' (satır kaybolsa da sonuç şeritte kalır)")
+
+    state.set_kv("cmdres_SOLUSDT", "")
+    state.set_kv("cmd_SOLUSDT", "SACMALIK")
+    t._process_manual_commands(None, 112.0)
+    durum, _ = sonuc(state)
+    assert durum == "red", durum
+    ok("bilinmeyen komut → 'red' (eskiden hiç iz bırakmazdı)")
+
+    state.set_kv("cmdres_SOLUSDT", "")
+    poz(state)
+    state.set_kv("cmd_SOLUSDT", "OPEN_LONG")
+    t._process_manual_commands(state.get_position("SOLUSDT"), 112.0)
+    durum, _ = sonuc(state)
+    assert durum == "red", durum
+    ok("zaten pozisyon varken AÇ → 'red'")
+
+
+def test_panel_komut_seridi():
+    """Panelin şeridi: kuyruktakini 'bekliyor', sonucu TTL boyunca gösterir."""
+    print("\nPANEL KOMUT ŞERİDİ")
+    from src import panel
+
+    state, _, t, _ = kur()
+    sym = CONFIG.symbols[0]
+    state.set_kv(f"cmd_{sym}", "STOP:1.23")
+    with patch.object(panel, "state", state), \
+         patch.object(panel, "CONFIG", replace(CONFIG, symbols=[sym])):
+        (satir,) = panel.build_komutlar()
+        assert satir["durum"] == "bekliyor" and satir["symbol"] == sym
+        ok("kuyrukta komut varken → 'bekliyor'")
+
+        # Sonuç geldi, komut tüketildi.
+        state.set_kv(f"cmd_{sym}", "")
+        state.set_kv(f"cmdres_{sym}",
+                     f"red|{datetime.now(timezone.utc).isoformat()}|Anında tetikler")
+        (satir,) = panel.build_komutlar()
+        assert satir["durum"] == "red" and satir["mesaj"] == "Anında tetikler"
+        ok("komut tüketilince → sonuç ('red' + sebep) gösteriliyor")
+
+        # Kuyrukta yeni komut varsa ESKİ sonuç değil, 'bekliyor' görünmeli.
+        state.set_kv(f"cmd_{sym}", "CLOSE")
+        (satir,) = panel.build_komutlar()
+        assert satir["durum"] == "bekliyor", "bayat sonuç yeni komutun üstünü örttü"
+        ok("yeni komut kuyruğa girince bayat sonuç gösterilmiyor")
+
+        # TTL dolunca şeritten düşer (panel sonsuza kadar kalabalık olmasın).
+        state.set_kv(f"cmd_{sym}", "")
+        eski = datetime.now(timezone.utc) - timedelta(seconds=panel.CMD_RESULT_TTL_S + 30)
+        state.set_kv(f"cmdres_{sym}", f"ok|{eski.isoformat()}|Uygulandı")
+        assert panel.build_komutlar() == []
+        ok(f"{panel.CMD_RESULT_TTL_S} sn sonra sonuç şeritten düşüyor")
+
+        # Bozuk kayıt paneli ÇÖKERTMEMELİ.
+        state.set_kv(f"cmdres_{sym}", "ok|bozuk-zaman|x")
+        assert panel.build_komutlar() == []
+        ok("bozuk zaman damgası → satır atlanıyor, panel çökmüyor")
+
+
 def main() -> int:
     print("=" * 74)
     print("  KRİTİK TESTLER — geçici DB, gerçek pozisyona DOKUNULMAZ")
     print("=" * 74)
     testler = [test_geriye_uyumluluk, test_pozisyon_tavani, test_r_bildirimi,
                test_manuel_stop_ret, test_manuel_stop_sikma,
-               test_manuel_stop_gevsetme, test_short, test_komut_kuyrugu]
+               test_manuel_stop_gevsetme, test_short, test_komut_kuyrugu,
+               test_komut_sonucu, test_panel_komut_seridi]
     for fn in testler:
         try:
             fn()

@@ -48,6 +48,7 @@ def triggers(symbol: str) -> tuple[float, float]:
 
 # --------------------------------------------------------------- bot kontrolü
 HEARTBEAT_STALE_S = 90    # bot 30 sn'de bir atar; 3 atış kaçarsa düşmüş sayılır
+CMD_RESULT_TTL_S = 120    # manuel komut sonucu panelde ne kadar asılı kalsın
 
 
 def bot_alive() -> bool:
@@ -134,6 +135,39 @@ def build_watchlist(open_symbols: set[str]) -> list[dict]:
     return out
 
 
+def build_komutlar() -> list[dict]:
+    """Manuel komutların durumu: kuyrukta mı, uygulandı mı, reddedildi mi.
+
+    Panelin "bot 30 sn içinde uygular" yazıp kaderine terk etmesi yeterli değildi:
+    bot komutu KABUL ETSE DE REDDETSE DE kuyruktan siliyor, dolayısıyla rozetin
+    sönmesi "uygulandı" anlamına gelmiyordu. Bot artık sonucu `cmdres_<SEMBOL>`
+    anahtarına yazıyor (bkz. FuturesPaperTrader._sonuc); burada okunup gösteriliyor.
+
+    Pozisyon tablosunun bir kolonu DEĞİL, ayrı bir şerit: başarılı KAPAT'ta satır
+    tablodan kaybolur, "açık pozisyon yok" reddinde ise hiç satır yoktur —
+    ikisinde de sonucu gösterecek hücre kalmazdı.
+    """
+    out, simdi = [], datetime.now(timezone.utc)
+    for sym in CONFIG.symbols:
+        bekleyen = state.get_kv(f"cmd_{sym}", "")
+        if bekleyen:
+            out.append({"symbol": sym, "durum": "bekliyor",
+                        "mesaj": f"{bekleyen} gönderildi — bot bir sonraki turunda uygulayacak"})
+            continue
+        ham = state.get_kv(f"cmdres_{sym}", "")
+        if not ham:
+            continue
+        durum, _, kalan = ham.partition("|")
+        ts, _, mesaj = kalan.partition("|")
+        try:
+            yas = (simdi - datetime.fromisoformat(ts)).total_seconds()
+        except ValueError:
+            continue
+        if 0 <= yas <= CMD_RESULT_TTL_S:
+            out.append({"symbol": sym, "durum": durum, "mesaj": mesaj, "yas": int(yas)})
+    return out
+
+
 def build_state() -> dict:
     balance = float(state.get_kv("fut_usdt", "10000.0"))
     positions = []
@@ -197,6 +231,7 @@ def build_state() -> dict:
         "n_trades": stats["count"], "win_rate": round(win_rate, 1),
         "cum_realized": round(stats["total_pnl"], 2),
         "positions": positions,
+        "komutlar": build_komutlar(),
         "watchlist": build_watchlist({p["symbol"] for p in positions}),
         "trades": state.recent_trades(30),
         "equity_history": [{"t": t, "v": round(v, 2)} for t, v in state.equity_history(600)],
@@ -256,6 +291,14 @@ PAGE = """<!doctype html>
   .side.L { background:color-mix(in srgb, var(--up) 18%, transparent); color:var(--up); }
   .side.S { background:color-mix(in srgb, var(--down) 18%, transparent); color:var(--down); }
   .empty { color:var(--mut); padding:14px 0; text-align:center; }
+  /* Manuel komut şeridi — kuyrukta/uygulandı/reddedildi. Sol kenar rengi durumu
+     taşır ama TEK gösterge o değil: simge ve metin de var (renk körlüğü). */
+  .cmdrow { display:flex; gap:8px; align-items:baseline; font-size:12.5px;
+    background:var(--card2); border-left:3px solid var(--mut); border-radius:6px;
+    padding:7px 10px; margin-bottom:6px; }
+  .cmdrow b { font-size:12.5px; }
+  .cmdrow .msg { color:var(--ink2); }
+  .cmdrow .yas { margin-left:auto; color:var(--mut); font-size:11px; white-space:nowrap; }
   svg { display:block; width:100%; }
   .pulse { animation:pulse 2s infinite; display:inline-block; width:7px; height:7px;
     border-radius:50%; background:var(--up); margin-right:6px; vertical-align:1px; }
@@ -298,7 +341,7 @@ PAGE = """<!doctype html>
 </div>
 <div class="grid" id="stats"></div>
 <div class="card"><h2>Ön Değerlendirme — her mum kapanışında 5 araçlı analiz (incelemesiz giriş yok)</h2><div id="assess"></div></div>
-<div class="card"><h2>Açık Pozisyonlar — anlık kâr/zarar</h2><div id="positions"></div></div>
+<div class="card"><h2>Açık Pozisyonlar — anlık kâr/zarar</h2><div id="komutlar"></div><div id="positions"></div></div>
 <div class="card"><h2>İzleme Listesi — tetiğe uzaklık</h2><div id="watch"></div></div>
 <div class="card"><h2>Varlık Eğrisi</h2><div id="chart"><div class="empty">Veri birikiyor…</div></div></div>
 <div class="card"><h2>Kâr Kilometre Taşları <span id="rbaslik" style="font-weight:400;color:var(--mut);font-size:13px"></span></h2><div id="revents"></div></div>
@@ -309,6 +352,10 @@ const money = v => (v<0?"−$":"$") + Math.abs(v).toLocaleString("tr-TR",{minimu
 const cls = v => v > 0 ? "up" : v < 0 ? "down" : "";
 const sign = v => (v>0?"+":"") + v.toLocaleString("tr-TR",{maximumFractionDigits:2});
 const kisa = v => (+v).toLocaleString("tr-TR",{maximumSignificantDigits:6});
+// Bot mesajları innerHTML'e giriyor; içlerinde ham kullanıcı girdisi (reddedilen
+// stop dizgisi) olabildiği için kaçırılır.
+const kacir = s => String(s ?? "").replace(/[&<>"]/g, c =>
+  ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
 // R ilerlemesi. 1R = GİRİŞ anındaki stop mesafesi; iz süren stop yükseldikçe
 // bugünkü mesafe daralır ve onu 1R sanmak kârı olduğundan büyük gösterir.
 // risk_unit'i olmayan (özellikten önce açılmış) pozisyonlarda "—" gösterilir,
@@ -365,6 +412,19 @@ async function refresh() {
         <td style="color:var(--mut)">${(a.ts||"").slice(11,16)} UTC</td></tr>`;
     }).join("") + "</table>"
     : `<div class="empty">İlk mum kapanışı bekleniyor — analiz her 4 saatte bir yenilenir</div>`;
+
+  // Manuel komut şeridi. "Rozet söndü = uygulandı" YANLIŞTI (bot reddettiğinde de
+  // kuyruktan siliyor), o yüzden bot artık sonucu yazıyor ve burada gösteriliyor.
+  $("komutlar").innerHTML = (d.komutlar || []).map(k => {
+    const s = k.durum === "bekliyor" ? ["⏳", "var(--amber)"]
+            : k.durum === "ok"       ? ["✅", "var(--up)"]
+            : k.durum === "red"      ? ["⛔", "var(--down)"]
+            :                          ["ℹ️", "var(--mut)"];
+    const yas = k.durum === "bekliyor" ? "" : `<span class="yas">${k.yas} sn önce</span>`;
+    return `<div class="cmdrow" style="border-left-color:${s[1]}">
+      <span>${s[0]}</span><b>${kacir(k.symbol)}</b>
+      <span class="msg">${kacir(k.mesaj)}</span>${yas}</div>`;
+  }).join("");
 
   $("positions").innerHTML = d.positions.length ? "<table><tr>" +
     "<th>Parite</th><th>Yön</th><th>Giriş</th><th>Anlık</th><th>Stop</th>" +
@@ -487,7 +547,9 @@ async function stopDegistir(sembol, yon, stop, fiyat, giris, qty) {
   if (!confirm(soru)) return;
   try {
     await fetch(`/api/manual/stop/${sembol}/${yeni}`, { method: "POST" });
-    alert("Komut gönderildi. Bot 30 saniye içinde uygulayacak.");
+    alert("Komut kuyruğa alındı.
+
+Sonucu tahmin etmene gerek yok: pozisyon tablosunun üstündeki şeritte ⏳ bekliyor olarak görünür, bot uygulayınca ✅ ya da ⛔ (sebebiyle) olur. Tur süresi ~1 dakika.");
   } catch { alert("Komut gönderilemedi."); }
   setTimeout(refresh, 2000);
 }
@@ -508,7 +570,9 @@ async function manuel(eylem, sembol, pnl) {
   if (!confirm(soru)) return;
   try {
     await fetch(`/api/manual/${eylem}/${sembol}`, { method: "POST" });
-    alert("Komut gönderildi. Bot 30 saniye içinde uygulayacak.");
+    alert("Komut kuyruğa alındı.
+
+Sonucu tahmin etmene gerek yok: pozisyon tablosunun üstündeki şeritte ⏳ bekliyor olarak görünür, bot uygulayınca ✅ ya da ⛔ (sebebiyle) olur. Tur süresi ~1 dakika.");
   } catch { alert("Komut gönderilemedi."); }
   setTimeout(refresh, 2000);
 }
@@ -540,7 +604,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         # Manuel komutlar: panel pozisyona DOKUNMAZ, komutu kuyruğa yazar;
-        # bot bir sonraki turunda (≤30 sn) uygular. Tek yazıcı ilkesi korunur.
+        # bot bir sonraki turunda (~1 dk) uygular. Tek yazıcı ilkesi korunur.
+        # Sonuç cmdres_<SEMBOL>'e yazılır ve panelde şerit olarak gösterilir.
         if self.path.startswith("/api/manual/"):
             parts = self.path.split("/")  # ['', 'api', 'manual', <eylem>, <sembol>]
             if len(parts) == 5:

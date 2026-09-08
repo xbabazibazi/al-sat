@@ -139,6 +139,22 @@ class FuturesPaperTrader:
                  self.symbol, r, upnl, kilitli)
 
     # --------------------------------------------------------- manuel komutlar
+    def _sonuc(self, durum: str, mesaj: str) -> None:
+        """Manuel komutun ÂKIBETİNİ panelin okuyabileceği yere bırakır.
+
+        NEDEN GEREKLİ: bot komutu kabul etse de reddetse de kuyruktan siliyor.
+        Sonuç yazılmazsa panelin "bekliyor" rozeti söner ve kullanıcı bunu
+        "uygulandı" sanar — oysa reddedilmiş olabilir. Bu projede aynı tipte iki
+        sessiz yutma yaşandı (deploy betiği panele ulaşamayınca güncellemeyi
+        sessizce erteledi; marjinal_katki veri yokken sessizce 0.00 bastı).
+        Üçüncüsü olmasın: her çıkış yolu buraya uğrar.
+
+        Biçim: "durum|zaman|mesaj" — durum ∈ {ok, red, bilgi}.
+        """
+        self.state.set_kv(
+            f"cmdres_{self.symbol}",
+            f"{durum}|{datetime.now(timezone.utc).isoformat()}|{mesaj}")
+
     def _process_manual_commands(self, pos: Position | None, price: float) -> Position | None:
         """Panelden gelen manuel AÇ/KAPAT komutlarını işler.
 
@@ -155,10 +171,12 @@ class FuturesPaperTrader:
         if cmd == "CLOSE":
             if pos is None:
                 log.info("[%s] Manuel kapatma istendi ama açık pozisyon yok", self.symbol)
+                self._sonuc("red", "Kapatılacak açık pozisyon yok.")
                 return None
             slip = (1 - SLIPPAGE) if pos.side == "LONG" else (1 + SLIPPAGE)
             log.info("[%s] MANUEL KAPATMA uygulanıyor", self.symbol)
             self._close(pos, price * slip, "manuel kapatma")
+            self._sonuc("ok", f"Pozisyon kapatıldı @ ${price * slip:,.6g}")
             return None
 
         if cmd.startswith("STOP:"):
@@ -167,12 +185,24 @@ class FuturesPaperTrader:
         if cmd in ("OPEN_LONG", "OPEN_SHORT"):
             if pos is not None:
                 log.info("[%s] Manuel açma istendi ama zaten pozisyon var", self.symbol)
+                self._sonuc("red", f"Zaten açık {pos.side} pozisyon var.")
                 return pos
             side = "LONG" if cmd == "OPEN_LONG" else "SHORT"
             log.info("[%s] MANUEL %s açılıyor", self.symbol, side)
             self._open(side, manual=True)
-            return self.state.get_position(self.symbol)
+            yeni = self.state.get_position(self.symbol)
+            # _open sessizce vazgeçebilir (bakiye, pozisyon üst sınırı, lot filtresi).
+            # Sonucu pozisyonun gerçekten doğduğuna bakarak yaz, isteğe değil.
+            if yeni is None:
+                self._sonuc("red", f"{side} açılamadı — bakiye, pozisyon üst "
+                                   f"sınırı veya lot filtresi engelledi (log'a bak).")
+            else:
+                self._sonuc("ok", f"{side} açıldı @ ${yeni.entry_price:,.6g} · "
+                                  f"stop ${yeni.trailing_stop:,.6g}")
+            return yeni
 
+        log.warning("[%s] Bilinmeyen manuel komut: %r", self.symbol, cmd)
+        self._sonuc("red", f"Bilinmeyen komut: {cmd}")
         return pos
 
     def _set_manual_stop(self, pos: Position | None, price: float, ham: str) -> Position | None:
@@ -185,28 +215,35 @@ class FuturesPaperTrader:
         """
         if pos is None:
             log.info("[%s] Manuel stop istendi ama açık pozisyon yok", self.symbol)
+            self._sonuc("red", "Stop değiştirilecek açık pozisyon yok.")
             return None
         try:
             yeni = float(ham)
         except ValueError:
             log.warning("[%s] Manuel stop okunamadı: %r", self.symbol, ham)
+            self._sonuc("red", f"Stop seviyesi sayıya çevrilemedi: {ham!r}")
             return pos
         if not (yeni > 0):
             self.notifier.send_error(f"{self.symbol}: stop 0 veya negatif olamaz — reddedildi.")
+            self._sonuc("red", f"Stop 0 veya negatif olamaz ({yeni:g}) — reddedildi.")
             return pos
 
         # anında tetiklenir mi?
         tetikler = yeni >= price if pos.side == "LONG" else yeni <= price
         if tetikler:
+            yon = "üstünde" if pos.side == "LONG" else "altında"
             self.notifier.send_error(
                 f"⛔️ {self.symbol}: stop `${yeni:,.6g}` anlık fiyatın "
-                f"({'üstünde' if pos.side == 'LONG' else 'altında'}, `${price:,.6g}`) — "
+                f"({yon}, `${price:,.6g}`) — "
                 f"bu pozisyonu anında kapatır. İstediğin buysa KAPAT düğmesini kullan."
             )
+            self._sonuc("red", f"${yeni:,.6g} anlık fiyatın ({yon} ${price:,.6g}) — "
+                               f"pozisyonu anında kapatırdı. KAPAT düğmesini kullan.")
             return pos
 
         eski = pos.trailing_stop
         if abs(yeni - eski) < 1e-12:
+            self._sonuc("bilgi", f"Stop zaten ${eski:,.6g} — değişiklik yok.")
             return pos
         sikilastir = yeni > eski if pos.side == "LONG" else yeni < eski
 
@@ -232,6 +269,9 @@ class FuturesPaperTrader:
         log.info("[%s] MANUEL STOP %s: %.6g → %.6g (kilit ref=%.6g)",
                  self.symbol, "sıkıldı" if sikilastir else "GEVŞETİLDİ",
                  eski, yeni, pos.stop_manual_ref)
+        self._sonuc("ok", f"Stop {'sıkıldı' if sikilastir else 'GEVŞETİLDİ'}: "
+                          f"${eski:,.6g} → ${yeni:,.6g} · garantilenen {kilitli:+,.2f} USDT"
+                          + ("" if sikilastir else " · iz sürme durduruldu 🔓"))
         if sikilastir:
             self.notifier.send(
                 f"🔒 *{self.symbol} stop sıkıldı* (manuel)\n"
