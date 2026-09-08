@@ -536,6 +536,7 @@ def test_deploy_teshis():
 
     d = panel.deploy_durum()
     for alan in ("yerel_surum", "uzak_dal", "crontab", "betik_var",
+                 "son_cron_kosusu",
                  "panel_erisilemedi_damgasi", "su_an_calisiyor", "log"):
         assert alan in d, f"teşhis alanı eksik: {alan}"
     ok("deploy_durum() beklenen alanların hepsini döndürdü")
@@ -573,6 +574,29 @@ def test_deploy_teshis():
         r = panel.guncellemeyi_tetikle()
     assert r["ok"] is True and sahte.called
     ok("geçerli durumda tetik arka planda başlatılıyor")
+
+    # Kalp atışı: sessizlik "yolunda" mı "ölü" mü — ayırt edilebilmeli.
+    kok = Path(tempfile.mkdtemp())
+    (kok / "logs").mkdir()
+    with patch.object(panel, "PROJECT_ROOT", kok):
+        h = panel._son_cron_kosusu()
+        assert h["saglikli"] is False and "hiç koşmamış" in h.get("not", "")
+        ok("damga yoksa 'sağlıklı değil' (cron ölü, sessizlik yutulmuyor)")
+
+        taze = datetime.now(timezone.utc).isoformat()
+        (kok / "logs" / ".son-kosu").write_text(taze, encoding="utf-8")
+        assert panel._son_cron_kosusu()["saglikli"] is True
+        ok("taze damga → sağlıklı")
+
+        bayat = (datetime.now(timezone.utc) - timedelta(minutes=20)).isoformat()
+        (kok / "logs" / ".son-kosu").write_text(bayat, encoding="utf-8")
+        h = panel._son_cron_kosusu()
+        assert h["saglikli"] is False and h["yas_sn"] > 900
+        ok("20 dk önceki damga → 3 koşu kaçmış, arıza olarak işaretlendi")
+
+        (kok / "logs" / ".son-kosu").write_text("bozuk", encoding="utf-8")
+        assert panel._son_cron_kosusu()["saglikli"] is False
+        ok("bozuk damga → çökmüyor, sağlıksız sayıyor")
 
 
 def main() -> int:

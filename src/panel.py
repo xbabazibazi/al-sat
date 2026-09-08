@@ -139,6 +139,27 @@ def _kabuk(*args: str, sure: int = 20) -> dict:
         return {"kod": -1, "cikti": f"{type(e).__name__}: {e}"}
 
 
+def _son_cron_kosusu() -> dict:
+    """Cron gerçekten tetikleniyor mu? Sessizlik tek başına kanıt değildir.
+
+    Güncelleme betiği yapacak iş yokken sessizce çıkıyor — doğru davranış, ama
+    yan etkisi şu: "her şey yolunda" ile "cron hiç çalışmıyor" dışarıdan aynı
+    görünüyor. 2026-09-09'da cron satırı iki gündür silinmişti ve fark edilmedi.
+    Betik artık her koşuda damga bırakıyor; buradaki yaş onun kanıtı.
+    """
+    damga = PROJECT_ROOT / "logs" / ".son-kosu"
+    try:
+        ts = damga.read_text(encoding="utf-8").strip()
+        yas = (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds()
+        # Cron 5 dakikada bir; 15 dakika = 3 koşu kaçtı, artık arıza sayılır.
+        return {"zaman": ts, "yas_sn": int(yas), "saglikli": yas < 900}
+    except FileNotFoundError:
+        return {"zaman": None, "yas_sn": None, "saglikli": False,
+                "not": "hiç koşmamış (damga yok) — cron kurulu mu?"}
+    except Exception as e:  # noqa: BLE001
+        return {"zaman": None, "yas_sn": None, "saglikli": False, "not": str(e)}
+
+
 def deploy_durum() -> dict:
     satirlar: list[str] = []
     try:
@@ -151,6 +172,7 @@ def deploy_durum() -> dict:
         "yerel_surum": _kabuk("git", "rev-parse", "--short", "HEAD"),
         "uzak_dal": _kabuk("git", "ls-remote", "--heads", "origin", "main", sure=45),
         "crontab": _kabuk("crontab", "-l"),
+        "son_cron_kosusu": _son_cron_kosusu(),
         "betik_var": GUNCELLE_BETIK.exists(),
         # Bu damga varsa betik ÇALIŞTI ama paneli okuyamadığı için erteledi.
         "panel_erisilemedi_damgasi": (PROJECT_ROOT / "logs" / ".panel-erisilemedi").exists(),

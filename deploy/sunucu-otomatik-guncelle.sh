@@ -87,6 +87,13 @@ cd "$PROJE" || { kayit "HATA: $PROJE yok"; exit 1; }
 exec 9>"${PROJE}/logs/.guncelle.lock"
 flock -n 9 || exit 0
 
+# KALP ATISI. Betik yapacak is yokken sessizce cikiyor; bu dogru ama yan etkisi
+# su: "cron gercekten calisiyor mu" DISARIDAN ANLASILAMIYOR. 2026-09-09'da cron
+# satiri iki gundur silinmisti ve kimse fark etmedi, cunku sessizlik hem "her sey
+# yolunda" hem "hic calismiyor" demek oluyordu. Artik her kosu iz birakir;
+# /api/deploy-durum bunun yasini gosterir. 5 dakikadan eskiyse cron olmustur.
+date -u '+%Y-%m-%dT%H:%M:%S+00:00' > "${PROJE}/logs/.son-kosu"
+
 # ---------------------------------------------------------------- yeni kod var mi
 git fetch origin "$DAL" --quiet 2>/dev/null || { kayit "fetch basarisiz (ag?)"; exit 0; }
 YEREL=$(git rev-parse HEAD)
