@@ -108,13 +108,38 @@ EOF
 chmod +x paneli-baslat.sh
 
 # crontab: acilista + her 5 dakikada bir nobetci (sudo gerekmez)
+#
+# DIKKAT — burada bir INTIHAR HATASI vardi (2026-09-09'da bulundu):
+#   crontab -l | grep -v "al-sat"
+# yol icinde "al-sat" GECEN HER SATIRI siliyordu. Otomatik guncellemenin satiri
+#   */5 * * * * bash /home/quon/al-sat/deploy/sunucu-otomatik-guncelle.sh
+# de bu desene uyuyordu. Sonuc: her kurulum otomatik guncellemeyi cron'dan
+# siliyordu. Ustelik otomatik guncelleme betigi botu yeniden baslatmak icin BU
+# DOSYAYI cagiriyor — yani ilk basarili guncellemede kendi kaydini siliyordu.
+# Kanit: sunucudaki guncelleme logu 2026-09-07 15:20'de duruyor ve bir daha hic
+# yazilmamis; crontab'da satir yoktu.
+#
+# Artik yalnizca KENDI isaretledigi satirlar ("# al-sat") temizleniyor.
 CRON_TMP="$(mktemp)"
-crontab -l 2>/dev/null | grep -v "al-sat" > "$CRON_TMP" || true
+crontab -l 2>/dev/null | grep -v "# al-sat" > "$CRON_TMP" || true
 echo "@reboot sleep 30 && ${PROJE}/paneli-baslat.sh   # al-sat" >> "$CRON_TMP"
 echo "*/5 * * * * ${PROJE}/paneli-baslat.sh           # al-sat nöbetçi" >> "$CRON_TMP"
+
+# Otomatik guncelleme satirini KORU; yoksa geri ekle (idempotent).
+GUNCELLE="${PROJE}/deploy/sunucu-otomatik-guncelle.sh"
+if [ -f "$GUNCELLE" ] && ! grep -q "sunucu-otomatik-guncelle" "$CRON_TMP"; then
+  echo "*/5 * * * * bash ${GUNCELLE} >/dev/null 2>&1" >> "$CRON_TMP"
+  echo "      otomatik guncelleme cron satiri geri eklendi"
+fi
+
 crontab "$CRON_TMP"
 rm -f "$CRON_TMP"
 echo "[4/5] Otomatik başlatma kuruldu (açılışta + 5 dakikalık nöbetçi)"
+if crontab -l 2>/dev/null | grep -q "sunucu-otomatik-guncelle"; then
+  echo "      otomatik güncelleme: AKTİF (5 dakikada bir)"
+else
+  echo "      otomatik güncelleme: KAPALI — betik yok: ${GUNCELLE}"
+fi
 
 # ---------- 5) Şimdi başlat ----------
 # GÜNCELLEME DURUMU: panel/bot zaten çalışıyorsa yeni kodu almaları için
