@@ -19,6 +19,7 @@ Kapsam (gerçek DB'ye DOKUNMAZ, geçici dosya kullanır):
   - Komut kuyruğu (panel → bot tek yazıcı akışı)
   - Komut SONUCU: her komut ok/red/bilgi izi bırakır (sessiz yutma yok)
   - Panel JS: gömülü script ayrışıyor mu, aradığı id'ler var mı
+  - Zaman: damgalar ofsetli gidiyor mu (kırpılırsa 3 saat sessizce kayar)
 
     python -m tests.kritik_testler
 """
@@ -477,6 +478,48 @@ def test_panel_js():
     ok("komut şeridinin kabı ve stili sayfada")
 
 
+def test_panel_saat():
+    """Zaman damgaları TAM ISO (ofsetli) gitmeli; biçimlemeyi tarayıcı yapar.
+
+    Panel "21:35 UTC" gösteriyordu, kullanıcı saatine bakıp 00:35 görüyordu ve
+    aradaki 3 saati kafadan ekliyordu. Sunucu saati DOĞRUYDU (ölçtüm: −2 sn),
+    sunum yanlıştı.
+
+    Kritik nokta: dizgi kırpılıp ofset düşerse (eskiden `entry_time[:16]`
+    yapılıyordu) `new Date("2026-09-06 04:00")` bunu YEREL saat sanar ve zaman
+    sessizce 3 saat kayar — hata vermeden, yanlış. Bu test onu engeller.
+    """
+    print("\nPANEL ZAMAN GÖSTERİMİ")
+    from src import panel
+    from tests.js_tarayici import _script_cikar
+
+    state, _, _, _ = kur()
+    poz(state)
+    piyasa = MagicMock()
+    piyasa.last_price.return_value = 112.0
+    with patch.object(panel, "state", state), \
+         patch.object(panel, "market", piyasa), \
+         patch.object(panel, "build_watchlist", lambda _: []):
+        d = panel.build_state()
+
+    an = datetime.fromisoformat(d["now"])
+    assert an.tzinfo is not None, "'now' ofsetsiz gidiyor — tarayıcı yerel sanar"
+    assert abs((datetime.now(timezone.utc) - an).total_seconds()) < 120
+    ok("'now' ofsetli ISO olarak gidiyor")
+
+    (p,) = d["positions"]
+    giris = datetime.fromisoformat(p["since"])
+    assert giris.tzinfo is not None, "'since' kırpılmış — 3 saatlik sessiz kayma riski"
+    ok("'since' TAM ISO (ofset korunmuş, kırpılmamış)")
+
+    # JS tarafı: sabit "UTC" etiketi ve zaman damgası kırpması kalmamalı.
+    js = _script_cikar(panel.PAGE)
+    assert " UTC</td>" not in js, "sabit UTC etiketi geri gelmiş"
+    assert "slice(11,16)" not in js, "zaman damgası yine kırpılıyor"
+    assert "toLocaleTimeString" in js and "_dt" in js
+    ok("JS sabit UTC etiketi kullanmıyor, yerel saate çeviriyor")
+
+
 def main() -> int:
     print("=" * 74)
     print("  KRİTİK TESTLER — geçici DB, gerçek pozisyona DOKUNULMAZ")
@@ -484,7 +527,8 @@ def main() -> int:
     testler = [test_geriye_uyumluluk, test_pozisyon_tavani, test_r_bildirimi,
                test_manuel_stop_ret, test_manuel_stop_sikma,
                test_manuel_stop_gevsetme, test_short, test_komut_kuyrugu,
-               test_komut_sonucu, test_panel_komut_seridi, test_panel_js]
+               test_komut_sonucu, test_panel_komut_seridi, test_panel_js,
+               test_panel_saat]
     for fn in testler:
         try:
             fn()

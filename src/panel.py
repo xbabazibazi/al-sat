@@ -206,7 +206,7 @@ def build_state() -> dict:
             "upnl": round(upnl, 2),
             "upnl_pct": round(upnl / p.margin * 100, 2) if p.margin else 0,
             "notional": round(pos_notional, 2),
-            "since": p.entry_time[:16].replace("T", " "),
+            "since": p.entry_time,              # TAM ISO — biçimlemeyi tarayıcı yapar
             "stop_kilit": p.stop_manual_ref,   # >0 = manuel gevşetme kilidi açık
             "r_simdi": r_simdi,                # None = eski pozisyon, risk_unit yok
             "r_hedef": r_hedef,                # bildirim eşiğine karşılık gelen fiyat
@@ -217,7 +217,7 @@ def build_state() -> dict:
     stats = state.trade_stats()
     win_rate = stats["wins"] / stats["count"] * 100 if stats["count"] else 0
     return {
-        "now": datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+        "now": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "bot_running": bot_alive(),
         "should_run": state.get_kv("bot_should_run") == "1",
         "max_daily_loss": CONFIG.max_daily_loss_pct * 100,
@@ -352,6 +352,21 @@ const money = v => (v<0?"−$":"$") + Math.abs(v).toLocaleString("tr-TR",{minimu
 const cls = v => v > 0 ? "up" : v < 0 ? "down" : "";
 const sign = v => (v>0?"+":"") + v.toLocaleString("tr-TR",{maximumFractionDigits:2});
 const kisa = v => (+v).toLocaleString("tr-TR",{maximumSignificantDigits:6});
+// ZAMAN. Sunucu her seyi UTC yazar; GOSTERIM tarayicinin saat diliminde yapilir.
+// Once panel "21:35 UTC" diyordu, kullanici saatine bakip 00:35 goruyordu ve
+// aradaki 3 saati kafadan ekliyordu. Sunucu saati dogruydu, sunum yanlisti.
+const _tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const _dt = s => {
+  if (!s) return null;
+  // Ofset yoksa UTC varsay; yoksa tarayici YEREL sanip 3 saat kaydirir.
+  const t = (/[Zz]|[+-]\\d{2}:?\\d{2}$/.test(s) ? s : s + "Z").replace(" ", "T");
+  const d = new Date(t);
+  return isNaN(d) ? null : d;
+};
+const saat = s => { const d = _dt(s); return d ? d.toLocaleTimeString("tr-TR",
+  {hour:"2-digit",minute:"2-digit"}) : "—"; };
+const gunSaat = s => { const d = _dt(s); return d ? d.toLocaleString("tr-TR",
+  {day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}) : "—"; };
 // Bot mesajları innerHTML'e giriyor; içlerinde ham kullanıcı girdisi (reddedilen
 // stop dizgisi) olabildiği için kaçırılır.
 const kacir = s => String(s ?? "").replace(/[&<>"]/g, c =>
@@ -375,7 +390,9 @@ async function refresh() {
   try { d = await (await fetch("/api/state")).json(); }
   catch { $("clock").textContent = "bağlantı koptu — yeniden denenecek"; return; }
 
-  $("clock").textContent = d.now;
+  { const d0 = _dt(d.now);
+    $("clock").textContent = d0 ? d0.toLocaleTimeString("tr-TR") : "—";
+    $("clock").title = `Sunucu UTC: ${(d.now||"").slice(11,19)} · gösterim: ${_tz}`; }
   $("pulse").className = "pulse" + (d.bot_running ? "" : " off");
   $("btnStart").disabled = d.bot_running;
   $("btnStop").disabled = !d.bot_running;
@@ -409,7 +426,7 @@ async function refresh() {
         <td class="${col}"><b>${a.decision}</b></td>
         <td class="${cls(a.score)}">${a.score>0?"+":""}${a.score}</td>
         <td style="text-align:left;color:var(--ink2);font-size:12px">${votes}</td>
-        <td style="color:var(--mut)">${(a.ts||"").slice(11,16)} UTC</td></tr>`;
+        <td style="color:var(--mut)">${saat(a.ts)}</td></tr>`;
     }).join("") + "</table>"
     : `<div class="empty">İlk mum kapanışı bekleniyor — analiz her 4 saatte bir yenilenir</div>`;
 
@@ -432,7 +449,7 @@ async function refresh() {
     "<th title='Stop şu an tetiklenirse bankaya girecek gerçek tutar'>Stop olursa</th>" +
     "<th>Marjin</th><th>Funding</th><th>Anlık PnL</th><th>%</th><th>Manuel</th></tr>" +
     d.positions.map(p => `<tr>
-      <td><b>${p.symbol}</b> <span style="color:var(--mut);font-size:11px">${p.since}</span></td>
+      <td><b>${p.symbol}</b> <span style="color:var(--mut);font-size:11px">${gunSaat(p.since)}</span></td>
       <td><span class="side ${p.side[0]}">${p.side}</span></td>
       <td>$${p.entry.toLocaleString("tr-TR")}</td>
       <td>$${p.price.toLocaleString("tr-TR")}</td>
@@ -501,7 +518,7 @@ async function refresh() {
       <td>$${(+e.price).toLocaleString("tr-TR")}</td>
       <td class="${cls(e.upnl_usdt)}"><b>${money(e.upnl_usdt)}</b></td>
       <td class="${cls(e.locked_usdt)}">${money(e.locked_usdt)}</td>
-      <td style="color:var(--mut)">${(e.ts||"").slice(0,16).replace("T"," ")}</td></tr>`).join("") + "</table>"
+      <td style="color:var(--mut)">${gunSaat(e.ts)}</td></tr>`).join("") + "</table>"
     : `<div class="empty">Henüz ${d.r_level}R kârına ulaşan pozisyon olmadı</div>`;
 
   $("trades").innerHTML = d.trades.length ? "<table><tr>" +
@@ -513,7 +530,7 @@ async function refresh() {
       <td class="${cls(t.pnl_usdt)}"><b>${money(t.pnl_usdt)}</b></td>
       <td class="${cls(t.pnl_usdt)}">${sign(t.pnl_pct)}%</td>
       <td style="color:var(--ink2)">${t.exit_reason}</td>
-      <td style="color:var(--mut)">${(t.exit_time||"").slice(0,16).replace("T"," ")}</td></tr>`).join("") + "</table>"
+      <td style="color:var(--mut)">${gunSaat(t.exit_time)}</td></tr>`).join("") + "</table>"
     : `<div class="empty">Henüz kapanan işlem yok</div>`;
 }
 async function stopDegistir(sembol, yon, stop, fiyat, giris, qty) {
