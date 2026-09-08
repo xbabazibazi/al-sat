@@ -18,6 +18,7 @@ Kapsam (gerçek DB'ye DOKUNMAZ, geçici dosya kullanır):
   - SHORT tarafı
   - Komut kuyruğu (panel → bot tek yazıcı akışı)
   - Komut SONUCU: her komut ok/red/bilgi izi bırakır (sessiz yutma yok)
+  - Panel JS: gömülü script ayrışıyor mu, aradığı id'ler var mı
 
     python -m tests.kritik_testler
 """
@@ -434,6 +435,48 @@ def test_panel_komut_seridi():
         ok("bozuk zaman damgası → satır atlanıyor, panel çökmüyor")
 
 
+def test_panel_js():
+    """Panelin gömülü JS'i AYRIŞMALI ve baktığı her id HTML'de OLMALI.
+
+    2026-09-08: `alert("...` içindeki \\n gerçek satır sonuna dönüştü. JS'te
+    çift tırnaklı dizgi satır atlayamaz; tek sözdizimi hatası TÜM script'i
+    öldürdü. Panel açıldı, başlıklar göründü, hiçbir tablo dolmadı — dışarıdan
+    "panel kapalı" gibi. 30 testin hepsi geçmişti çünkü hiçbiri JS'e bakmıyordu
+    ve otomatik dağıtım bozuk sürümü canlıya taşıdı. Bu test o boşluğu kapatır.
+    """
+    print("\nPANEL JS (dağıtım kapısının kör noktasıydı)")
+    import re
+
+    from src.panel import PAGE
+    from tests.js_tarayici import _script_cikar, dogrula, ham_satir_sonu_ara
+
+    hatalar = dogrula(PAGE)
+    assert not hatalar, "panel JS ayrıştırılamıyor:\n" + "\n".join(hatalar)
+    ok("gömülü JS sözdizimi geçerli")
+
+    # Yedek tarayıcı, node'suz sunucuda tek savunma — o da temiz demeli.
+    assert not ham_satir_sonu_ara(_script_cikar(PAGE)), "yedek tarayıcı yanlış alarm verdi"
+    ok("node'suz yedek tarayıcı da temiz (yanlış alarm yok)")
+
+    # REGRESYON: bugünkü hatanın aynısını geri koy, yakalanmalı.
+    bozuk = PAGE.replace("alert(`Komut", 'alert("Komut').replace("dakika.`);", 'dakika.");')
+    assert bozuk != PAGE, "regresyon örneği kurulamadı (metin değişmiş)"
+    assert ham_satir_sonu_ara(_script_cikar(bozuk)), "tarayıcı bugünkü hatayı KAÇIRDI"
+    ok("aynı hata geri konsa yakalanıyor [regresyon]")
+
+    # Runtime tarafı: $("x") ile aranan her id sayfada tanımlı olmalı.
+    js = _script_cikar(PAGE)
+    istenen = set(re.findall(r'\$\("([^"]+)"\)', js))
+    tanimli = set(re.findall(r'id="([^"]+)"', PAGE))
+    eksik = istenen - tanimli
+    assert not eksik, f"JS'in aradığı id HTML'de yok: {sorted(eksik)}"
+    ok(f"JS'in baktığı {len(istenen)} id'nin hepsi HTML'de tanımlı")
+
+    # Şeridin kabı gerçekten var mı (yeni özellik boşa düşmesin).
+    assert 'id="komutlar"' in PAGE and "cmdrow" in PAGE
+    ok("komut şeridinin kabı ve stili sayfada")
+
+
 def main() -> int:
     print("=" * 74)
     print("  KRİTİK TESTLER — geçici DB, gerçek pozisyona DOKUNULMAZ")
@@ -441,7 +484,7 @@ def main() -> int:
     testler = [test_geriye_uyumluluk, test_pozisyon_tavani, test_r_bildirimi,
                test_manuel_stop_ret, test_manuel_stop_sikma,
                test_manuel_stop_gevsetme, test_short, test_komut_kuyrugu,
-               test_komut_sonucu, test_panel_komut_seridi]
+               test_komut_sonucu, test_panel_komut_seridi, test_panel_js]
     for fn in testler:
         try:
             fn()

@@ -547,9 +547,9 @@ async function stopDegistir(sembol, yon, stop, fiyat, giris, qty) {
   if (!confirm(soru)) return;
   try {
     await fetch(`/api/manual/stop/${sembol}/${yeni}`, { method: "POST" });
-    alert("Komut kuyruğa alındı.
+    alert(`Komut kuyruğa alındı.
 
-Sonucu tahmin etmene gerek yok: pozisyon tablosunun üstündeki şeritte ⏳ bekliyor olarak görünür, bot uygulayınca ✅ ya da ⛔ (sebebiyle) olur. Tur süresi ~1 dakika.");
+Sonucu tahmin etmene gerek yok: pozisyon tablosunun üstündeki şeritte ⏳ bekliyor olarak görünür, bot uygulayınca ✅ ya da ⛔ (sebebiyle) olur. Tur süresi ~1 dakika.`);
   } catch { alert("Komut gönderilemedi."); }
   setTimeout(refresh, 2000);
 }
@@ -570,9 +570,9 @@ async function manuel(eylem, sembol, pnl) {
   if (!confirm(soru)) return;
   try {
     await fetch(`/api/manual/${eylem}/${sembol}`, { method: "POST" });
-    alert("Komut kuyruğa alındı.
+    alert(`Komut kuyruğa alındı.
 
-Sonucu tahmin etmene gerek yok: pozisyon tablosunun üstündeki şeritte ⏳ bekliyor olarak görünür, bot uygulayınca ✅ ya da ⛔ (sebebiyle) olur. Tur süresi ~1 dakika.");
+Sonucu tahmin etmene gerek yok: pozisyon tablosunun üstündeki şeritte ⏳ bekliyor olarak görünür, bot uygulayınca ✅ ya da ⛔ (sebebiyle) olur. Tur süresi ~1 dakika.`);
   } catch { alert("Komut gönderilemedi."); }
   setTimeout(refresh, 2000);
 }
