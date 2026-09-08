@@ -89,6 +89,12 @@ class Config:
     # Sunucuda çalışırken 0.0.0.0 gerekir (container dışından erişim için).
     # Yayınlanan portu MUTLAKA Tailscale IP'sine bağlayın — bkz. docker-compose.
     panel_host: str = _env("PANEL_HOST", "127.0.0.1")
+    # Panelden güncelleme tetikleme ucu (/api/guncelle). Panel yalnızca Tailscale
+    # arayüzünde dinlediği için ağ dışına kapalı, tetik de SABİT bir betiği
+    # çalıştırır (parametre almaz). Yine de ağdaki herkese "dağıtımı başlat"
+    # yetkisi verir; kapatmak için .env'e DEPLOY_ENDPOINT=false yaz.
+    # Teşhis ucu (/api/deploy-durum) salt-okunurdur, bu bayrakla kapanmaz.
+    deploy_endpoint: bool = _env("DEPLOY_ENDPOINT", "true").lower() == "true"
     symbols: tuple[str, ...] = tuple(
         s.strip().upper() for s in _env("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if s.strip()
     )

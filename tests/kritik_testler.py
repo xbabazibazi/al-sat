@@ -20,6 +20,7 @@ Kapsam (gerçek DB'ye DOKUNMAZ, geçici dosya kullanır):
   - Komut SONUCU: her komut ok/red/bilgi izi bırakır (sessiz yutma yok)
   - Panel JS: gömülü script ayrışıyor mu, aradığı id'ler var mı
   - Zaman: damgalar ofsetli gidiyor mu (kırpılırsa 3 saat sessizce kayar)
+  - Dağıtım teşhisi: /api/deploy-durum çökmeden durum veriyor mu
 
     python -m tests.kritik_testler
 """
@@ -520,6 +521,60 @@ def test_panel_saat():
     ok("JS sabit UTC etiketi kullanmıyor, yerel saate çeviriyor")
 
 
+def test_deploy_teshis():
+    """Dağıtım teşhis ucu: çökmeden durum döndürmeli, tetik korunmalı.
+
+    Otomatik güncelleme 2026-09-09'da sessizce çalışmadı ve sebebi bulunamadı,
+    çünkü sunucudaki log yalnızca ssh ile okunabiliyordu — teşhis edilemeyen
+    güvenlik kapısı, kapı değil kör noktadır. Bu uç log'u HTTP'ye açar.
+
+    Teşhis fonksiyonu ASLA patlamamalı: patlarsa arıza anında (tam da lazım
+    olduğu anda) elimizde hiçbir şey kalmaz.
+    """
+    print("\nDAĞITIM TEŞHİSİ")
+    from src import panel
+
+    d = panel.deploy_durum()
+    for alan in ("yerel_surum", "uzak_dal", "crontab", "betik_var",
+                 "panel_erisilemedi_damgasi", "su_an_calisiyor", "log"):
+        assert alan in d, f"teşhis alanı eksik: {alan}"
+    ok("deploy_durum() beklenen alanların hepsini döndürdü")
+
+    # Alt komutlar patlasa bile teşhis ayakta kalmalı.
+    with patch.object(panel.subprocess, "run", side_effect=OSError("git yok")):
+        d2 = panel.deploy_durum()
+    assert d2["yerel_surum"]["kod"] == -1 and "git yok" in d2["yerel_surum"]["cikti"]
+    ok("alt komut patlasa da teşhis çökmüyor, hatayı raporluyor")
+
+    # Log okunamasa bile çökmemeli.
+    with patch.object(panel, "GUNCELLE_LOG", Path("/olmayan/dizin/x.log")):
+        assert isinstance(panel.deploy_durum()["log"], list)
+    ok("log dosyası yoksa boş liste (çökme yok)")
+
+    # Tetik: betik yoksa reddetmeli, iş parçacığı BAŞLATMAMALI.
+    with patch.object(panel, "GUNCELLE_BETIK", Path("/olmayan/betik.sh")), \
+         patch.object(panel.threading, "Thread") as sahte:
+        r = panel.guncellemeyi_tetikle()
+    assert r["ok"] is False and not sahte.called
+    ok("betik yoksa tetik reddediliyor (boşuna süreç doğmuyor)")
+
+    # Zaten sürüyorsa ikinci tetik reddedilmeli (eşzamanlı iki dağıtım olmaz).
+    panel._guncelle_calisiyor.set()
+    try:
+        with patch.object(panel.threading, "Thread") as sahte:
+            r = panel.guncellemeyi_tetikle()
+        assert r["ok"] is False and "sürüyor" in r["hata"] and not sahte.called
+    finally:
+        panel._guncelle_calisiyor.clear()
+    ok("güncelleme sürerken ikinci tetik reddediliyor")
+
+    # Tetik SABİT betiği çağırmalı — dışarıdan parametre almadığını sabitler.
+    with patch.object(panel.threading, "Thread") as sahte:
+        r = panel.guncellemeyi_tetikle()
+    assert r["ok"] is True and sahte.called
+    ok("geçerli durumda tetik arka planda başlatılıyor")
+
+
 def main() -> int:
     print("=" * 74)
     print("  KRİTİK TESTLER — geçici DB, gerçek pozisyona DOKUNULMAZ")
@@ -528,7 +583,7 @@ def main() -> int:
                test_manuel_stop_ret, test_manuel_stop_sikma,
                test_manuel_stop_gevsetme, test_short, test_komut_kuyrugu,
                test_komut_sonucu, test_panel_komut_seridi, test_panel_js,
-               test_panel_saat]
+               test_panel_saat, test_deploy_teshis]
     for fn in testler:
         try:
             fn()

@@ -112,6 +112,81 @@ def watchdog() -> None:
             log.error("Watchdog hatası: %s", e)
 
 
+# ------------------------------------------------------- dağıtım teşhisi/tetiği
+# NEDEN VAR: otomatik güncelleme 2026-09-09'da sessizce çalışmadı ve sebebi
+# bulunamadı, çünkü sunucudaki `logs/otomatik-guncelle.log` yalnızca ssh ile
+# okunabiliyordu. Teşhis edilemeyen bir güvenlik kapısı, kapı değil kör noktadır:
+# bu oturumda üç kez "herhalde cron çekmiştir" denip yanlış çıkıldı.
+# Bu uçlar log'u ve cron durumunu HTTP üzerinden görünür kılar.
+#
+# GÜVENLİK: panel yalnızca Tailscale arayüzünde dinler (kur-sunucu.sh PANEL_HOST'u
+# oraya sabitler), yani açık internete kapalıdır. Tetik SABİT bir betiği çalıştırır,
+# dışarıdan parametre almaz — komut enjeksiyonu yüzeyi yok. Yine de bu, ağdaki
+# herkese "güncellemeyi başlat" yetkisi verir; istemezsen .env'e
+# DEPLOY_ENDPOINT=false yazıp kapatabilirsin.
+GUNCELLE_BETIK = PROJECT_ROOT / "deploy" / "sunucu-otomatik-guncelle.sh"
+GUNCELLE_LOG = PROJECT_ROOT / "logs" / "otomatik-guncelle.log"
+_guncelle_calisiyor = threading.Event()
+
+
+def _kabuk(*args: str, sure: int = 20) -> dict:
+    """Kısa bir komut çalıştırır; çökmez, her zaman sözlük döner."""
+    try:
+        r = subprocess.run(list(args), cwd=str(PROJECT_ROOT), capture_output=True,
+                           text=True, timeout=sure)
+        return {"kod": r.returncode, "cikti": (r.stdout + r.stderr).strip()[-3000:]}
+    except Exception as e:  # noqa: BLE001 — teşhis aracı, asla patlamamalı
+        return {"kod": -1, "cikti": f"{type(e).__name__}: {e}"}
+
+
+def deploy_durum() -> dict:
+    satirlar: list[str] = []
+    try:
+        if GUNCELLE_LOG.exists():
+            satirlar = GUNCELLE_LOG.read_text(
+                encoding="utf-8", errors="replace").splitlines()[-80:]
+    except Exception as e:  # noqa: BLE001
+        satirlar = [f"log okunamadı: {e}"]
+    return {
+        "yerel_surum": _kabuk("git", "rev-parse", "--short", "HEAD"),
+        "uzak_dal": _kabuk("git", "ls-remote", "--heads", "origin", "main", sure=45),
+        "crontab": _kabuk("crontab", "-l"),
+        "betik_var": GUNCELLE_BETIK.exists(),
+        # Bu damga varsa betik ÇALIŞTI ama paneli okuyamadığı için erteledi.
+        "panel_erisilemedi_damgasi": (PROJECT_ROOT / "logs" / ".panel-erisilemedi").exists(),
+        "su_an_calisiyor": _guncelle_calisiyor.is_set(),
+        "log_satir_sayisi": len(satirlar),
+        "log": satirlar,
+    }
+
+
+def guncellemeyi_tetikle() -> dict:
+    """Güncelleme betiğini ARKA PLANDA başlatır; sonucu log'dan izlenir.
+
+    Eşzamanlı değil: betik testleri çalıştırıp botu yeniden başlatıyor, bu
+    30-60 saniye sürüyor. İstemciyi o kadar bekletmek yerine hemen dönüyoruz;
+    ilerleme /api/deploy-durum'daki log'dan okunur.
+    """
+    if not GUNCELLE_BETIK.exists():
+        return {"ok": False, "hata": f"betik yok: {GUNCELLE_BETIK}"}
+    if _guncelle_calisiyor.is_set():
+        return {"ok": False, "hata": "güncelleme zaten sürüyor"}
+
+    def calistir() -> None:
+        _guncelle_calisiyor.set()
+        try:
+            subprocess.run(["bash", str(GUNCELLE_BETIK)], cwd=str(PROJECT_ROOT),
+                           capture_output=True, text=True, timeout=600)
+        except Exception as e:  # noqa: BLE001
+            log.error("Güncelleme tetiklenemedi: %s", e)
+        finally:
+            _guncelle_calisiyor.clear()
+
+    threading.Thread(target=calistir, daemon=True).start()
+    log.info("Güncelleme elle tetiklendi (panel)")
+    return {"ok": True, "not": "başlatıldı — ilerleme için /api/deploy-durum"}
+
+
 def build_watchlist(open_symbols: set[str]) -> list[dict]:
     out = []
     for sym in CONFIG.symbols:
@@ -614,6 +689,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 log.error("state hatası: %s", e)
                 self._send(500, "application/json", b'{"error":"state"}')
+        elif self.path == "/api/deploy-durum":
+            # Teşhis ucu: cron kurulu mu, betik çalışmış mı, neden ertelemiş.
+            try:
+                body = json.dumps(deploy_durum(), ensure_ascii=False).encode("utf-8")
+                self._send(200, "application/json", body)
+            except Exception as e:  # noqa: BLE001
+                log.error("deploy-durum hatası: %s", e)
+                self._send(500, "application/json", b'{"error":"deploy-durum"}')
         elif self.path == "/":
             self._send(200, "text/html; charset=utf-8", PAGE.encode("utf-8"))
         else:
@@ -649,6 +732,15 @@ class Handler(BaseHTTPRequestHandler):
                                json.dumps({"ok": True, "queued": f"STOP:{fiyat}"}).encode())
                     return
             self._send(400, "application/json", b'{"ok":false}')
+            return
+
+        if self.path == "/api/guncelle":
+            if not CONFIG.deploy_endpoint:
+                self._send(403, "application/json",
+                           b'{"ok":false,"hata":"DEPLOY_ENDPOINT=false"}')
+                return
+            self._send(200, "application/json",
+                       json.dumps(guncellemeyi_tetikle(), ensure_ascii=False).encode())
             return
 
         if self.path == "/api/start":
