@@ -42,7 +42,31 @@ if (-not $PushAtlama) {
     Baslik "[1/6] Kod GitHub'a gonderiliyor..."
     Set-Location $proje
     git push origin main 2>&1 | ForEach-Object { Bilgi $_ }
-    if ($LASTEXITCODE -eq 0) { Ok "push tamam" } else { Bilgi "push atlandi (zaten guncel olabilir)" }
+    $pushKod = $LASTEXITCODE
+    # Sunucu dosyalari BU PC'den almiyor, GitHub'dan CEKIYOR. Yani push
+    # basarisizsa dagitilan sey ESKI koddur. Eski surum bunu yutuyordu:
+    # "push atlandi (zaten guncel olabilir)" deyip devam ediyor, kullanici
+    # dagitimin gittigini saniyordu. 2026-09-09'da tam bu yuzden d002bef
+    # sunucuya gitmedi ve saatlerce yanlis yerde arandi.
+    # Dogrulama: yereldeki HEAD gercekten uzakta mi?
+    $yerel = (git rev-parse HEAD).Trim()
+    $uzak  = ((git ls-remote origin refs/heads/main) -split "\s+")[0]
+    if ($yerel -ne $uzak) {
+        Hata "PUSH GITMEDI - dagitim durduruldu."
+        Bilgi "yerel HEAD : $yerel"
+        Bilgi "GitHub main: $uzak"
+        if ($pushKod -ne 0) { Bilgi "git push cikis kodu: $pushKod" }
+        Bilgi ""
+        Bilgi "En sik sebep: remote.origin.pushurl'de birden fazla adres var"
+        Bilgi "(orn. ulasilamayan bir gitea). Push hepsine gider, biri patlarsa"
+        Bilgi "komut hata doner. Kontrol ve temizlik:"
+        Bilgi "    git config --get-all remote.origin.pushurl"
+        Bilgi "    git config --unset-all remote.origin.pushurl"
+        Bilgi ""
+        Bilgi "Eski kodu dagitmamak icin cikiliyor. Duzeltip tekrar calistir."
+        exit 1
+    }
+    Ok "push tamam - GitHub main = $($yerel.Substring(0,7))"
 } else {
     Baslik "[1/6] Push atlandi (-PushAtlama)"
 }
