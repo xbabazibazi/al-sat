@@ -173,6 +173,13 @@ def deploy_durum() -> dict:
         "uzak_dal": _kabuk("git", "ls-remote", "--heads", "origin", "main", sure=45),
         "crontab": _kabuk("crontab", "-l"),
         "son_cron_kosusu": _son_cron_kosusu(),
+        # Kilit tutulu mu? Guncelleme betigi `flock -n 9 || exit 0` ile cikar;
+        # kilit sizarsa (bkz. 9>&- notu) her tur SESSIZCE olur. Kilidi tutan
+        # sizmis bir tanitici olabilir: flock acik dosya TANIMINA baglidir ve
+        # `nohup ... &` ile dogan panel/bot onu miras alabilir.
+        "kilit_serbest": _kabuk(
+            "flock", "-n", str(PROJECT_ROOT / "logs" / ".guncelle.lock"),
+            "-c", "true"),
         "betik_var": GUNCELLE_BETIK.exists(),
         # Bu damga varsa betik ÇALIŞTI ama paneli okuyamadığı için erteledi.
         "panel_erisilemedi_damgasi": (PROJECT_ROOT / "logs" / ".panel-erisilemedi").exists(),

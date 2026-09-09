@@ -536,7 +536,7 @@ def test_deploy_teshis():
 
     d = panel.deploy_durum()
     for alan in ("yerel_surum", "uzak_dal", "crontab", "betik_var",
-                 "son_cron_kosusu",
+                 "son_cron_kosusu", "kilit_serbest",
                  "panel_erisilemedi_damgasi", "su_an_calisiyor", "log"):
         assert alan in d, f"teşhis alanı eksik: {alan}"
     ok("deploy_durum() beklenen alanların hepsini döndürdü")
