@@ -151,6 +151,23 @@ class Config:
     poll_seconds: int = 30             # ana döngü periyodu (stop takibi + mum kontrolü)
     daily_report_hour: int = int(_env("DAILY_REPORT_HOUR", "21"))
 
+    # ---- BORSA kanalı (ABD + BIST, SANAL cüzdanla paper) ----
+    # Kripto botundan tamamen ayrı: ayrı DB, ayrı cüzdanlar (USD + TRY), ayrı
+    # iş parçacığı. Günlük mum + haftalık teyit; BIST long-only (borsa_trader.py).
+    # Kapatmak için .env'e BORSA_ENABLED=false yaz.
+    borsa_enabled: bool = _env("BORSA_ENABLED", "true").lower() == "true"
+    borsa_symbols: tuple[str, ...] = tuple(
+        s.strip().upper() for s in _env(
+            "BORSA_SYMBOLS",
+            "SPY,QQQ,NVDA,AAPL,MSFT,AMZN,META,GOOGL,TSLA,AMD,"
+            "XU100.IS,THYAO.IS,ASELS.IS,GARAN.IS,AKBNK.IS,EREGL.IS,TUPRS.IS,"
+            "SISE.IS,KCHOL.IS,BIMAS.IS").split(",") if s.strip()
+    )
+    borsa_poll_seconds: int = int(_env("BORSA_POLL_SECONDS", "300"))  # veri 15dk gecikmeli; sık sormak anlamsız
+    borsa_risk_pct: float = float(_env("BORSA_RISK_PCT", "0.01"))     # işlem başına cüzdanın %1'i
+    borsa_max_positions: int = int(_env("BORSA_MAX_POSITIONS", "3"))  # cüzdan başına eşzamanlı tavan
+    borsa_db_path: Path = DATA_DIR / "borsa_state.db"
+
     # Dosyalar
     db_path: Path = DATA_DIR / "bot_state.db"
     log_path: Path = DATA_DIR / "bot.log"

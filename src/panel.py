@@ -28,6 +28,9 @@ from .strategy import compute_indicators
 log = logging.getLogger("panel")
 market = MarketData()
 state = StateStore(CONFIG.db_path)
+# BORSA kanalının ayrı DB'si. Panel yalnızca OKUR + komut kuyruğuna yazar;
+# pozisyonlara tek yazıcı borsa iş parçacığıdır (kripto ile aynı ilke).
+borsa_state = StateStore(CONFIG.borsa_db_path)
 
 _trigger_cache: dict[str, tuple[float, float, float]] = {}  # symbol -> (ts, long_trig, short_trig)
 TRIGGER_TTL = 300  # mum 4 saatte bir değişir; 5 dakikada bir yenilemek fazlasıyla yeterli
@@ -346,6 +349,96 @@ def build_state() -> dict:
     }
 
 
+def build_borsa_state() -> dict:
+    """BORSA sekmesinin verisi — kriptonun build_state'inin sade aynası.
+
+    Fiyatlar yfinance'ten DEĞİL, botun kv'ye bıraktığı son değerden okunur
+    (bfiyat_<SEMBOL> = "fiyat|zaman"). Panel ağ beklemez; fiyat bayatsa
+    yaşı gösterilir, uydurulmaz.
+    """
+    from .borsa_trader import BASLANGIC   # yfinance'e dokunmayan sabitler
+
+    def fiyat(sym: str) -> tuple[float | None, str]:
+        ham = borsa_state.get_kv(f"bfiyat_{sym}", "")
+        if "|" not in ham:
+            return None, ""
+        f, _, ts = ham.partition("|")
+        try:
+            return float(f), ts
+        except ValueError:
+            return None, ""
+
+    simdi = datetime.now(timezone.utc)
+    positions = []
+    kilitli = {"USD": 0.0, "TRY": 0.0}     # açık pozisyonlardaki tutar + kâr
+    for p in borsa_state.all_positions():
+        cur = "TRY" if p.symbol.endswith(".IS") else "USD"
+        price, price_ts = fiyat(p.symbol)
+        if price is None:
+            price = p.entry_price          # fiyat yoksa giriş göster, kâr 0 say
+        upnl = (p.qty * (price - p.entry_price) if p.side == "LONG"
+                else p.qty * (p.entry_price - price))
+        kilitli[cur] += p.margin + upnl
+        positions.append({
+            "symbol": p.symbol, "cur": cur, "side": p.side, "qty": p.qty,
+            "entry": p.entry_price, "price": price, "stop": p.trailing_stop,
+            "upnl": round(upnl, 2),
+            "upnl_pct": round(upnl / p.margin * 100, 2) if p.margin else 0,
+            "notional": round(p.margin, 2),
+            "since": p.entry_time, "fiyat_zamani": price_ts,
+        })
+
+    cuzdanlar = []
+    for cur in ("USD", "TRY"):
+        nakit = float(borsa_state.get_kv(f"borsa_{cur}", str(BASLANGIC[cur])))
+        varlik = nakit + kilitli[cur]
+        cuzdanlar.append({
+            "cur": cur, "nakit": round(nakit, 2), "varlik": round(varlik, 2),
+            "baslangic": BASLANGIC[cur],
+            "pnl_pct": round((varlik / BASLANGIC[cur] - 1) * 100, 2),
+        })
+
+    komutlar = []
+    for sym in CONFIG.borsa_symbols:
+        if borsa_state.get_kv(f"bcmd_{sym}", ""):
+            komutlar.append({"symbol": sym, "durum": "bekliyor",
+                             "mesaj": "KAPAT gönderildi — borsa döngüsü uygulayacak (~5 dk)"})
+            continue
+        ham = borsa_state.get_kv(f"bcmdres_{sym}", "")
+        if not ham:
+            continue
+        durum, _, kalan = ham.partition("|")
+        ts, _, mesaj = kalan.partition("|")
+        try:
+            yas = (simdi - datetime.fromisoformat(ts)).total_seconds()
+        except ValueError:
+            continue
+        # Döngü 5 dk olduğu için sonuç kriptodakinden uzun asılı kalır (TTL 15 dk).
+        if 0 <= yas <= 900:
+            komutlar.append({"symbol": sym, "durum": durum, "mesaj": mesaj, "yas": int(yas)})
+
+    hb = borsa_state.get_kv("borsa_heartbeat")
+    canli = False
+    if hb:
+        try:
+            canli = (simdi - datetime.fromisoformat(hb)).total_seconds() \
+                    < CONFIG.borsa_poll_seconds * 2 + 60
+        except ValueError:
+            pass
+
+    return {
+        "enabled": CONFIG.borsa_enabled,
+        "canli": canli,
+        "now": simdi.isoformat(timespec="seconds"),
+        "cuzdanlar": cuzdanlar,
+        "positions": positions,
+        "komutlar": komutlar,
+        "assessments": borsa_state.latest_assessments(),
+        "trades": borsa_state.recent_trades(20),
+        "symbols": list(CONFIG.borsa_symbols),
+    }
+
+
 PAGE = """<!doctype html>
 <html lang="tr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -429,6 +522,13 @@ PAGE = """<!doctype html>
      Koyu yazıyla iki temada da 8:1 üzeri. Renk KAPAT'ın kırmızısından ayrışsın
      diye seçildi; ikisi yan yana duruyor ve yanlış tıklanmamalı. */
   button.mini.stop  { background:var(--amber-btn); color:#15181d; }
+  /* Sekmeler: KRİPTO / BORSA. Genel button kuralı (color:#fff) sekmede geçersiz —
+     pasif sekme kart zemininde beyaz yazı okunmazdı; .tab kuralı sınıf olduğu
+     için elementi ezer. */
+  .tabs { display:flex; gap:6px; margin-bottom:14px; }
+  .tab { background:var(--card2); color:var(--ink2); border:1px solid var(--line);
+    padding:8px 22px; border-radius:8px; font-weight:700; letter-spacing:.03em; }
+  .tab.aktif { background:var(--accent); color:#fff; border-color:var(--accent); }
 </style></head><body>
 <div class="top">
   <h1><span class="pulse" id="pulse"></span>AL-SAT Paneli</h1>
@@ -443,6 +543,11 @@ PAGE = """<!doctype html>
   <span class="state" id="botstate"></span>
   <span class="note" id="dailynote"></span>
 </div>
+<div class="tabs">
+  <button class="tab aktif" id="tabKripto" onclick="sekme('kripto')">KRİPTO</button>
+  <button class="tab" id="tabBorsa" onclick="sekme('borsa')">BORSA <span style="font-weight:400">ABD+BIST</span></button>
+</div>
+<div id="sayfaKripto">
 <div class="grid" id="stats"></div>
 <div class="card"><h2>Ön Değerlendirme — her mum kapanışında 5 araçlı analiz (incelemesiz giriş yok)</h2><div id="assess"></div></div>
 <div class="card"><h2>Açık Pozisyonlar — anlık kâr/zarar</h2><div id="komutlar"></div><div id="positions"></div></div>
@@ -450,6 +555,13 @@ PAGE = """<!doctype html>
 <div class="card"><h2>Varlık Eğrisi</h2><div id="chart"><div class="empty">Veri birikiyor…</div></div></div>
 <div class="card"><h2>Kâr Kilometre Taşları <span id="rbaslik" style="font-weight:400;color:var(--mut);font-size:13px"></span></h2><div id="revents"></div></div>
 <div class="card"><h2>Son İşlemler</h2><div id="trades"></div></div>
+</div>
+<div id="sayfaBorsa" style="display:none">
+<div class="grid" id="bStats"></div>
+<div class="card"><h2>Açık Pozisyonlar — hisse (sanal cüzdan)</h2><div id="bKomutlar"></div><div id="bPositions"></div></div>
+<div class="card"><h2>Ön Değerlendirme — günlük mum + haftalık teyit</h2><div id="bAssess"></div></div>
+<div class="card"><h2>Son İşlemler — hisse</h2><div id="bTrades"></div></div>
+</div>
 <script>
 const $ = id => document.getElementById(id);
 const money = v => (v<0?"−$":"$") + Math.abs(v).toLocaleString("tr-TR",{minimumFractionDigits:2,maximumFractionDigits:2});
@@ -704,8 +816,108 @@ async function ctrl(action) {
   try { await fetch("/api/" + action, { method: "POST" }); } catch {}
   setTimeout(refresh, 1500);
 }
+
+// ---------------------------------------------------------------- BORSA sekmesi
+function sekme(ad) {
+  const borsa = ad === "borsa";
+  $("sayfaKripto").style.display = borsa ? "none" : "";
+  $("sayfaBorsa").style.display = borsa ? "" : "none";
+  $("tabKripto").className = "tab" + (borsa ? "" : " aktif");
+  $("tabBorsa").className = "tab" + (borsa ? " aktif" : "");
+  if (borsa) refreshBorsa();
+}
+// Para birimi sembole gore: ".IS" = BIST (TL), digeri ABD ($).
+const bPara = (v, cur) => (v<0 ? "−" : "") + (cur === "TRY" ? "₺" : "$") +
+  Math.abs(v).toLocaleString("tr-TR",{minimumFractionDigits:2,maximumFractionDigits:2});
+
+async function refreshBorsa() {
+  let d;
+  try { d = await (await fetch("/api/borsa")).json(); }
+  catch { return; }
+  if (d.error) return;
+
+  $("bStats").innerHTML = d.cuzdanlar.map(c =>
+    `<div class="stat"><div class="l">${c.cur} Cüzdanı (sanal)</div>
+     <div class="v ${cls(c.varlik - c.baslangic)}">${bPara(c.varlik, c.cur)}</div>
+     <div class="s">${sign(c.pnl_pct)}% · nakit ${bPara(c.nakit, c.cur)}</div></div>`
+  ).join("") +
+  `<div class="stat"><div class="l">Borsa Döngüsü</div>
+   <div class="v" style="font-size:15px;color:${d.canli ? "var(--up)" : "var(--down)"}">${d.canli ? "ÇALIŞIYOR" : "BEKLEMEDE"}</div>
+   <div class="s">${d.symbols.length} sembol · günlük mum · 5 dk tur</div></div>`;
+
+  $("bKomutlar").innerHTML = (d.komutlar || []).map(k => {
+    const s = k.durum === "bekliyor" ? ["⏳", "var(--amber)"]
+            : k.durum === "ok"       ? ["✅", "var(--up)"]
+            : k.durum === "red"      ? ["⛔", "var(--down)"]
+            :                          ["ℹ️", "var(--mut)"];
+    const yas = k.durum === "bekliyor" ? "" : `<span class="yas">${k.yas} sn önce</span>`;
+    return `<div class="cmdrow" style="border-left-color:${s[1]}">
+      <span>${s[0]}</span><b>${kacir(k.symbol)}</b>
+      <span class="msg">${kacir(k.mesaj)}</span>${yas}</div>`;
+  }).join("");
+
+  $("bPositions").innerHTML = d.positions.length ? "<table><tr>" +
+    "<th>Sembol</th><th>Yön</th><th>Adet</th><th>Giriş</th><th>Anlık</th>" +
+    "<th>Stop</th><th>Tutar</th><th>Anlık PnL</th><th>%</th><th>Manuel</th></tr>" +
+    d.positions.map(p => `<tr>
+      <td><b>${p.symbol}</b> <span style="color:var(--mut);font-size:11px">${gunSaat(p.since)}</span></td>
+      <td><span class="side ${p.side[0]}">${p.side}</span></td>
+      <td>${p.qty}</td>
+      <td>${bPara(p.entry, p.cur)}</td>
+      <td>${bPara(p.price, p.cur)} <span style="color:var(--mut);font-size:10px" title="Yahoo verisi 15-20 dk gecikmeli olabilir">${saat(p.fiyat_zamani)}</span></td>
+      <td>${bPara(p.stop, p.cur)}</td>
+      <td>${bPara(p.notional, p.cur)}</td>
+      <td class="${cls(p.upnl)}"><b>${bPara(p.upnl, p.cur)}</b></td>
+      <td class="${cls(p.upnl)}">${sign(p.upnl_pct)}%</td>
+      <td><button class="mini close" onclick="borsaKapat('${p.symbol}',${p.upnl.toFixed(2)},'${p.cur}')">KAPAT</button></td></tr>`).join("") + "</table>"
+    : `<div class="empty">Açık hisse pozisyonu yok — sinyal bekleniyor (günlük mum kapanışlarında)</div>`;
+
+  $("bAssess").innerHTML = d.assessments.length ? "<table><tr>" +
+    "<th>Sembol</th><th>Karar</th><th>Skor</th><th style='text-align:left'>Araç Oyları</th><th>Zaman</th></tr>" +
+    d.assessments.map(a => {
+      const col = a.decision === "LONG-UYGUN" ? "up" : a.decision === "SHORT-UYGUN" ? "down" : "";
+      const votes = a.veto ? `<span class="down">VETO: ${kacir(a.veto)}</span>`
+        : (a.votes||[]).map(v => `${v.tool} <b class="${cls(v.score)}">${v.score>0?"+":""}${v.score}</b>`).join(" · ");
+      return `<tr><td><b>${a.symbol}</b></td>
+        <td class="${col}"><b>${a.decision}</b></td>
+        <td class="${cls(a.score)}">${a.score>0?"+":""}${a.score}</td>
+        <td style="text-align:left;color:var(--ink2);font-size:12px">${votes}</td>
+        <td style="color:var(--mut)">${saat(a.ts)}</td></tr>`;
+    }).join("") + "</table>"
+    : `<div class="empty">İlk günlük mum kapanışı bekleniyor (BIST ~18:10, ABD ~23:00 TR saati)</div>`;
+
+  $("bTrades").innerHTML = d.trades.length ? "<table><tr>" +
+    "<th>Sembol</th><th>Yön</th><th>Giriş → Çıkış</th><th>Net PnL</th><th>%</th><th>Neden</th><th>Kapanış</th></tr>" +
+    d.trades.map(t => {
+      const cur = t.symbol.endsWith(".IS") ? "TRY" : "USD";
+      return `<tr>
+      <td><b>${t.symbol}</b></td>
+      <td><span class="side ${(t.side||"LONG")[0]}">${t.side||"LONG"}</span></td>
+      <td>${bPara(+t.entry_price, cur)} → ${bPara(+t.exit_price, cur)}</td>
+      <td class="${cls(t.pnl_usdt)}"><b>${bPara(t.pnl_usdt, cur)}</b></td>
+      <td class="${cls(t.pnl_usdt)}">${sign(t.pnl_pct)}%</td>
+      <td style="color:var(--ink2)">${kacir(t.exit_reason)}</td>
+      <td style="color:var(--mut)">${gunSaat(t.exit_time)}</td></tr>`;
+    }).join("") + "</table>"
+    : `<div class="empty">Henüz kapanan hisse işlemi yok</div>`;
+}
+
+async function borsaKapat(sembol, pnl, cur) {
+  const soru = `${sembol} hisse pozisyonunu ŞİMDİ kapat?\n\n` +
+    `Anlık kâr/zarar: ${pnl >= 0 ? "+" : ""}${pnl} ${cur}\n\n` +
+    `Not: fiyat 15-20 dk gecikmeli olabilir; gerçekleşme botun bir sonraki\n` +
+    `turunda (~5 dk) olur ve o anki fiyattan yapılır.`;
+  if (!confirm(soru)) return;
+  try {
+    await fetch(`/api/borsa/kapat/${sembol}`, { method: "POST" });
+    alert("Komut kuyruğa alındı. Sonuç yukarıdaki şeritte ⏳ → ✅/⛔ olarak görünecek (~5 dk).");
+  } catch { alert("Komut gönderilemedi."); }
+  setTimeout(refreshBorsa, 2000);
+}
+
 refresh();
 setInterval(refresh, 5000);
+setInterval(() => { if ($("sayfaBorsa").style.display !== "none") refreshBorsa(); }, 15000);
 </script></body></html>"""
 
 
@@ -718,6 +930,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 log.error("state hatası: %s", e)
                 self._send(500, "application/json", b'{"error":"state"}')
+        elif self.path == "/api/borsa":
+            try:
+                body = json.dumps(build_borsa_state(), ensure_ascii=False).encode("utf-8")
+                self._send(200, "application/json", body)
+            except Exception as e:  # noqa: BLE001
+                log.error("borsa state hatası: %s", e)
+                self._send(500, "application/json", b'{"error":"borsa"}')
         elif self.path == "/api/deploy-durum":
             # Teşhis ucu: cron kurulu mu, betik çalışmış mı, neden ertelemiş.
             try:
@@ -761,6 +980,18 @@ class Handler(BaseHTTPRequestHandler):
                                json.dumps({"ok": True, "queued": f"STOP:{fiyat}"}).encode())
                     return
             self._send(400, "application/json", b'{"ok":false}')
+            return
+
+        # BORSA manuel kapatma — kripto ile aynı desen: komut kuyruğa, sonuç
+        # bcmdres'ten şeride. Sembol adında '/' olmadığı için yol ayrımı güvenli.
+        if self.path.startswith("/api/borsa/kapat/"):
+            sembol = self.path.rsplit("/", 1)[-1].upper()
+            if sembol in CONFIG.borsa_symbols:
+                borsa_state.set_kv(f"bcmd_{sembol}", "CLOSE")
+                log.info("BORSA manuel kapatma kuyruğa alındı: %s", sembol)
+                self._send(200, "application/json", b'{"ok":true}')
+            else:
+                self._send(400, "application/json", b'{"ok":false}')
             return
 
         if self.path == "/api/guncelle":

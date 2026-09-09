@@ -10,6 +10,7 @@ import argparse
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
@@ -40,6 +41,40 @@ def setup_logging() -> None:
     )
     file_handler.setFormatter(fmt)
     root.addHandler(file_handler)
+
+
+def borsa_dongusu(notifier: TelegramNotifier) -> None:
+    """BORSA kanalı — kendi iş parçacığında, kendi DB'siyle, kendi hızında.
+
+    Kripto döngüsünden TAM YALITIM: burada ne olursa olsun (yfinance çöker,
+    ağ gider, Yahoo bizi engeller) kripto botu etkilenmez. Bu yüzden ayrı
+    thread + ayrı StateStore + geniş try/except. Tersi de doğru: bu döngü
+    kripto DB'sine hiç dokunmaz (tek yazıcı ilkesi iki dünyada da geçerli).
+    """
+    log = logging.getLogger("borsa")
+    try:
+        from .borsa_data import BorsaMarket
+        from .borsa_trader import BorsaPaperTrader
+    except ImportError as e:
+        log.error("BORSA kanalı başlatılamadı (yfinance kurulu mu?): %s", e)
+        notifier.send_error(f"BORSA kanalı devre dışı — modül eksik: {e}")
+        return
+
+    state = StateStore(CONFIG.borsa_db_path)
+    market = BorsaMarket(CONFIG.borsa_symbols)
+    traders = [BorsaPaperTrader(s, CONFIG, market, state, notifier)
+               for s in CONFIG.borsa_symbols]
+    log.info("BORSA kanalı başladı | %d sembol | döngü %ds | SANAL cüzdan",
+             len(traders), CONFIG.borsa_poll_seconds)
+
+    while True:
+        state.set_kv("borsa_heartbeat", datetime.now(timezone.utc).isoformat())
+        for t in traders:
+            try:
+                t.poll()
+            except Exception as e:
+                log.error("[%s] Borsa döngü hatası: %s", t.symbol, e, exc_info=True)
+        time.sleep(CONFIG.borsa_poll_seconds)
 
 
 def main() -> None:
@@ -103,6 +138,11 @@ def main() -> None:
 
     # Panelin "çalışıyor mu" bilmesi için kalp atışı + süreç kimliği
     state.set_kv("bot_pid", str(os.getpid()))
+
+    # BORSA kanalı (daemon: ana süreç ölünce o da ölür; --once turunda açılmaz)
+    if CONFIG.borsa_enabled and not args.once:
+        threading.Thread(target=borsa_dongusu, args=(notifier,),
+                         name="borsa", daemon=True).start()
 
     while True:
         state.set_kv("bot_heartbeat", datetime.now(timezone.utc).isoformat())

@@ -599,6 +599,156 @@ def test_deploy_teshis():
         ok("bozuk damga → çökmüyor, sağlıksız sayıyor")
 
 
+# ------------------------------------------------------------- BORSA kanalı
+def borsa_kur(sembol="NVDA"):
+    """İzole borsa trader'ı — ağ YOK, market sahte."""
+    from src.borsa_trader import BorsaPaperTrader
+    db = Path(tempfile.mkdtemp()) / "borsa_test.db"
+    state = StateStore(db)
+    market = MagicMock()
+    market.last_price.return_value = 100.0
+    market.klines.return_value = None       # mum yok → sinyal akışı çalışmaz
+    market.haftalik_yukari.return_value = True
+    notifier = MagicMock()
+    cfg = replace(CONFIG, borsa_max_positions=3, borsa_risk_pct=0.01)
+    return state, notifier, market, BorsaPaperTrader(sembol, cfg, market,
+                                                     state, notifier)
+
+
+def borsa_poz(state, sym="NVDA", entry=100.0, stop=90.0, side="LONG",
+              qty=10.0, margin=1000.0):
+    p = Position(symbol=sym, qty=qty, entry_price=entry, highest_price=entry,
+                 trailing_stop=stop, stop_order_id=None,
+                 entry_time=datetime.now(timezone.utc).isoformat(),
+                 entry_fee_usdt=0.5, side=side, margin=margin, funding_acc=0.0,
+                 risk_unit=10.0)
+    state.save_position(p)
+    return p
+
+
+def test_borsa_kanali():
+    print("\nBORSA KANALI (ABD + BIST, sanal cüzdan)")
+    from src.borsa_data import para_birimi
+    from src.borsa_trader import BASLANGIC, SLIPPAGE as BSLIP
+
+    # Para birimi eşlemesi — cüzdan seçiminin temeli, yanılırsa muhasebe karışır.
+    assert para_birimi("NVDA") == "USD" and para_birimi("THYAO.IS") == "TRY"
+    assert para_birimi("thyao.is") == "TRY", "küçük harf sembol yanlış cüzdana gitti"
+    ok("para birimi eşlemesi: .IS → TRY, diğerleri → USD")
+
+    # Cüzdanlar bağımsız başlar.
+    state, _, _, t_abd = borsa_kur("NVDA")
+    _, _, _, t_bist = borsa_kur("THYAO.IS")
+    assert t_abd._balance() == BASLANGIC["USD"]
+    assert t_bist._balance() == BASLANGIC["TRY"]
+    ok("USD ve TRY cüzdanları kendi başlangıç değerleriyle açılıyor")
+
+    # GAP DÜRÜSTLÜĞÜ: fiyat stopun ÜZERİNDEN atladıysa çıkış stop'tan değil
+    # GERÇEKLEŞEN fiyattan olmalı. (Kriptoda stop fiyatı varsayımı makul,
+    # hissede gece gap'i bunu yalanlar — bu kanalın var olma sebeplerinden.)
+    state, _, market, t = borsa_kur("NVDA")
+    p = borsa_poz(state, "NVDA", entry=100.0, stop=90.0)
+    cikis = t._stop_exit_price(p, 80.0)     # fiyat 90 stopunun altına GAP'lemiş
+    assert cikis is not None and abs(cikis - 80.0 * (1 - BSLIP)) < 1e-9, \
+        f"gap'te stop fiyatından çıkılmış: {cikis}"
+    ok("LONG gap: stop 90 ama fiyat 80 → çıkış 80'den (stop fiyatı hayal)")
+
+    cikis = t._stop_exit_price(p, 89.0)     # normal tetiklenme, gap yok
+    assert cikis is not None and abs(cikis - 89.0 * (1 - BSLIP)) < 1e-9
+    assert t._stop_exit_price(p, 95.0) is None, "stop üstünde fiyatta tetiklendi"
+    ok("stop normal tetiklenme + tetiklenmeme sınırları doğru")
+
+    sp = borsa_poz(state, "TSLA", entry=100.0, stop=110.0, side="SHORT")
+    cikis = t._stop_exit_price(sp, 120.0)   # short'ta yukarı gap
+    assert cikis is not None and abs(cikis - 120.0 * (1 + BSLIP)) < 1e-9
+    ok("SHORT gap: stop 110 ama fiyat 120 → çıkış 120'den")
+
+    # BIST'TE SHORT YASAK — canlıda yapamayacağımızı kağıtta ölçmek yalan olur.
+    state, _, market, t = borsa_kur("THYAO.IS")
+    satir = pd.Series({"close": 80.0, "ema_trend": 100.0, "rsi": 40.0,
+                       "atr": 2.0, "donchian_high": 120.0, "donchian_low": 85.0})
+    market.haftalik_yukari.return_value = False   # short'a uygun ortam bile olsa
+    with patch.object(t, "_open") as acilis:
+        t._try_enter(satir, MagicMock(decision="SHORT-UYGUN", score=-70))
+    assert not acilis.called, "BIST sembolünde SHORT açıldı!"
+    ok("BIST'te short kırılımı gelse de pozisyon AÇILMIYOR (long-only)")
+
+    # Aynı satır ABD sembolünde short açabilmeli (kural piyasaya özgü, genel değil).
+    state, _, market, t = borsa_kur("TSLA")
+    with patch.object(t, "_open") as acilis:
+        t._try_enter(satir, MagicMock(decision="SHORT-UYGUN", score=-70))
+    assert acilis.called, "ABD sembolünde geçerli short reddedildi"
+    ok("aynı sinyal ABD sembolünde short açıyor (kısıt yalnız BIST'te)")
+
+    # Cüzdan muhasebesi: açılışta nakit düşer, kapanışta tutar+kâr döner.
+    state, notifier, market, t = borsa_kur("NVDA")
+    market.last_price.return_value = 100.0
+    t._open("LONG", atr=2.0, reason="test")
+    p = state.get_position("NVDA")
+    assert p is not None and p.qty >= 1 and p.qty == int(p.qty), "tam hisse değil"
+    assert p.trailing_stop < p.entry_price, "stop girişin üstünde"
+    assert t._balance() < BASLANGIC["USD"], "açılış nakit düşürmedi"
+    ara = t._balance()
+    t._close(p, 110.0, "test kapanışı")
+    assert t._balance() > ara, "kapanış parayı geri koymadı"
+    assert state.get_position("NVDA") is None
+    islemler = state.recent_trades(5)
+    assert len(islemler) == 1 and islemler[0]["pnl_usdt"] > 0
+    ok("cüzdan muhasebesi: aç → nakit düşer, kârla kapat → nakit artar")
+
+    # KOMUT: pozisyon yokken CLOSE → red izi; varken CLOSE → kapanır + ok izi.
+    state, _, market, t = borsa_kur("NVDA")
+    state.set_kv("bcmd_NVDA", "CLOSE")
+    t._process_manual_commands(None, 100.0)
+    assert state.get_kv("bcmdres_NVDA", "").startswith("red|")
+    ok("pozisyonsuz CLOSE → 'red' izi (sessiz yutma yok)")
+
+    p = borsa_poz(state, "NVDA")
+    state.set_kv("bcmd_NVDA", "CLOSE")
+    sonuc = t._process_manual_commands(p, 105.0)
+    assert sonuc is None and state.get_position("NVDA") is None
+    assert state.get_kv("bcmdres_NVDA", "").startswith("ok|")
+    ok("pozisyonlu CLOSE → kapandı + 'ok' izi")
+
+    # Fiyat YOKKEN kapatma reddedilir — bilinmeyen fiyattan işlem olmaz.
+    p = borsa_poz(state, "NVDA")
+    state.set_kv("bcmd_NVDA", "CLOSE")
+    sonuc = t._process_manual_commands(p, None)
+    assert sonuc is not None and state.get_position("NVDA") is not None
+    assert state.get_kv("bcmdres_NVDA", "").startswith("red|")
+    ok("fiyat alınamıyorken CLOSE → red + pozisyon duruyor (körlemesine işlem yok)")
+
+    # Günlük kesici: cüzdan gün başından %5+ eridiyse yeni giriş yok.
+    state, _, market, t = borsa_kur("NVDA")
+    bugun = datetime.now(timezone.utc).date().isoformat()
+    state.set_kv("borsa_gunbasi_USD", f"{bugun}|20000.0")   # gün başı 20k, şimdi 10k
+    assert t._kesici_devrede() is True
+    with patch.object(t, "_open") as acilis:
+        uygun = pd.Series({"close": 130.0, "ema_trend": 100.0, "rsi": 60.0,
+                           "atr": 2.0, "donchian_high": 125.0, "donchian_low": 85.0})
+        t._try_enter(uygun, MagicMock(decision="LONG-UYGUN", score=70))
+    assert not acilis.called, "kesici devredeyken giriş açıldı"
+    ok("günlük kesici devredeyken yeni giriş engelleniyor")
+
+    # Panel: /api/borsa veri sözleşmesi — sekmenin beklediği alanlar eksiksiz.
+    import src.panel as panel
+    with patch.object(panel, "borsa_state", state):
+        d = panel.build_borsa_state()
+    for alan in ("enabled", "canli", "cuzdanlar", "positions", "komutlar",
+                 "assessments", "trades", "symbols"):
+        assert alan in d, f"/api/borsa alanı eksik: {alan}"
+    assert {c["cur"] for c in d["cuzdanlar"]} == {"USD", "TRY"}
+    ok("/api/borsa sözleşmesi tam (iki cüzdan + sekme alanları)")
+
+    # Panel JS: borsa sekmesinin id'leri gerçekten sayfada (test 47 dinamikti,
+    # burada sekmeye ÖZGÜ olanları sabitliyoruz ki kablo kopukluğu yakalansın).
+    from src.panel import PAGE
+    for eid in ("sayfaBorsa", "tabBorsa", "bStats", "bPositions",
+                "bKomutlar", "bAssess", "bTrades"):
+        assert f'id="{eid}"' in PAGE, f"borsa sekmesi id eksik: {eid}"
+    ok("borsa sekmesinin tüm id'leri sayfada tanımlı")
+
+
 def main() -> int:
     print("=" * 74)
     print("  KRİTİK TESTLER — geçici DB, gerçek pozisyona DOKUNULMAZ")
@@ -607,7 +757,7 @@ def main() -> int:
                test_manuel_stop_ret, test_manuel_stop_sikma,
                test_manuel_stop_gevsetme, test_short, test_komut_kuyrugu,
                test_komut_sonucu, test_panel_komut_seridi, test_panel_js,
-               test_panel_saat, test_deploy_teshis]
+               test_panel_saat, test_deploy_teshis, test_borsa_kanali]
     for fn in testler:
         try:
             fn()
