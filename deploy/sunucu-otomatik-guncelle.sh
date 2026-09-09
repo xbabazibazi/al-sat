@@ -25,6 +25,10 @@
 #
 # Elle calistirma / test:
 #   bash ~/al-sat/deploy/sunucu-otomatik-guncelle.sh
+#
+# DOGRULAMA (2026-09-09): kilit sizintisi (fd 9) duzeltmesi sunucuda dogrulandi —
+# kilit_serbest=0, kalp atisi saglikli. Bu satirin kendisi ucecu kanarya taahhudu:
+# sunucu bunu KENDI cekerse dongu ucdan uca kanitlanmis olur.
 set -uo pipefail
 
 PROJE="${HOME}/al-sat"
