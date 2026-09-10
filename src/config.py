@@ -127,7 +127,10 @@ class Config:
     # Zaten 3×ATR iz süren stop ile 4R'ye ulaşıldığında stop matematiksel olarak
     # giriş+3R'de kilitlidir (tepe−3ATR = giriş+12ATR−3ATR), yani kârın dörtte
     # üçü garanti altındadır — "stop'u yukarı çek" ihtiyacı otomatik karşılanır.
-    r_notify_level: float = float(_env("R_NOTIFY_LEVEL", "4.0"))
+    # Varsayılan 4.0'dı; kullanıcı HER R'da haber istedi (2026-09-10) → 1.0.
+    # Her tam R eşiği (1R, 2R, 3R...) BİR kez bildirilir; eşik etrafında
+    # gidip gelme spam yapmaz (r_notified cırcırı yalnızca yukarı sayar).
+    r_notify_level: float = float(_env("R_NOTIFY_LEVEL", "1.0"))
 
     # Komisyon optimizasyonu:
     # - Binance'te "BNB ile komisyon öde" açıksa spot ücret %0.10 → %0.075 düşer.
