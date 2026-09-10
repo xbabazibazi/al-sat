@@ -92,7 +92,11 @@ def main() -> None:
 
     market = MarketData()
     state = StateStore(CONFIG.db_path)
-    notifier = TelegramNotifier(CONFIG.telegram_token, CONFIG.telegram_chat_id)
+    # saglik_yaz: bildirim kanalının durumu panele AYRI bir kanaldan ulaşsın.
+    # Telegram bozulduğunda bunu Telegram'dan duyuramayız (2026-09-10 dersi).
+    notifier = TelegramNotifier(CONFIG.telegram_token, CONFIG.telegram_chat_id,
+                                saglik_yaz=state.set_kv)
+    notifier.dogrula()   # token'ı ilk işlemi beklemeden sına
     breaker = CircuitBreaker(state, CONFIG.max_daily_loss_pct)
 
     futures_mode = CONFIG.mode == "futures_paper"

@@ -817,6 +817,63 @@ def test_borsa_kanali():
     ok("borsa sekmesinin tüm id'leri sayfada tanımlı")
 
 
+def test_telegram_saglik():
+    """2026-09-10: bot OPUSDT SHORT açtı, token yenilenmişti, HİÇ bildirim
+    gitmedi ve hiçbir yerde iz kalmadı. Bu testler o sessizliği yasaklar."""
+    print("\nBİLDİRİM KANALI (kendi arızasını kendi kanalından duyuramaz)")
+    from src.notifier import SAGLIK_ANAHTARI, TelegramNotifier
+
+    state, _, _, _ = kur()
+
+    # 1) Token EKSİK → sessizce devre dışı kalmak YASAK, iz bırakmalı.
+    n = TelegramNotifier("", "12345", saglik_yaz=state.set_kv)
+    kayit = json.loads(state.get_kv(SAGLIK_ANAHTARI))
+    assert kayit["ok"] is False and "TELEGRAM_BOT_TOKEN" in kayit["sebep"]
+    assert n.send("deneme") is False, "kapalıyken send True döndü"
+    ok("token eksikse durum 'arızalı' yazılıyor (eskiden tamamen sessizdi)")
+
+    n2 = TelegramNotifier("abc", "", saglik_yaz=state.set_kv)
+    assert "TELEGRAM_CHAT_ID" in json.loads(state.get_kv(SAGLIK_ANAHTARI))["sebep"]
+    ok("chat_id eksikse de sebep adıyla raporlanıyor")
+
+    # 2) Token GEÇERSİZ (401) → sebep gövdeden okunup kaydedilmeli.
+    state2, _, _, _ = kur()
+    n3 = TelegramNotifier("eski_token", "42", saglik_yaz=state2.set_kv)
+    sahte = MagicMock(status_code=401)
+    sahte.json.return_value = {"description": "Unauthorized"}
+    with patch("src.notifier.requests.post", return_value=sahte):
+        assert n3.send("deneme") is False
+    kayit = json.loads(state2.get_kv(SAGLIK_ANAHTARI))
+    assert kayit["ok"] is False and "Unauthorized" in kayit["sebep"]
+    ok("401'de sebep ('Unauthorized') kaydediliyor, sessizce yutulmuyor")
+
+    # 3) Başarılı gönderim durumu TEMİZLEMELİ (arıza asılı kalmasın).
+    with patch("src.notifier.requests.post", return_value=MagicMock(status_code=200)):
+        assert n3.send("deneme") is True
+    assert json.loads(state2.get_kv(SAGLIK_ANAHTARI))["ok"] is True
+    ok("gönderim düzelince durum 'sağlıklı'ya dönüyor")
+
+    # 4) Açılış doğrulaması: ilk işlemi BEKLEMEDEN token'ı sınar.
+    state3, _, _, _ = kur()
+    n4 = TelegramNotifier("token", "42", saglik_yaz=state3.set_kv)
+    with patch("src.notifier.requests.get", return_value=MagicMock(status_code=401)):
+        assert n4.dogrula() is False
+    assert "401" in json.loads(state3.get_kv(SAGLIK_ANAHTARI))["sebep"]
+    ok("açılışta getMe ile sınama — bozuk token işlem beklemeden yakalanıyor")
+
+    # 5) Panel: durum /api/state'e çıkmalı ve "kayıt yok" ≠ "sorun yok".
+    import src.panel as panel
+    bos, _, _, _ = kur()
+    with patch.object(panel, "state", bos):
+        assert panel.telegram_saglik()["ok"] is None, "kayıt yokken 'sağlıklı' sanıldı"
+    with patch.object(panel, "state", state2):
+        assert panel.telegram_saglik()["ok"] is True
+    ok("panel: kayıt yoksa 'bilinmiyor' (sessizlik 'yolunda' sayılmıyor)")
+
+    assert 'id="tgUyari"' in panel.PAGE and "ÇALIŞMIYOR" in panel.PAGE
+    ok("panelde arıza bandının kabı ve metni mevcut")
+
+
 def main() -> int:
     print("=" * 74)
     print("  KRİTİK TESTLER — geçici DB, gerçek pozisyona DOKUNULMAZ")
@@ -825,7 +882,8 @@ def main() -> int:
                test_manuel_stop_ret, test_manuel_stop_sikma,
                test_manuel_stop_gevsetme, test_short, test_komut_kuyrugu,
                test_komut_sonucu, test_panel_komut_seridi, test_panel_js,
-               test_panel_saat, test_deploy_teshis, test_borsa_kanali]
+               test_panel_saat, test_deploy_teshis, test_borsa_kanali,
+               test_telegram_saglik]
     for fn in testler:
         try:
             fn()

@@ -65,6 +65,25 @@ def bot_alive() -> bool:
     return age < HEARTBEAT_STALE_S
 
 
+def telegram_saglik() -> dict:
+    """Bildirim kanalının durumu — panelde büyük uyarı olarak gösterilir.
+
+    NEDEN PANELDE: Telegram bozulduğunda bunu Telegram'dan duyuramayız.
+    2026-09-10'da bot OPUSDT SHORT açtı, token yenilenmişti ve hiçbir bildirim
+    gitmedi; kullanıcı işlemi panelde tesadüfen gördü. Kanalın kendi arızası
+    ikinci bir kanaldan görünmek zorunda.
+    """
+    ham = state.get_kv("telegram_saglik", "")
+    if not ham:
+        # Kayıt yok: bot bu sürümden önce başlamış olabilir. "Sorun yok"
+        # DEMEK DEĞİL — bilinmiyor demek; ikisini karıştırmıyoruz.
+        return {"ok": None, "sebep": "henüz rapor yok (bot yeniden başlayınca gelir)"}
+    try:
+        return json.loads(ham)
+    except ValueError:
+        return {"ok": None, "sebep": "durum kaydı okunamadı"}
+
+
 def spawn_bot() -> bool:
     """Botu ayrı, bağımsız bir süreç olarak başlatır (panel kapansa da yaşar)."""
     if bot_alive():
@@ -346,6 +365,7 @@ def build_state() -> dict:
         "r_events": state.recent_r_events(12),
         "max_positions": CONFIG.max_concurrent_positions,
         "r_level": CONFIG.r_notify_level,
+        "telegram": telegram_saglik(),
     }
 
 
@@ -544,7 +564,19 @@ PAGE = """<!doctype html>
   .tab { background:var(--card2); color:var(--ink2); border:1px solid var(--line);
     padding:8px 22px; border-radius:8px; font-weight:700; letter-spacing:.03em; }
   .tab.aktif { background:var(--accent); color:#fff; border-color:var(--accent); }
+  /* Bildirim kanalı arıza bandı. Telegram bozulduğunda bunu Telegram'dan
+     duyuramayız — bu yüzden panelde, sayfanın EN ÜSTÜNDE ve göz ardı
+     edilemeyecek kadar belirgin. Renk tek gösterge değil: simge + metin var. */
+  .uyari { display:none; gap:10px; align-items:baseline; border-radius:10px;
+    padding:12px 16px; margin-bottom:14px; font-size:13.5px;
+    background:color-mix(in srgb, var(--down) 14%, var(--card));
+    border:1px solid var(--down); color:var(--ink); }
+  .uyari.goster { display:flex; }
+  .uyari.bilinmiyor { background:color-mix(in srgb, var(--amber) 12%, var(--card));
+    border-color:var(--amber); }
+  .uyari .n { color:var(--ink2); font-size:12.5px; }
 </style></head><body>
+<div class="uyari" id="tgUyari"></div>
 <div class="top">
   <h1><span class="pulse" id="pulse"></span>AL-SAT Paneli</h1>
   <span class="chip" id="mode"></span>
@@ -624,6 +656,21 @@ async function refresh() {
   { const d0 = _dt(d.now);
     $("clock").textContent = d0 ? d0.toLocaleTimeString("tr-TR") : "—";
     $("clock").title = `Sunucu UTC: ${(d.now||"").slice(11,19)} · gösterim: ${_tz}`; }
+  // BILDIRIM KANALI. Telegram bozuksa bunu Telegram'dan soyleyemeyiz;
+  // panelin en ustunde gorunur. "ok:null" = BILINMIYOR, "sorun yok" DEGIL.
+  { const t = d.telegram || {}; const el = $("tgUyari");
+    if (t.ok === false) {
+      el.className = "uyari goster";
+      el.innerHTML = `<span>⛔</span><div><b>Telegram bildirimleri ÇALIŞMIYOR</b>
+        <div class="n">${kacir(t.sebep || "sebep bilinmiyor")} · işlemler açılmaya
+        devam eder ama haber GELMEZ. Sunucudaki <code>.env</code> içindeki
+        TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID kontrol edilmeli.</div></div>`;
+    } else if (t.ok === null || t.ok === undefined) {
+      el.className = "uyari bilinmiyor goster";
+      el.innerHTML = `<span>❔</span><div><b>Telegram durumu bilinmiyor</b>
+        <div class="n">${kacir(t.sebep || "")}</div></div>`;
+    } else { el.className = "uyari"; } }
+
   $("pulse").className = "pulse" + (d.bot_running ? "" : " off");
   $("btnStart").disabled = d.bot_running;
   $("btnStop").disabled = !d.bot_running;
