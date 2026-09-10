@@ -157,8 +157,118 @@ class BorsaPaperTrader:
             self._sonuc("ok", f"Pozisyon kapatıldı @ {SIMGE[self.cur]}{price * slip:,.2f}")
             return None
 
+        if cmd.startswith("STOP:"):
+            return self._set_manual_stop(pos, price, cmd[5:])
+
         self._sonuc("red", f"Bilinmeyen komut: {cmd}")
         return pos
+
+    def _set_manual_stop(self, pos: Position | None, price: float | None,
+                         ham: str) -> Position | None:
+        """Panelden manuel stop — kripto _set_manual_stop'un aynası.
+
+        Aynı kurallar: seviye serbest (sıkma da gevşetme de), ama anında
+        tetikleyecek seviye reddedilir ve stop hiçbir koşulda KALDIRILAMAZ.
+        Gevşetmede iz sürme kilidi (stop_manual_ref) kriptodaki formülle
+        kurulur: ref = 2×eski − yeni — işlem verdiğin payı geri kazanmadan
+        algoritma kontrolü geri almaz.
+        """
+        s = SIMGE[self.cur]
+        if pos is None:
+            self._sonuc("red", "Stop değiştirilecek açık pozisyon yok.")
+            return None
+        if price is None:
+            self._sonuc("red", "Şu an fiyat alınamıyor — stop değişikliği ertelendi, tekrar dene.")
+            return pos
+        try:
+            yeni = float(ham)
+        except ValueError:
+            self._sonuc("red", f"Stop seviyesi sayıya çevrilemedi: {ham!r}")
+            return pos
+        if not (yeni > 0):
+            self._sonuc("red", f"Stop 0 veya negatif olamaz ({yeni:g}) — reddedildi.")
+            return pos
+
+        tetikler = yeni >= price if pos.side == "LONG" else yeni <= price
+        if tetikler:
+            yon = "üstünde" if pos.side == "LONG" else "altında"
+            self._sonuc("red", f"{s}{yeni:,.2f} anlık fiyatın ({yon} {s}{price:,.2f}) — "
+                               f"pozisyonu anında kapatırdı. KAPAT düğmesini kullan.")
+            return pos
+
+        eski = pos.trailing_stop
+        if abs(yeni - eski) < 1e-12:
+            self._sonuc("bilgi", f"Stop zaten {s}{eski:,.2f} — değişiklik yok.")
+            return pos
+        sikilastir = yeni > eski if pos.side == "LONG" else yeni < eski
+
+        pos.trailing_stop = yeni
+        if sikilastir:
+            pos.stop_manual_ref = 0.0     # cırcır zaten korur, kilit gerekmez
+        else:
+            ref = 2 * eski - yeni
+            pos.stop_manual_ref = ref if ref > 0 else 1e-9
+        self.state.save_position(pos)
+
+        kilitli = pos.qty * ((yeni - pos.entry_price) if pos.side == "LONG"
+                             else (pos.entry_price - yeni))
+        log.info("[%s] MANUEL STOP %s: %.4f → %.4f (kilit ref=%.4f)",
+                 self.symbol, "sıkıldı" if sikilastir else "GEVŞETİLDİ",
+                 eski, yeni, pos.stop_manual_ref)
+        self._sonuc("ok", f"Stop {'sıkıldı' if sikilastir else 'GEVŞETİLDİ'}: "
+                          f"{s}{eski:,.2f} → {s}{yeni:,.2f} · garantilenen "
+                          f"{kilitli:+,.2f} {self.cur}"
+                          + ("" if sikilastir else " · iz sürme durduruldu 🔓"))
+        self.notifier.send(
+            f"{'🔒' if sikilastir else '⚠️'} *BORSA · {self.symbol} stop "
+            f"{'sıkıldı' if sikilastir else 'GEVŞETİLDİ'}* (manuel)\n"
+            f"• `{s}{eski:,.2f}` → `{s}{yeni:,.2f}` · garantilenen: "
+            f"`{kilitli:+,.2f} {self.cur}`"
+            + ("" if sikilastir else
+               f"\n• İz sürme durdu — aday `{s}{pos.stop_manual_ref:,.2f}`'i "
+               f"geçince kendiliğinden devam eder.")
+        )
+        return pos
+
+    # ------------------------------------------------------- kâr kilometre taşı
+    def _check_r_notify(self, pos: Position, price: float) -> None:
+        """Pozisyon N×R kâra ulaşınca haber verir — KAPATMAZ (kriptoyla aynı ilke:
+        otomatik kâr hedefi sağlamlık testini geçemedi, karar kullanıcıda)."""
+        seviye = self.cfg.r_notify_level
+        if seviye <= 0 or pos.qty <= 0:
+            return
+        if pos.risk_unit <= 0:
+            tahmin = abs(pos.highest_price - pos.trailing_stop)
+            if tahmin <= 0:
+                return
+            pos.risk_unit = tahmin
+            self.state.save_position(pos)
+
+        kar_mesafe = ((price - pos.entry_price) if pos.side == "LONG"
+                      else (pos.entry_price - price))
+        r = kar_mesafe / pos.risk_unit
+        ulasilan = int(r / seviye) * seviye
+        if ulasilan < seviye or ulasilan <= pos.r_notified:
+            return
+
+        upnl = self._unrealized(pos, price)
+        kilitli = pos.qty * ((pos.trailing_stop - pos.entry_price) if pos.side == "LONG"
+                             else (pos.entry_price - pos.trailing_stop))
+        pos.r_notified = ulasilan
+        self.state.save_position(pos)
+        self.state.record_r_event(
+            self.symbol, datetime.now(timezone.utc).isoformat(), pos.side,
+            ulasilan, r, price, upnl, kilitli,
+        )
+        s = SIMGE[self.cur]
+        self.notifier.send(
+            f"🎯 *BORSA · {self.symbol} {r:.1f}R KÂRA ULAŞTI*\n"
+            f"• Anlık kâr: `{upnl:+,.2f} {self.cur}`\n"
+            f"• Stop kilidi: `{s}{pos.trailing_stop:,.2f}` → `{kilitli:+,.2f} {self.cur}` garantide\n"
+            f"• Pozisyon DEVAM ediyor — kapatmak istersen panelden KAPAT."
+        )
+        log.info("[%s] %.1fR kâr bildirimi (upnl=%.2f kilitli=%.2f)",
+                 self.symbol, r, upnl, kilitli)
 
     # ------------------------------------------------------- günlük devre kesici
     def _kesici_devrede(self) -> bool:
@@ -197,6 +307,8 @@ class BorsaPaperTrader:
             if cikis is not None:
                 self._close(pos, cikis, "izleyen stop")
                 pos = None
+            else:
+                self._check_r_notify(pos, price)
 
         # 1b) Günlük devre kesici — kriptodaki seçici kapatmanın aynısı:
         # yalnızca ZARARDAKI pozisyon kapanır, kârdaki izleyen stopla yaşar.
@@ -246,6 +358,16 @@ class BorsaPaperTrader:
         if pos.side == "LONG":
             if float(row["high"]) > pos.highest_price:
                 pos.highest_price = float(row["high"])
+            aday = pos.highest_price - atr * self.cfg.strategy.atr_multiplier
+            # Manuel gevşetme kilidi (kriptoyla aynı): işlem, gevşetme anındaki
+            # adayı geçene kadar iz sürme DURUR — yoksa bot ertesi mumda geri alır.
+            if pos.stop_manual_ref > 0:
+                if aday <= pos.stop_manual_ref:
+                    self.state.save_position(pos)   # yalnızca uç değeri kaydet
+                    return
+                log.info("[%s] Manuel stop kilidi açıldı (aday %.4f > ref %.4f)",
+                         self.symbol, aday, pos.stop_manual_ref)
+                pos.stop_manual_ref = 0.0
             new_stop = updated_trailing_stop(
                 pos.trailing_stop, pos.highest_price, atr, self.cfg.strategy)
             if new_stop > pos.trailing_stop:
@@ -256,6 +378,13 @@ class BorsaPaperTrader:
             if float(row["low"]) < pos.highest_price:
                 pos.highest_price = float(row["low"])
             aday = pos.highest_price + atr * self.cfg.strategy.atr_multiplier
+            if pos.stop_manual_ref > 0:
+                if aday >= pos.stop_manual_ref:
+                    self.state.save_position(pos)
+                    return
+                log.info("[%s] Manuel stop kilidi açıldı (aday %.4f < ref %.4f)",
+                         self.symbol, aday, pos.stop_manual_ref)
+                pos.stop_manual_ref = 0.0
             if aday < pos.trailing_stop:
                 log.info("[%s] SHORT stop indirildi: %.2f → %.2f",
                          self.symbol, pos.trailing_stop, aday)

@@ -379,6 +379,17 @@ def build_borsa_state() -> dict:
         upnl = (p.qty * (price - p.entry_price) if p.side == "LONG"
                 else p.qty * (p.entry_price - price))
         kilitli[cur] += p.margin + upnl
+        # R ilerlemesi — kriptoyla aynı kural: 1R = GİRİŞ anındaki stop mesafesi.
+        r_simdi = r_hedef = None
+        if p.risk_unit > 0:
+            r_simdi = round(((price - p.entry_price) if p.side == "LONG"
+                             else (p.entry_price - price)) / p.risk_unit, 2)
+            if CONFIG.r_notify_level > 0:
+                r_hedef = (p.entry_price + CONFIG.r_notify_level * p.risk_unit
+                           if p.side == "LONG"
+                           else p.entry_price - CONFIG.r_notify_level * p.risk_unit)
+        stop_pnl = p.qty * ((p.trailing_stop - p.entry_price) if p.side == "LONG"
+                            else (p.entry_price - p.trailing_stop))
         positions.append({
             "symbol": p.symbol, "cur": cur, "side": p.side, "qty": p.qty,
             "entry": p.entry_price, "price": price, "stop": p.trailing_stop,
@@ -386,6 +397,9 @@ def build_borsa_state() -> dict:
             "upnl_pct": round(upnl / p.margin * 100, 2) if p.margin else 0,
             "notional": round(p.margin, 2),
             "since": p.entry_time, "fiyat_zamani": price_ts,
+            "r_simdi": r_simdi, "r_hedef": r_hedef, "r_notified": p.r_notified,
+            "stop_pnl": round(stop_pnl, 2),
+            "stop_kilit": p.stop_manual_ref,
         })
 
     cuzdanlar = []
@@ -400,9 +414,10 @@ def build_borsa_state() -> dict:
 
     komutlar = []
     for sym in CONFIG.borsa_symbols:
-        if borsa_state.get_kv(f"bcmd_{sym}", ""):
+        bekleyen = borsa_state.get_kv(f"bcmd_{sym}", "")
+        if bekleyen:
             komutlar.append({"symbol": sym, "durum": "bekliyor",
-                             "mesaj": "KAPAT gönderildi — borsa döngüsü uygulayacak (~5 dk)"})
+                             "mesaj": f"{bekleyen} gönderildi — borsa döngüsü uygulayacak (~5 dk)"})
             continue
         ham = borsa_state.get_kv(f"bcmdres_{sym}", "")
         if not ham:
@@ -829,6 +844,45 @@ function sekme(ad) {
 // Para birimi sembole gore: ".IS" = BIST (TL), digeri ABD ($).
 const bPara = (v, cur) => (v<0 ? "−" : "") + (cur === "TRY" ? "₺" : "$") +
   Math.abs(v).toLocaleString("tr-TR",{minimumFractionDigits:2,maximumFractionDigits:2});
+// R hucresi — kriptodaki rHucre'nin para-birimi-duyarli esi.
+function bRHucre(p) {
+  if (p.r_simdi === null || p.r_simdi === undefined)
+    return `<span style="color:var(--mut)" title="Bu pozisyon R takibinden önce açıldı">—</span>`;
+  const ulasti = p.r_notified > 0 && p.r_simdi >= p.r_notified;
+  const renk = ulasti ? "var(--up)" : p.r_simdi > 0 ? "var(--ink)" : "var(--mut)";
+  const hedef = p.r_hedef
+    ? `<div style="font-size:10px;color:var(--mut)">hedef ${bPara(p.r_hedef, p.cur)}</div>` : "";
+  return `<b style="color:${renk}">${sign(p.r_simdi)}R</b>${ulasti ? " 🎯" : ""}${hedef}`;
+}
+
+async function borsaStop(sembol, yon, stop, fiyat, giris, cur) {
+  const uzun = yon === "LONG";
+  const ham = prompt(
+    `${sembol} ${yon} — yeni stop seviyesi\n\n` +
+    `Giriş  : ${giris}\nAnlık  : ${fiyat}\nŞu anki stop: ${stop}\n\n` +
+    (uzun ? `LONG: stop anlık fiyatın ALTINDA olmalı.` : `SHORT: stop anlık fiyatın ÜSTÜNDE olmalı.`),
+    String(stop));
+  if (ham === null) return;
+  const yeni = parseFloat(String(ham).replace(",", "."));
+  if (!(yeni > 0)) { alert("Geçersiz sayı."); return; }
+  if (uzun ? yeni >= fiyat : yeni <= fiyat) {
+    alert(`Bu seviye pozisyonu ANINDA kapatır.\nİstediğin buysa KAPAT düğmesini kullan.`);
+    return;
+  }
+  const sik = uzun ? yeni > stop : yeni < stop;
+  const soru = sik
+    ? `${sembol}: stop SIKILIYOR\n\n${stop} → ${yeni}\n\nİz süren stop buradan devam edecek.`
+    : `⚠️ ${sembol}: stop GEVŞETİLİYOR\n\n${stop} → ${yeni}\n\n` +
+      `DİKKAT: Zararı büyütme iznidir. İz sürme DURDURULACAK; işlem verdiğin\n` +
+      `payı geri kazanınca kendiliğinden devam eder.\n\n` +
+      `Not: hissede gece gap'i stopun ötesine atlayabilir — stop fiyatı garanti değil.\n\nEmin misin?`;
+  if (!confirm(soru)) return;
+  try {
+    await fetch(`/api/borsa/stop/${sembol}/${yeni}`, { method: "POST" });
+    alert("Komut kuyruğa alındı — şeritte ⏳ → ✅/⛔ olarak görünecek (~5 dk).");
+  } catch { alert("Komut gönderilemedi."); }
+  setTimeout(refreshBorsa, 2000);
+}
 
 async function refreshBorsa() {
   let d;
@@ -858,18 +912,24 @@ async function refreshBorsa() {
 
   $("bPositions").innerHTML = d.positions.length ? "<table><tr>" +
     "<th>Sembol</th><th>Yön</th><th>Adet</th><th>Giriş</th><th>Anlık</th>" +
-    "<th>Stop</th><th>Tutar</th><th>Anlık PnL</th><th>%</th><th>Manuel</th></tr>" +
+    "<th>Stop</th>" +
+    "<th title='Giriş anındaki stop mesafesi 1R kabul edilir'>R</th>" +
+    "<th title='Stop şu an tetiklenirse bankaya girecek gerçek tutar (gap olmazsa)'>Stop olursa</th>" +
+    "<th>Tutar</th><th>Anlık PnL</th><th>%</th><th>Manuel</th></tr>" +
     d.positions.map(p => `<tr>
       <td><b>${p.symbol}</b> <span style="color:var(--mut);font-size:11px">${gunSaat(p.since)}</span></td>
       <td><span class="side ${p.side[0]}">${p.side}</span></td>
       <td>${p.qty}</td>
       <td>${bPara(p.entry, p.cur)}</td>
       <td>${bPara(p.price, p.cur)} <span style="color:var(--mut);font-size:10px" title="Yahoo verisi 15-20 dk gecikmeli olabilir">${saat(p.fiyat_zamani)}</span></td>
-      <td>${bPara(p.stop, p.cur)}</td>
+      <td>${bPara(p.stop, p.cur)}${p.stop_kilit > 0 ? ` <span title="Manuel gevşetme kilidi açık — iz süren stop durduruldu" style="color:var(--amber)">🔓</span>` : ""}</td>
+      <td>${bRHucre(p)}</td>
+      <td class="${cls(p.stop_pnl)}">${bPara(p.stop_pnl, p.cur)}</td>
       <td>${bPara(p.notional, p.cur)}</td>
       <td class="${cls(p.upnl)}"><b>${bPara(p.upnl, p.cur)}</b></td>
       <td class="${cls(p.upnl)}">${sign(p.upnl_pct)}%</td>
-      <td><button class="mini close" onclick="borsaKapat('${p.symbol}',${p.upnl.toFixed(2)},'${p.cur}')">KAPAT</button></td></tr>`).join("") + "</table>"
+      <td><button class="mini stop" onclick="borsaStop('${p.symbol}','${p.side}',${p.stop},${p.price},${p.entry},'${p.cur}')">STOP</button>
+          <button class="mini close" onclick="borsaKapat('${p.symbol}',${p.upnl.toFixed(2)},'${p.cur}')">KAPAT</button></td></tr>`).join("") + "</table>"
     : `<div class="empty">Açık hisse pozisyonu yok — sinyal bekleniyor (günlük mum kapanışlarında)</div>`;
 
   $("bAssess").innerHTML = d.assessments.length ? "<table><tr>" +
@@ -992,6 +1052,24 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, "application/json", b'{"ok":true}')
             else:
                 self._send(400, "application/json", b'{"ok":false}')
+            return
+
+        # BORSA manuel stop — /api/borsa/stop/<SEMBOL>/<fiyat>. Geçerlilik
+        # denetimi BOTTA (tek yazıcı: panel pozisyon okumaz, komut bırakır).
+        if self.path.startswith("/api/borsa/stop/"):
+            parts = self.path.split("/")   # ['', 'api', 'borsa', 'stop', sembol, fiyat]
+            if len(parts) == 6:
+                sembol = parts[4].upper()
+                try:
+                    fiyat = float(parts[5])
+                except ValueError:
+                    fiyat = 0.0
+                if sembol in CONFIG.borsa_symbols and fiyat > 0:
+                    borsa_state.set_kv(f"bcmd_{sembol}", f"STOP:{fiyat!r}")
+                    log.info("BORSA manuel STOP kuyruğa alındı: %s → %s", sembol, fiyat)
+                    self._send(200, "application/json", b'{"ok":true}')
+                    return
+            self._send(400, "application/json", b'{"ok":false}')
             return
 
         if self.path == "/api/guncelle":

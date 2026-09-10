@@ -730,15 +730,83 @@ def test_borsa_kanali():
     assert not acilis.called, "kesici devredeyken giriş açıldı"
     ok("günlük kesici devredeyken yeni giriş engelleniyor")
 
+    # MANUEL STOP — kriptodaki kuralların aynası: anında tetikleyen RED,
+    # sıkma serbest, gevşetme kilit kurar, iz sürme kilit açılana dek durur.
+    state, _, market, t = borsa_kur("NVDA")
+    state.set_kv("bcmd_NVDA", "STOP:95")
+    t._process_manual_commands(None, 100.0)
+    assert state.get_kv("bcmdres_NVDA", "").startswith("red|")
+    ok("pozisyon yokken STOP → 'red' izi")
+
+    p = borsa_poz(state, "NVDA", entry=100.0, stop=90.0)
+    state.set_kv("bcmd_NVDA", "STOP:105")            # LONG'da fiyat üstü stop
+    p = t._process_manual_commands(p, 100.0)
+    assert p.trailing_stop == 90.0, "anında tetikleyen stop kabul edildi!"
+    assert "kapatırdı" in state.get_kv("bcmdres_NVDA", "")
+    ok("anında tetikleyecek stop reddedildi (KAPAT'a yönlendirme)")
+
+    state.set_kv("bcmd_NVDA", "STOP:95")             # sıkma: 90 → 95
+    p = t._process_manual_commands(p, 100.0)
+    assert p.trailing_stop == 95.0 and p.stop_manual_ref == 0.0
+    assert state.get_kv("bcmdres_NVDA", "").startswith("ok|")
+    ok("stop sıkma uygulanıyor, kilit kurulmuyor (cırcır zaten korur)")
+
+    state.set_kv("bcmd_NVDA", "STOP:85")             # gevşetme: 95 → 85
+    p = t._process_manual_commands(p, 100.0)
+    assert p.trailing_stop == 85.0 and abs(p.stop_manual_ref - 105.0) < 1e-9, \
+        f"kilit ref yanlış: {p.stop_manual_ref} (2×95−85=105 olmalı)"
+    ok("gevşetme: ref = 2×eski − yeni kilidi kuruldu")
+
+    # Kilit varken iz sürme DURMALI (aday ref'in altında kaldıkça).
+    t._update_trailing(p, mum(high=101.0, low=95.0, atr=1.0))   # aday 101−3=98 < 105
+    p = state.get_position("NVDA")
+    assert p.trailing_stop == 85.0 and p.stop_manual_ref > 0, "kilit ihlal edildi"
+    ok("kilit açıkken iz süren stop gevşetilmiş seviyeye dokunmuyor")
+
+    # İşlem payı geri kazanınca (aday > ref) kilit açılır, iz sürme döner.
+    t._update_trailing(p, mum(high=110.0, low=100.0, atr=1.0))  # aday 110−3=107 > 105
+    p = state.get_position("NVDA")
+    assert p.stop_manual_ref == 0.0 and p.trailing_stop == 107.0
+    ok("aday ref'i geçince kilit kendiliğinden açıldı, stop yükseldi")
+
+    # Fiyat alınamıyorken STOP komutu ertelenir (körlemesine değişiklik yok).
+    state.set_kv("bcmd_NVDA", "STOP:100")
+    p = t._process_manual_commands(p, None)
+    assert p.trailing_stop == 107.0
+    assert state.get_kv("bcmdres_NVDA", "").startswith("red|")
+    ok("fiyatsızken STOP → red + seviye değişmedi")
+
+    # R BİLDİRİMİ — bildirir ama KAPATMAZ, aynı eşiği tekrar bildirmez.
+    state, notifier, market, t = borsa_kur("NVDA")
+    p = borsa_poz(state, "NVDA", entry=100.0, stop=97.0)
+    p.risk_unit = 3.0                                # 1R = 3
+    state.save_position(p)
+    notifier.reset_mock()
+    t._check_r_notify(p, 112.0)                      # (112−100)/3 = 4R
+    assert notifier.send.called, "4R'de bildirim gitmedi"
+    assert state.get_position("NVDA") is not None, "R bildirimi pozisyonu KAPATTI!"
+    assert state.get_position("NVDA").r_notified == 4.0
+    ok("4R'de bildirim gitti, pozisyon AÇIK kaldı")
+
+    notifier.reset_mock()
+    t._check_r_notify(state.get_position("NVDA"), 113.0)   # hâlâ 4R bandında
+    assert not notifier.send.called, "aynı eşik ikinci kez bildirildi (spam)"
+    ok("aynı R eşiği ikinci kez bildirilmiyor")
+
     # Panel: /api/borsa veri sözleşmesi — sekmenin beklediği alanlar eksiksiz.
     import src.panel as panel
+    borsa_poz(state, "NVDA", entry=100.0, stop=95.0)   # risk_unit=10 (borsa_poz)
     with patch.object(panel, "borsa_state", state):
         d = panel.build_borsa_state()
     for alan in ("enabled", "canli", "cuzdanlar", "positions", "komutlar",
                  "assessments", "trades", "symbols"):
         assert alan in d, f"/api/borsa alanı eksik: {alan}"
     assert {c["cur"] for c in d["cuzdanlar"]} == {"USD", "TRY"}
-    ok("/api/borsa sözleşmesi tam (iki cüzdan + sekme alanları)")
+    pp = next(x for x in d["positions"] if x["symbol"] == "NVDA")
+    for alan in ("r_simdi", "r_hedef", "stop_pnl", "stop_kilit"):
+        assert alan in pp, f"pozisyonda R/stop alanı eksik: {alan}"
+    assert abs(pp["stop_pnl"] - 10 * (95.0 - 100.0)) < 1e-9, "stop_pnl hesabı yanlış"
+    ok("/api/borsa sözleşmesi tam (iki cüzdan + R + stop alanları)")
 
     # Panel JS: borsa sekmesinin id'leri gerçekten sayfada (test 47 dinamikti,
     # burada sekmeye ÖZGÜ olanları sabitliyoruz ki kablo kopukluğu yakalansın).
