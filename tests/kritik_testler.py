@@ -890,6 +890,169 @@ def test_telegram_saglik():
     ok("bot günlüğü ucu: kuyruk + filtre + üst sınır + dosyasızlık")
 
 
+def sahte_broker(cfg=None):
+    """Gerçek Binance'e DOKUNMAYAN FuturesBroker. binance.client.Client
+    içeri alınmadan yamalanır; ağ isteği hiç doğmaz."""
+    from src import futures_exchange as fx
+    istemci = MagicMock()
+    istemci.futures_exchange_info.return_value = {"symbols": [{
+        "symbol": "BTCUSDT",
+        "filters": [{"filterType": "LOT_SIZE", "stepSize": "0.001", "minQty": "0.001"},
+                    {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
+                    {"filterType": "MIN_NOTIONAL", "notional": "5"}]}]}
+    sahte_modul = MagicMock()
+    sahte_modul.Client.return_value = istemci
+    with patch.dict(sys.modules, {"binance": MagicMock(),
+                                  "binance.client": sahte_modul}):
+        b = fx.FuturesBroker(cfg or replace(CONFIG, mode="futures_testnet"))
+    return b, istemci
+
+
+def test_canli_altyapi():
+    """CANLIYA GEÇİŞ KAPISI. Buradaki her test, gerçek parayla yapılması
+    felaket olacak bir hatayı yasaklar."""
+    print("\nCANLI ALTYAPI (gerçek para yolu)")
+    from src import futures_exchange as fx
+
+    # --- Fiyat/miktar yuvarlama: yukarı yuvarlamak emir reddi üretir ---
+    assert fx.asagi_yuvarla(1.23987, 0.001) <= 1.23987
+    assert abs(fx.asagi_yuvarla(0.7, 0.1) - 0.7) < 1e-9, "kayan nokta hatası"
+    assert abs(fx.fiyat_yuvarla(123.456, 0.10) - 123.5) < 1e-9
+    ok("miktar AŞAĞI, fiyat tick'e yuvarlanıyor (emir reddi önleniyor)")
+
+    # --- STOPSUZ POZİSYON YASAK: stop kurulamazsa pozisyon geri kapatılır ---
+    b, c = sahte_broker()
+    c.futures_create_order.side_effect = [
+        {"executedQty": "0.5", "avgPrice": "100", "orderId": 1},   # giriş dolar
+        Exception("stop reddedildi"),                              # STOP başarısız
+        {"executedQty": "0.5", "avgPrice": "99.9", "orderId": 3},  # geri kapatma
+    ]
+    sonuc = b.giris_ve_stop("BTCUSDT", "LONG", 0.5, 95.0)
+    assert sonuc is None, "stop kurulamadı ama pozisyon açık bırakıldı!"
+    assert c.futures_create_order.call_count == 3, "geri kapatma emri gönderilmedi"
+    kapanis = c.futures_create_order.call_args_list[2].kwargs
+    assert kapanis["side"] == "SELL" and kapanis["type"] == "MARKET"
+    ok("stop kurulamazsa pozisyon DERHAL kapatılıyor ('stop daima olacak')")
+
+    # --- Kapatma da başarısızsa ACİL bayrağı: sessizce geçilmez ---
+    b, c = sahte_broker()
+    c.futures_create_order.side_effect = [
+        {"executedQty": "0.5", "avgPrice": "100", "orderId": 1},
+        Exception("stop reddedildi"),
+        Exception("kapatma da reddedildi"),
+    ]
+    sonuc = b.giris_ve_stop("BTCUSDT", "LONG", 0.5, 95.0)
+    assert sonuc is not None and sonuc["acil"] is True and sonuc["stop_id"] is None
+    ok("stop YOK + kapatma da başarısız → 'acil' bayrağı (sessiz geçiş yok)")
+
+    # --- Mutlu yol ---
+    b, c = sahte_broker()
+    c.futures_create_order.side_effect = [
+        {"executedQty": "0.5", "avgPrice": "100", "orderId": 1},
+        {"orderId": 77},
+    ]
+    sonuc = b.giris_ve_stop("BTCUSDT", "LONG", 0.5, 95.0)
+    assert sonuc["acil"] is False and sonuc["stop_id"] == 77 and sonuc["giris"] == 100.0
+    stop_cagri = c.futures_create_order.call_args_list[1].kwargs
+    assert stop_cagri["type"] == "STOP_MARKET" and stop_cagri["closePosition"] is True
+    assert stop_cagri["side"] == "SELL", "LONG'un stopu SELL olmalı"
+    ok("giriş + borsa taraflı STOP_MARKET (closePosition) birlikte kuruluyor")
+
+    # --- İz süren stop: ÖNCE yeni kurulur, SONRA eski iptal edilir ---
+    b, c = sahte_broker()
+    c.futures_create_order.return_value = {"orderId": 99}
+    yeni = b.stop_tasi("BTCUSDT", "LONG", eski_id=55, yeni_stop=97.0)
+    assert yeni == 99 and c.futures_cancel_order.called
+    ok("stop taşımada sıra doğru: yeni kurulmadan eski iptal edilmiyor")
+
+    # Yeni stop kurulamazsa ESKİSİ KORUNUR (iptal edilmez!) — aksi hâlde
+    # pozisyon tamamen stopsuz kalırdı.
+    b, c = sahte_broker()
+    c.futures_create_order.side_effect = Exception("red")
+    yeni = b.stop_tasi("BTCUSDT", "LONG", eski_id=55, yeni_stop=97.0)
+    assert yeni == 55 and not c.futures_cancel_order.called, "eski stop iptal edildi!"
+    ok("yeni stop kurulamazsa eski stop KORUNUYOR (korumasız an oluşmuyor)")
+
+    # --- SHORT tarafı: stop BUY olmalı ---
+    b, c = sahte_broker()
+    c.futures_create_order.return_value = {"orderId": 5}
+    b.stop_kur("BTCUSDT", "SHORT", 105.0)
+    assert c.futures_create_order.call_args.kwargs["side"] == "BUY"
+    ok("SHORT pozisyonun stopu BUY yönünde kuruluyor")
+
+    # --- Borsadaki gerçek pozisyon okuması (mutabakatın temeli) ---
+    b, c = sahte_broker()
+    c.futures_position_information.return_value = [
+        {"positionAmt": "-0.30", "entryPrice": "100", "leverage": "2",
+         "liquidationPrice": "150"}]
+    p = b.pozisyon("BTCUSDT")
+    assert p["yon"] == "SHORT" and p["miktar"] == 0.30
+    c.futures_position_information.return_value = [{"positionAmt": "0"}]
+    assert b.pozisyon("BTCUSDT") is None
+    ok("borsadaki gerçek pozisyon doğru okunuyor (yön + miktar)")
+
+    # --- Hedge modu tespiti: 'tek pozisyon' varsayımımızı çürütür ---
+    b, c = sahte_broker()
+    c.futures_get_position_mode.return_value = {"dualSidePosition": True}
+    assert b.tek_yon_modu_mu() is False
+    c.futures_get_position_mode.return_value = {"dualSidePosition": False}
+    assert b.tek_yon_modu_mu() is True
+    ok("hedge modu tespit ediliyor (tek yön varsayımı sınanıyor)")
+
+
+def test_canli_kapisi():
+    """Kazara gerçek paraya geçiş İMKÂNSIZ olmalı."""
+    print("\nGERÇEK PARA KAPISI")
+    temel = dict(mode="futures_live", live_key="k", live_secret="s",
+                 risk_pct=0.005, canli_risk_tavani=0.01)
+
+    # Onay dizgisi yoksa AÇILMAZ.
+    try:
+        replace(CONFIG, **temel, canli_onay="").validate()
+        raise AssertionError("onaysız canlı mod başladı!")
+    except ValueError as e:
+        assert "CANLI_ONAY" in str(e)
+    ok("CANLI_ONAY olmadan futures_live BAŞLAMIYOR")
+
+    # Yanlış/yaklaşık onay da kabul edilmez (tam eşleşme şart).
+    for yanlis in ("evet", "EVET", "EVET_GERCEK_PARA ", "gercek_para"):
+        try:
+            replace(CONFIG, **temel, canli_onay=yanlis).validate()
+            raise AssertionError(f"yanlış onay kabul edildi: {yanlis!r}")
+        except ValueError:
+            pass
+    ok("yaklaşık onay dizgileri reddediliyor (tam eşleşme şart)")
+
+    # Anahtar yoksa açılmaz.
+    try:
+        replace(CONFIG, mode="futures_live", live_key="", live_secret="",
+                canli_onay="EVET_GERCEK_PARA").validate()
+        raise AssertionError("anahtarsız canlı mod başladı!")
+    except ValueError as e:
+        assert "BINANCE_LIVE" in str(e)
+    ok("canlı anahtar olmadan futures_live BAŞLAMIYOR")
+
+    # Kâğıttaki risk canlıya olduğu gibi taşınmaz.
+    try:
+        replace(CONFIG, mode="futures_live", live_key="k", live_secret="s",
+                canli_onay="EVET_GERCEK_PARA", risk_pct=0.02,
+                canli_risk_tavani=0.01).validate()
+        raise AssertionError("canlıda tavan üstü risk kabul edildi!")
+    except ValueError as e:
+        assert "tavan" in str(e)
+    ok("canlıda risk tavanı (%1) aşılamıyor — kâğıt riski taşınmıyor")
+
+    # Üç kilit de tamamsa geçer.
+    replace(CONFIG, **temel, canli_onay="EVET_GERCEK_PARA").validate()
+    ok("anahtar + onay + risk tavanı tamamsa canlı mod geçerli sayılıyor")
+
+    # Kâğıt ve testnet modları bu kapıdan etkilenmemeli (regresyon).
+    replace(CONFIG, mode="futures_paper").validate()
+    replace(CONFIG, mode="futures_testnet", testnet_key="k",
+            testnet_secret="s").validate()
+    ok("kâğıt ve testnet modları kapıdan etkilenmiyor [regresyon]")
+
+
 def main() -> int:
     print("=" * 74)
     print("  KRİTİK TESTLER — geçici DB, gerçek pozisyona DOKUNULMAZ")
@@ -899,7 +1062,7 @@ def main() -> int:
                test_manuel_stop_gevsetme, test_short, test_komut_kuyrugu,
                test_komut_sonucu, test_panel_komut_seridi, test_panel_js,
                test_panel_saat, test_deploy_teshis, test_borsa_kanali,
-               test_telegram_saglik]
+               test_telegram_saglik, test_canli_altyapi, test_canli_kapisi]
     for fn in testler:
         try:
             fn()

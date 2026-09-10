@@ -41,7 +41,17 @@ class StrategyParams:
 
 @dataclass(frozen=True)
 class Config:
-    mode: str = _env("BOT_MODE", "dry_run").lower()  # dry_run | testnet | live | futures_paper
+    # dry_run | testnet | live | futures_paper | futures_testnet | futures_live
+    mode: str = _env("BOT_MODE", "dry_run").lower()
+
+    # CANLI PARA KAPISI — kazara açılmayı imkânsız kılar.
+    # futures_live modu YALNIZCA bu değer tam olarak "EVET_GERCEK_PARA" ise
+    # başlar. Tek bir .env satırının yanlışlıkla değişmesi ya da eski bir
+    # yedeğin geri yüklenmesi gerçek parayı riske atmasın diye ikinci bir
+    # bilinçli onay şarttır. Ayrıca canlıda risk tavanı ayrıca kısılır.
+    canli_onay: str = _env("CANLI_ONAY", "")
+    # Canlıda işlem başına risk tavanı (kâğıttaki %2 canlı için fazla agresif).
+    canli_risk_tavani: float = float(_env("CANLI_RISK_TAVANI", "0.01"))
 
     # ---- Vadeli işlem (futures_paper) ayarları ----
     # Kaldıraç neden 2? (2026-09-07 ölçümü — PORTFÖY motoru, backtest/portfoy.py)
@@ -178,16 +188,41 @@ class Config:
     strategy: StrategyParams = field(default_factory=StrategyParams)
 
     def validate(self) -> None:
-        if self.mode not in ("dry_run", "testnet", "live", "futures_paper"):
+        gecerli = ("dry_run", "testnet", "live", "futures_paper",
+                   "futures_testnet", "futures_live")
+        if self.mode not in gecerli:
             raise ValueError(f"Geçersiz BOT_MODE: {self.mode}")
-        if self.mode == "futures_paper" and not (1 <= self.leverage <= 5):
+        if self.mode.startswith("futures") and not (1 <= self.leverage <= 5):
             raise ValueError("LEVERAGE 1-5 arasında olmalı — üstü backtest'te değer üretmedi, risk üretti")
         if self.mode == "testnet" and not (self.testnet_key and self.testnet_secret):
             raise ValueError("testnet modu için BINANCE_TESTNET_KEY/SECRET gerekli (testnet.binance.vision)")
+        if self.mode == "futures_testnet" and not (self.testnet_key and self.testnet_secret):
+            raise ValueError("futures_testnet için BINANCE_TESTNET_KEY/SECRET gerekli "
+                             "(testnet.binancefuture.com)")
         if self.mode == "live" and not (self.live_key and self.live_secret):
             raise ValueError("live modu için BINANCE_LIVE_KEY/SECRET gerekli")
         if not (0 < self.risk_pct <= 0.05):
             raise ValueError("RISK_PCT 0 ile 0.05 (%5) arasında olmalı — daha yükseği kumardır")
+
+        # ---------------- GERÇEK PARA KAPISI ----------------
+        # Üç ayrı kilit: anahtar + bilinçli onay dizgisi + kısılmış risk tavanı.
+        # Amaç, "yanlışlıkla canlıya geçmiş olma" ihtimalini sıfırlamaktır;
+        # bu moda ancak isteyerek ve okuyarak girilebilir.
+        if self.mode == "futures_live":
+            if not (self.live_key and self.live_secret):
+                raise ValueError("futures_live için BINANCE_LIVE_KEY/SECRET gerekli")
+            if self.canli_onay != "EVET_GERCEK_PARA":
+                raise ValueError(
+                    "GERÇEK PARA MODU KİLİTLİ. Açmak için .env'e şunu ekle:\n"
+                    "  CANLI_ONAY=EVET_GERCEK_PARA\n"
+                    "Bu kasıtlı bir engeldir: canlıya geçiş kazara olmamalı. "
+                    "Öncesinde `python -m src.canli_kontrol` çalıştırılmalıdır.")
+            if self.risk_pct > self.canli_risk_tavani:
+                raise ValueError(
+                    f"Canlıda RISK_PCT ({self.risk_pct:.3f}) tavanı "
+                    f"({self.canli_risk_tavani:.3f}) aşıyor. Kâğıttaki risk "
+                    f"canlıya olduğu gibi taşınmaz; CANLI_RISK_TAVANI ile "
+                    f"bilinçli olarak yükseltilebilir.")
 
 
 CONFIG = Config()
