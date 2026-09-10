@@ -873,6 +873,22 @@ def test_telegram_saglik():
     assert 'id="tgUyari"' in panel.PAGE and "ÇALIŞMIYOR" in panel.PAGE
     ok("panelde arıza bandının kabı ve metni mevcut")
 
+    # 6) Bot günlüğü teşhis ucu — ssh kapalıyken kör kalmayalım.
+    kok = Path(tempfile.mkdtemp())
+    kayit = kok / "bot.log"
+    kayit.write_text("\n".join(f"satir {i} OPUSDT" if i % 2 else f"satir {i} baska"
+                               for i in range(300)), encoding="utf-8")
+    # Config donmuş bir dataclass — alanı doğrudan yamalanamaz, kopyası konur.
+    with patch.object(panel, "CONFIG", replace(CONFIG, log_path=kayit)):
+        r = panel.bot_log(10)
+        assert r["var"] is True and len(r["satirlar"]) == 10
+        s = panel.bot_log(500, "OPUSDT")
+        assert all("OPUSDT" in x for x in s["satirlar"]), "filtre sızdırdı"
+        assert len(panel.bot_log(9999)["satirlar"]) <= 500, "üst sınır aşıldı"
+    with patch.object(panel, "CONFIG", replace(CONFIG, log_path=kok / "yok.log")):
+        assert panel.bot_log()["var"] is False   # dosya yoksa çökmemeli
+    ok("bot günlüğü ucu: kuyruk + filtre + üst sınır + dosyasızlık")
+
 
 def main() -> int:
     print("=" * 74)

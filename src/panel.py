@@ -19,6 +19,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from .config import CONFIG, PROJECT_ROOT
 from .exchange import MarketData
@@ -63,6 +64,38 @@ def bot_alive() -> bool:
     except ValueError:
         return False
     return age < HEARTBEAT_STALE_S
+
+
+def bot_log(n: int = 150, ara: str = "") -> dict:
+    """Bot günlüğünün SONU — salt okunur teşhis ucu.
+
+    NEDEN VAR: 2026-09-10'da "OP açıldı ama bildirim gelmedi" arızasında
+    sebebi bulmak için `data/bot.log` gerekti ve ssh kapalıydı; saatlerce
+    tahmin yürütüldü. Aynı ders `/api/deploy-durum` ile bir kez öğrenilmişti:
+    TEŞHİS EDİLEMEYEN KATMAN, KÖR NOKTADIR. Bu uç o kör noktayı kapatır.
+
+    Salt okunur; hiçbir şey çalıştırmaz, hiçbir şey değiştirmez.
+    """
+    yol = CONFIG.log_path
+    if not yol.exists():
+        return {"var": False, "not": f"günlük dosyası yok: {yol}", "satirlar": []}
+    n = max(1, min(int(n), 500))
+    try:
+        # Dosya 5MB'a kadar büyüyebilir (RotatingFileHandler); sonundan oku.
+        with open(yol, "rb") as f:
+            f.seek(0, 2)
+            boyut = f.tell()
+            f.seek(max(0, boyut - 400_000))
+            ham = f.read().decode("utf-8", errors="replace")
+        satirlar = ham.splitlines()
+        if ara:
+            # Düz alt dizgi araması — düzenli ifade DEĞİL (dışarıdan gelen
+            # desenle pahalı geri izleme riski almayalım).
+            kucuk = ara.lower()
+            satirlar = [s for s in satirlar if kucuk in s.lower()]
+        return {"var": True, "toplam": len(satirlar), "satirlar": satirlar[-n:]}
+    except Exception as e:  # noqa: BLE001
+        return {"var": False, "not": f"okunamadı: {e}", "satirlar": []}
 
 
 def telegram_saglik() -> dict:
@@ -1037,6 +1070,17 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 log.error("state hatası: %s", e)
                 self._send(500, "application/json", b'{"error":"state"}')
+        elif self.path.startswith("/api/bot-log"):
+            # Salt okunur teşhis: /api/bot-log?n=200&q=OPUSDT
+            try:
+                q = parse_qs(urlparse(self.path).query)
+                body = json.dumps(
+                    bot_log(int(q.get("n", ["150"])[0]), q.get("q", [""])[0]),
+                    ensure_ascii=False).encode("utf-8")
+                self._send(200, "application/json", body)
+            except Exception as e:  # noqa: BLE001
+                log.error("bot-log hatası: %s", e)
+                self._send(500, "application/json", b'{"error":"bot-log"}')
         elif self.path == "/api/borsa":
             try:
                 body = json.dumps(build_borsa_state(), ensure_ascii=False).encode("utf-8")
