@@ -22,6 +22,7 @@ from .analysis import analyzer_allows, assess
 from .config import Config
 from .exchange import MarketData, floor_to_step
 from .notifier import TelegramNotifier
+from .performans import ozet
 from .risk import CircuitBreaker
 from .state import Position, StateStore
 from .strategy import (check_entry, check_entry_short, compute_indicators, ema,
@@ -64,20 +65,58 @@ class FuturesPaperTrader:
         net = raw - pos.entry_fee_usdt - exit_fee - pos.funding_acc
         self._set_balance(self._balance() + pos.margin + raw - exit_fee - pos.funding_acc)
 
+        # ÇIKIŞ ETİKETİ — "izleyen stop" hem +%21'lik kazancın hem −%4'lük
+        # zararın çıkış sebebiydi; kayıtta ikisi AYNI görünüyordu. Bu sistemde
+        # tek çıkış kapısı stop olduğu için kullanıcı haklı olarak "her şey
+        # stopla bitiyor = hep kaybediyoruz" diye okuyordu. Kazanç ile zararın
+        # birbirine benzemesi, sessiz arızalar kadar tehlikeli bir okuma hatası.
+        etiket = f"{reason} · {'kâr kilitlendi' if net >= 0 else 'zarar kesildi'}"
+
         now = datetime.now(timezone.utc).isoformat()
         pnl_usdt, pnl_pct = self.state.record_trade(
             self.symbol, pos.entry_time, now, pos.entry_price, exit_price, pos.qty,
-            reason, side=pos.side, pnl_override=net,
+            etiket, side=pos.side, pnl_override=net,
         )
         self.state.clear_position(self.symbol)
         emoji = "🟢" if net >= 0 else "🔴"
         arrow = "📈 LONG" if pos.side == "LONG" else "📉 SHORT"
+        baslik = "KÂR KİLİTLENDİ" if net >= 0 else "ZARAR KESİLDİ"
+        # R cinsinden sonuç: "−1R" beklenen maliyet, "+3R" ise sistemin geçim
+        # kaynağıdır. Tek başına USDT rakamı bu farkı anlatmıyor.
+        r_metni = ""
+        if pos.risk_unit > 0 and pos.qty > 0:
+            r = ((exit_price - pos.entry_price) if pos.side == "LONG"
+                 else (pos.entry_price - exit_price)) / pos.risk_unit
+            r_metni = f" · `{r:+.2f}R`"
         self.notifier.send(
-            f"{emoji} *{self.symbol} {arrow} KAPANDI* ({reason})\n"
-            f"• Giriş: `${pos.entry_price:,.2f}` → Çıkış: `${exit_price:,.2f}`\n"
-            f"• Net PnL: `{net:+,.2f} USDT` (komisyon+funding dahil)"
+            f"{emoji} *{self.symbol} {arrow} — {baslik}*\n"
+            f"• Sebep: {reason}\n"
+            f"• Giriş: `${pos.entry_price:,.6g}` → Çıkış: `${exit_price:,.6g}`\n"
+            f"• Net PnL: `{net:+,.2f} USDT`{r_metni} (komisyon+funding dahil)\n"
+            f"• {self._seri_notu()}"
         )
-        log.info("[%s] %s kapandı (%s): net %+.2f USDT", self.symbol, pos.side, reason, net)
+        log.info("[%s] %s kapandı (%s): net %+.2f USDT", self.symbol, pos.side, etiket, net)
+
+    def _seri_notu(self) -> str:
+        """Kapanış mesajına tek satırlık bağlam: bu işlem yalnız mı, seri mi?
+
+        Amaç yatıştırmak değil ölçü vermek. Bu strateji çoğu işlemde zarar
+        eder; seriyi görmeden tek tek mesaj okumak insanı "sistem bozuldu"
+        sonucuna götürüyor — ve çalışan sistemi bozmaya.
+        """
+        try:
+            o = ozet(self.state.pnl_sirali())
+        except Exception:  # noqa: BLE001 — bildirim asla kapanışı bozmasın
+            return ""
+        seri = o["seri"]
+        if seri > 0:
+            durum = f"{seri} işlemdir kazanıyor"
+        elif seri < 0:
+            durum = f"{-seri} işlemdir zararda"
+        else:
+            durum = "ilk işlem"
+        return (f"Genel: {o['n']} işlem · kazanma %{o['kazanma_orani']} · "
+                f"beklenti `{o['beklenti']:+.2f}`/işlem · {durum}")
 
     def _stop_hit(self, pos: Position, price: float) -> bool:
         return price <= pos.trailing_stop if pos.side == "LONG" else price >= pos.trailing_stop

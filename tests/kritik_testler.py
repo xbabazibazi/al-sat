@@ -1053,6 +1053,71 @@ def test_canli_kapisi():
     ok("kâğıt ve testnet modları kapıdan etkilenmiyor [regresyon]")
 
 
+def test_performans_karnesi():
+    """2026-09-15: kullanıcı "bot para kazandırmıyor, her şey stopla bitiyor"
+    dedi. Kayda bakınca 7 işlemin 7'si de "izleyen stop"tu — ama ikisi +260 ve
+    +133 USDT KAZANÇTI. Bu sistemde tek çıkış kapısı stop olduğu için kazanç
+    ile zarar kayıtta AYNI görünüyordu. Bu testler o okuma hatasını yasaklar."""
+    print("\nSİSTEM KARNESİ (kazanç ile zarar aynı görünmemeli)")
+    from src.performans import ozet
+
+    # --- 1) Çıkış etiketi kazancı zarardan ayırmalı
+    state, notifier, trader, _ = kur()
+    p = poz(state, entry=100.0, stop=120.0, qty=10.0, risk_unit=3.0)
+    trader._close(p, 130.0, "izleyen stop")          # LONG 100 → 130 = KAZANÇ
+    kayit = state.recent_trades(1)[0]
+    assert kayit["pnl_usdt"] > 0, "kazanç işlemi zarar kaydedilmiş"
+    assert "kâr kilitlendi" in kayit["exit_reason"], kayit["exit_reason"]
+    assert "izleyen stop" in kayit["exit_reason"], "asıl sebep kaybolmamalı"
+    ok("kazançla kapanan stop 'kâr kilitlendi' diye kaydediliyor")
+
+    p = poz(state, entry=100.0, stop=96.0, qty=10.0, risk_unit=3.0)
+    trader._close(p, 96.0, "izleyen stop")           # LONG 100 → 96 = ZARAR
+    kayit = state.recent_trades(1)[0]
+    assert kayit["pnl_usdt"] < 0
+    assert "zarar kesildi" in kayit["exit_reason"], kayit["exit_reason"]
+    ok("zararla kapanan stop 'zarar kesildi' diye kaydediliyor")
+
+    mesajlar = [c.args[0] for c in notifier.send.call_args_list]
+    assert any("KÂR KİLİTLENDİ" in m for m in mesajlar), "kazanç mesajı ayrışmıyor"
+    assert any("ZARAR KESİLDİ" in m for m in mesajlar), "zarar mesajı ayrışmıyor"
+    assert any("R`" in m for m in mesajlar), "R cinsinden sonuç yazılmıyor"
+    ok("Telegram kapanış mesajı kazanç/zarar ve R'yi ayrı ayrı söylüyor")
+
+    # --- 2) Beklenti matematiği: az kazanan + yüksek ödeme = pozitif sistem
+    # Gerçek veri (2026-09-15): 5 zarar ~−67, 2 kazanç +261/+133 → net +59.
+    gercek = [-67.95, -78.39, 260.94, 133.32, -61.01, -39.24, -88.46]
+    o = ozet(gercek)
+    assert o["n"] == 7 and o["kazanan"] == 2
+    assert abs(o["toplam"] - 59.21) < 0.01, o["toplam"]
+    assert o["beklenti"] > 0, "pozitif beklentili seri negatif hesaplandı"
+    assert o["odeme_orani"] > 1.8, o["odeme_orani"]
+    ok("kazanma oranı düşükken bile beklenti pozitif hesaplanıyor")
+
+    assert o["seri"] == -3, f"son 3 zarar serisi görülmedi: {o['seri']}"
+    assert o["tepeden_dusus"] < 0, "gerçekleşen K/Z geri çekilmesi ölçülmüyor"
+    ok("zarar serisi ve tepeden düşüş ölçülüyor (körlük yok)")
+
+    # --- 3) Az örnekle strateji değiştirmeye karşı açık uyarı
+    assert "ANLAMSIZ" in o["yorum"], o["yorum"]
+    ok("7 işlemde 'istatistiksel olarak anlamsız' uyarısı veriliyor")
+
+    # --- 4) Sınır durumlar: boş liste ve tamamı zarar çökmemeli
+    bos = ozet([])
+    assert bos["n"] == 0 and bos["beklenti"] == 0 and bos["odeme_orani"] == 0
+    hep = ozet([-10.0, -10.0, -10.0])
+    assert hep["beklenti"] < 0 and hep["seri"] == -3
+    assert hep["odeme_orani"] == 0, "kazanç yokken ödeme oranı uydurulmamalı"
+    ok("boş geçmiş ve tamamı-zarar durumları çökmüyor [regresyon]")
+
+    # --- 5) Panel karneyi gerçekten yayınlıyor mu (sessiz kaybolma yasak)
+    from src import panel
+    assert 'id="perf"' in panel.PAGE and 'id="bPerf"' in panel.PAGE
+    assert "function perfKart" in panel.PAGE
+    assert "beklenen_en_uzun_zarar" in panel.PAGE, "seri bağlamı panelde yok"
+    ok("panel karneyi hem kripto hem borsa sekmesinde çiziyor")
+
+
 def main() -> int:
     print("=" * 74)
     print("  KRİTİK TESTLER — geçici DB, gerçek pozisyona DOKUNULMAZ")
@@ -1062,7 +1127,8 @@ def main() -> int:
                test_manuel_stop_gevsetme, test_short, test_komut_kuyrugu,
                test_komut_sonucu, test_panel_komut_seridi, test_panel_js,
                test_panel_saat, test_deploy_teshis, test_borsa_kanali,
-               test_telegram_saglik, test_canli_altyapi, test_canli_kapisi]
+               test_telegram_saglik, test_canli_altyapi, test_canli_kapisi,
+               test_performans_karnesi]
     for fn in testler:
         try:
             fn()

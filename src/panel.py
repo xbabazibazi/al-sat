@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .config import CONFIG, PROJECT_ROOT
 from .exchange import MarketData
+from .performans import ozet
 from .state import StateStore
 from .strategy import compute_indicators
 
@@ -399,6 +400,10 @@ def build_state() -> dict:
         "max_positions": CONFIG.max_concurrent_positions,
         "r_level": CONFIG.r_notify_level,
         "telegram": telegram_saglik(),
+        # Tek tek işlemlere bakınca bu strateji "hep kaybediyor" gibi görünür:
+        # işlemlerin çoğu zarardır, kâr az sayıda büyük kazançtan gelir. Karar
+        # duyguyla değil BEKLENTİYLE verilsin diye tablo panelde duruyor.
+        "performans": ozet(state.pnl_sirali()),
     }
 
 
@@ -504,6 +509,10 @@ def build_borsa_state() -> dict:
         "assessments": borsa_state.latest_assessments(),
         "trades": borsa_state.recent_trades(20),
         "symbols": list(CONFIG.borsa_symbols),
+        # NOT: iki cüzdan (USD + TRY) tek listede toplanıyor. Rakamlar farklı
+        # para birimlerinden geldiği için "toplam" anlamsızdır; anlamlı olan
+        # kazanma oranı, ödeme oranı ve seri — onlar birimsizdir.
+        "performans": ozet(borsa_state.pnl_sirali()),
     }
 
 
@@ -629,6 +638,7 @@ PAGE = """<!doctype html>
 </div>
 <div id="sayfaKripto">
 <div class="grid" id="stats"></div>
+<div class="card"><h2>Sistem Karnesi — tek işleme değil, beklentiye bak</h2><div id="perf"></div></div>
 <div class="card"><h2>Ön Değerlendirme — her mum kapanışında 5 araçlı analiz (incelemesiz giriş yok)</h2><div id="assess"></div></div>
 <div class="card"><h2>Açık Pozisyonlar — anlık kâr/zarar</h2><div id="komutlar"></div><div id="positions"></div></div>
 <div class="card"><h2>İzleme Listesi — tetiğe uzaklık</h2><div id="watch"></div></div>
@@ -638,6 +648,7 @@ PAGE = """<!doctype html>
 </div>
 <div id="sayfaBorsa" style="display:none">
 <div class="grid" id="bStats"></div>
+<div class="card"><h2>Sistem Karnesi — hisse (iki cüzdan birlikte)</h2><div id="bPerf"></div></div>
 <div class="card"><h2>Açık Pozisyonlar — hisse (sanal cüzdan)</h2><div id="bKomutlar"></div><div id="bPositions"></div></div>
 <div class="card"><h2>Ön Değerlendirme — günlük mum + haftalık teyit</h2><div id="bAssess"></div></div>
 <div class="card"><h2>Son İşlemler — hisse</h2><div id="bTrades"></div></div>
@@ -648,6 +659,43 @@ const money = v => (v<0?"−$":"$") + Math.abs(v).toLocaleString("tr-TR",{minimu
 const cls = v => v > 0 ? "up" : v < 0 ? "down" : "";
 const sign = v => (v>0?"+":"") + v.toLocaleString("tr-TR",{maximumFractionDigits:2});
 const kisa = v => (+v).toLocaleString("tr-TR",{maximumSignificantDigits:6});
+
+// SISTEM KARNESI. Bu strateji islemlerin cogunda zarar eder; kar az sayida
+// buyuk kazanctan gelir. Son islemlere tek tek bakan "hep kaybediyoruz" diye
+// okur ve CALISAN sistemi degistirmek ister. Karar duyguya degil beklentiye
+// baglansin diye tablo burada duruyor.
+function perfKart(p, birim) {
+  if (!p || !p.n) return `<div class="empty">Henüz kapanmış işlem yok</div>`;
+  const seriMetin = p.seri > 0 ? `${p.seri} işlemdir kazanıyor`
+                  : p.seri < 0 ? `${-p.seri} işlemdir zararda`
+                  :              "—";
+  const seriAlt = p.seri < 0
+    ? `bu uzunlukta seri olasılığı %${p.seri_olasilik} · ${p.n} işlemde beklenen en uzun: ${p.beklenen_en_uzun_zarar}`
+    : "üst üste sonuç";
+  const hedefKz = `hedef %${p.hedef_kazanma[0]}–${p.hedef_kazanma[1]}`;
+  const satir = [
+    ["Beklenti / işlem", sign(p.beklenti) + " " + birim,
+     p.beklenti > 0 ? "pozitif — sistemin motoru bu" : "NEGATİF", p.beklenti],
+    ["Kazanma oranı", "%" + p.kazanma_orani, `${p.kazanan}K / ${p.kaybeden}Z · ${hedefKz}`, 0],
+    ["Ödeme oranı", p.odeme_orani.toFixed(2) + "×",
+     `ort. kazanç ÷ ort. zarar · hedef ≥${p.hedef_odeme}`,
+     p.odeme_orani - p.hedef_odeme],
+    ["Ort. kazanç", sign(p.ort_kazanc) + " " + birim, `${p.kazanan} işlem`, 1],
+    ["Ort. zarar", "−" + Math.abs(p.ort_zarar).toLocaleString("tr-TR",{maximumFractionDigits:2}) + " " + birim,
+     `${p.kaybeden} işlem`, -1],
+    ["Seri", seriMetin, seriAlt, p.seri],
+    ["Tepeden düşüş", sign(p.tepeden_dusus) + " " + birim, "gerçekleşen K/Z zirvesinden", p.tepeden_dusus],
+  ].map(([l,v,s,c]) =>
+    `<div class="stat"><div class="l">${l}</div><div class="v ${cls(c)}">${v}</div><div class="s">${s}</div></div>`
+  ).join("");
+  return `<div class="grid">${satir}</div>
+    <div style="margin-top:10px;color:var(--ink2);font-size:13px;line-height:1.5">
+      ${p.yorum}<br>
+      <span style="color:var(--mut)">Bu sistemde TEK çıkış kapısı izleyen stoptur —
+      kazançlar da stopla kapanır. “Stop” zarar demek değildir; çıkış etiketi artık
+      <b>kâr kilitlendi</b> / <b>zarar kesildi</b> diye ayrılır.</span>
+    </div>`;
+}
 // ZAMAN. Sunucu her seyi UTC yazar; GOSTERIM tarayicinin saat diliminde yapilir.
 // Once panel "21:35 UTC" diyordu, kullanici saatine bakip 00:35 goruyordu ve
 // aradaki 3 saati kafadan ekliyordu. Sunucu saati dogruydu, sunum yanlisti.
@@ -726,6 +774,8 @@ async function refresh() {
   ].map(([l,v,s,c]) =>
     `<div class="stat"><div class="l">${l}</div><div class="v ${cls(c)}">${v}</div><div class="s">${s}</div></div>`
   ).join("");
+
+  $("perf").innerHTML = perfKart(d.performans, "USDT");
 
   $("assess").innerHTML = d.assessments.length ? "<table><tr>" +
     "<th>Parite</th><th>Karar</th><th>Skor</th><th style='text-align:left'>Araç Oyları</th><th>Zaman</th></tr>" +
@@ -978,6 +1028,10 @@ async function refreshBorsa() {
   `<div class="stat"><div class="l">Borsa Döngüsü</div>
    <div class="v" style="font-size:15px;color:${d.canli ? "var(--up)" : "var(--down)"}">${d.canli ? "ÇALIŞIYOR" : "BEKLEMEDE"}</div>
    <div class="s">${d.symbols.length} sembol · günlük mum · 5 dk tur</div></div>`;
+
+  // Birim yazmiyoruz: USD ve TRY islemleri ayni listede. Oran ve seri
+  // birimsizdir, anlamli olan onlar.
+  $("bPerf").innerHTML = perfKart(d.performans, "");
 
   $("bKomutlar").innerHTML = (d.komutlar || []).map(k => {
     const s = k.durum === "bekliyor" ? ["⏳", "var(--amber)"]

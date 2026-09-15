@@ -237,6 +237,15 @@ class StateStore:
         n, total, wins = cur.fetchone()
         return {"count": n, "total_pnl": total, "wins": wins}
 
+    def pnl_sirali(self) -> list[float]:
+        """Kapanmış işlemlerin net K/Z'si, ESKİDEN YENİYE.
+
+        Sıra önemli: zarar serisi ve tepeden düşüş hesabı buna dayanır
+        (bkz. performans.py).
+        """
+        cur = self._conn.execute("SELECT pnl_usdt FROM trades ORDER BY id ASC")
+        return [float(r[0]) for r in cur.fetchall()]
+
     # ------------------------------------------------------------ anahtar/değer
     def get_kv(self, key: str, default: str = "") -> str:
         cur = self._conn.execute("SELECT value FROM kv WHERE key=?", (key,))

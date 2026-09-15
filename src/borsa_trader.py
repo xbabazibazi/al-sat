@@ -95,22 +95,33 @@ class BorsaPaperTrader:
         net = raw - pos.entry_fee_usdt - exit_fee
         self._set_balance(self._balance() + pos.margin + raw - exit_fee)
 
+        # Kripto tarafıyla aynı gerekçe (bkz. futures_trader._close): tek çıkış
+        # kapısı stop olduğu için kazanç da zarar da "izleyen stop" yazıyordu.
+        etiket = f"{reason} · {'kâr kilitlendi' if net >= 0 else 'zarar kesildi'}"
+
         now = datetime.now(timezone.utc).isoformat()
         self.state.record_trade(
             self.symbol, pos.entry_time, now, pos.entry_price, exit_price, pos.qty,
-            reason, side=pos.side, pnl_override=net,
+            etiket, side=pos.side, pnl_override=net,
         )
         self.state.clear_position(self.symbol)
         s = SIMGE[self.cur]
         emoji = "🟢" if net >= 0 else "🔴"
         arrow = "📈 LONG" if pos.side == "LONG" else "📉 SHORT"
+        baslik = "KÂR KİLİTLENDİ" if net >= 0 else "ZARAR KESİLDİ"
+        r_metni = ""
+        if pos.risk_unit > 0 and pos.qty > 0:
+            r = ((exit_price - pos.entry_price) if pos.side == "LONG"
+                 else (pos.entry_price - exit_price)) / pos.risk_unit
+            r_metni = f" · `{r:+.2f}R`"
         self.notifier.send(
-            f"{emoji} *BORSA · {self.symbol} {arrow} KAPANDI* ({reason})\n"
+            f"{emoji} *BORSA · {self.symbol} {arrow} — {baslik}*\n"
+            f"• Sebep: {reason}\n"
             f"• Giriş: `{s}{pos.entry_price:,.2f}` → Çıkış: `{s}{exit_price:,.2f}`\n"
-            f"• Net PnL: `{net:+,.2f} {self.cur}` (komisyon dahil, sanal cüzdan)"
+            f"• Net PnL: `{net:+,.2f} {self.cur}`{r_metni} (komisyon dahil, sanal cüzdan)"
         )
         log.info("[%s] %s kapandı (%s): net %+.2f %s",
-                 self.symbol, pos.side, reason, net, self.cur)
+                 self.symbol, pos.side, etiket, net, self.cur)
 
     def _stop_exit_price(self, pos: Position, price: float) -> float | None:
         """Stop tetiklendiyse GERÇEKLEŞEN çıkış fiyatı; tetiklenmediyse None.
