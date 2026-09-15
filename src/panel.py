@@ -216,6 +216,156 @@ def _son_cron_kosusu() -> dict:
         return {"zaman": None, "yas_sn": None, "saglikli": False, "not": str(e)}
 
 
+SON_KONTROL = PROJECT_ROOT / "logs" / ".son-kontrol"
+GERILIK_BASI = PROJECT_ROOT / "logs" / ".gerilik-basladi"
+GERILIK_ALARM_DAMGASI = PROJECT_ROOT / "logs" / ".gerilik-bildirildi"
+# 15 dk = cron'un üç turu. Bir tur kaçmak gürültü, üç tur kaçmak arızadır.
+GERILIK_ESIGI_SN = 900
+GOZCU_PERIYOT_SN = 300
+
+# Gözcünün son turunun sonucu. /api/state bunu OKUR, hesaplamaz: ls-remote bir
+# ağ çağrısı ve panel 5 saniyede bir yenileniyor — sayfayı ağa bağlamayız.
+_dagitim_durum: dict = {"alarm": False, "sebep": "", "bakildi": None,
+                        "not": "gözcü henüz ilk turunu atmadı"}
+
+
+def _son_kontrol() -> dict:
+    """Güncelleme betiği bir kontrolü TAMAMLADI mı? Kalp atışı bunu söyleyemez.
+
+    `.son-kosu` yalnızca "cron tetikledi" demek. 2026-09-15'te beş gün boyunca
+    taptazeydi ve panel "cron: sağlıklı" diyordu; oysa betik sızmış bir kilitte
+    takılıp her turda sessizce çıkıyordu — tek fetch bile yapmadı. Bu damga
+    betiğin SONUNDA yazılır ve neyi neyle karşılaştırdığını da taşır. İkisi
+    birlikte "tetiklendi" ile "işini yaptı"yı ayırır.
+    """
+    try:
+        parcalar = SON_KONTROL.read_text(encoding="utf-8").strip().split()
+        ts = parcalar[0]
+        yas = (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds()
+        return {"zaman": ts, "yas_sn": int(yas),
+                "yerel": parcalar[1] if len(parcalar) > 1 else None,
+                "uzak": parcalar[2] if len(parcalar) > 2 else None,
+                "sonuc": parcalar[3] if len(parcalar) > 3 else None,
+                "saglikli": yas < GERILIK_ESIGI_SN}
+    except FileNotFoundError:
+        return {"zaman": None, "yas_sn": None, "saglikli": False,
+                "not": "hiç kontrol tamamlanmamış (damga yok)"}
+    except Exception as e:  # noqa: BLE001 — teşhis aracı asla patlamamalı
+        return {"zaman": None, "yas_sn": None, "saglikli": False, "not": str(e)}
+
+
+def _dagitim_degerlendir(yerel: str | None, uzak: str | None, gerilik_sn: int | None,
+                         son_kontrol: dict, gozcu_yasi_sn: float) -> dict:
+    """Saf karar fonksiyonu: alarm çalmalı mı, neden? (I/O yok → sınanabilir)
+
+    İKİ AYRI ARIZA, İKİ AYRI CÜMLE:
+      1) GERİDE — sunucudaki sha GitHub'ınkinden farklı ve bu ~15 dk sürdü.
+         Kod gelmiyor demektir (kilit, ağ, ya da testte takılan bir commit).
+      2) KONTROL DURDU — betik hiç tamamlanmış kontrol damgası bırakmıyor.
+         Bu, henüz yeni commit yokken bile döngünün öldüğünü yakalar; asıl
+         2026-09-15 arızası tam olarak buydu ve hiçbir gösterge kırmızı olmadı.
+    """
+    geride = bool(yerel and uzak and yerel != uzak)
+    sebepler: list[str] = []
+
+    if geride and gerilik_sn is not None and gerilik_sn > GERILIK_ESIGI_SN:
+        etiket = son_kontrol.get("sonuc")
+        neden = f" (son kontrol sonucu: {etiket})" if etiket and etiket != "guncel" else ""
+        sebepler.append(
+            f"sunucu {gerilik_sn // 60} dakikadır GitHub'ın gerisinde: "
+            f"{(yerel or '?')[:7]} ≠ {(uzak or '?')[:7]}{neden}")
+
+    yas = son_kontrol.get("yas_sn")
+    # Damga yoksa hemen bağırmayız: bu sürüm yeni kurulmuş olabilir, betik en geç
+    # 5 dk içinde ilk damgasını bırakır. Ama gözcü eşik kadar beklediyse artık
+    # "henüz yazılmadı" değil, "hiç yazılmıyor" demektir.
+    if yas is None:
+        if gozcu_yasi_sn > GERILIK_ESIGI_SN:
+            sebepler.append("güncelleme betiği hiç tamamlanmış kontrol bırakmadı "
+                            "— döngü çalışmıyor")
+    elif yas > GERILIK_ESIGI_SN:
+        sebepler.append(f"son TAMAMLANAN kontrol {yas // 60} dakika önce — "
+                        f"cron tetikleniyor ama betik işini bitiremiyor")
+
+    return {"yerel": yerel, "uzak": uzak, "geride": geride,
+            "gerilik_sn": gerilik_sn, "son_kontrol": son_kontrol,
+            "alarm": bool(sebepler), "sebep": " · ".join(sebepler)}
+
+
+def _gerilik_suresi(geride: bool, simdi: datetime) -> int | None:
+    """Gerilik ne zaman başladı? Dosyada tutulur, bellekte DEĞİL.
+
+    NEDEN DOSYA: panel nöbetçisi (cron, 5 dk) paneli yeniden başlatabiliyor.
+    Süre bellekte tutulsaydı her restart sayacı sıfırlar ve 15 dakikalık eşiğe
+    asla ulaşılmazdı — alarm sonsuza kadar susardı. Tam da kaçındığımız şey.
+    """
+    if not geride:
+        GERILIK_BASI.unlink(missing_ok=True)
+        GERILIK_ALARM_DAMGASI.unlink(missing_ok=True)
+        return None
+    try:
+        bas = datetime.fromisoformat(GERILIK_BASI.read_text(encoding="utf-8").strip())
+    except Exception:  # noqa: BLE001 — yok ya da bozuk: şimdi başlat
+        GERILIK_BASI.write_text(simdi.isoformat(), encoding="utf-8")
+        return 0
+    return int((simdi - bas).total_seconds())
+
+
+def dagitim_gozcusu() -> None:
+    """Döngünün DIŞINDAN bakan gözcü — arızayı arızalı olanın kendisi bildirmez.
+
+    Güncelleme betiği kilitte takıldığında kendi sessizliğini duyuramaz; o yüzden
+    kontrolü panel yapıyor. Panel ayrı bir süreç, ayrı bir cron satırı ve ayrı bir
+    nöbetçiyle ayakta — ikisinin aynı anda ölmesi için iki ayrı arıza gerekir.
+    """
+    basladi = time.time()
+    while True:
+        try:
+            yerel = _kabuk("git", "rev-parse", "HEAD")
+            uzak = _kabuk("git", "ls-remote", "--heads", "origin", "main", sure=45)
+            y = yerel["cikti"].strip() if yerel["kod"] == 0 else None
+            # ls-remote çıktısı "<sha>\trefs/heads/main"
+            u = uzak["cikti"].split()[0] if uzak["kod"] == 0 and uzak["cikti"] else None
+            simdi = datetime.now(timezone.utc)
+            geride = bool(y and u and y != u)
+            sonuc = _dagitim_degerlendir(
+                y, u, _gerilik_suresi(geride, simdi), _son_kontrol(),
+                time.time() - basladi)
+            sonuc["bakildi"] = simdi.isoformat(timespec="seconds")
+            global _dagitim_durum
+            _dagitim_durum = sonuc
+            _gerilik_bildir(sonuc)
+        except Exception as e:  # noqa: BLE001 — gözcü asla ölmemeli
+            log.error("Dağıtım gözcüsü hatası: %s", e)
+        time.sleep(GOZCU_PERIYOT_SN)
+
+
+def _gerilik_bildir(sonuc: dict) -> None:
+    """Alarmı Telegram'a BİR KEZ gönderir (damga dosyası), düzelince damgayı siler.
+
+    Her 5 dakikada bir aynı mesajı atmak uyarıyı gürültüye çevirir; gürültü de
+    tıpkı sessizlik gibi görmezden gelinir.
+    """
+    if not sonuc.get("alarm"):
+        GERILIK_ALARM_DAMGASI.unlink(missing_ok=True)
+        return
+    if GERILIK_ALARM_DAMGASI.exists():
+        return
+    try:
+        from .notifier import TelegramNotifier
+        TelegramNotifier(CONFIG.telegram_token, CONFIG.telegram_chat_id).send_error(
+            "⛔️ OTOMATİK GÜNCELLEME DÖNGÜSÜ ARIZALI\n"
+            f"{sonuc.get('sebep', '')}\n\n"
+            "Sunucu yeni kodu çekmiyor. Bot çalışmaya devam ediyor ama ESKİ sürümle.\n"
+            "Teşhis: /api/deploy-durum")
+        GERILIK_ALARM_DAMGASI.write_text(
+            datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+        log.error("Dağıtım gerilik alarmı gönderildi: %s", sonuc.get("sebep"))
+    except Exception as e:  # noqa: BLE001
+        # Telegram da bozuksa panel bandı hâlâ kırmızı — tek kanala bağlı değiliz.
+        log.error("Gerilik alarmı gönderilemedi: %s", e)
+
+
 def deploy_durum() -> dict:
     satirlar: list[str] = []
     try:
@@ -229,6 +379,10 @@ def deploy_durum() -> dict:
         "uzak_dal": _kabuk("git", "ls-remote", "--heads", "origin", "main", sure=45),
         "crontab": _kabuk("crontab", "-l"),
         "son_cron_kosusu": _son_cron_kosusu(),
+        # "cron tetiklendi" (üstteki) ile "betik işini bitirdi" (alttaki) AYRI
+        # sorulardır. 2026-09-15'te ilki yeşilken ikincisi beş gündür ölüydü.
+        "son_kontrol": _son_kontrol(),
+        "dagitim": _dagitim_durum,
         # Kilit tutulu mu? Guncelleme betigi `flock -n 9 || exit 0` ile cikar;
         # kilit sizarsa (bkz. 9>&- notu) her tur SESSIZCE olur. Kilidi tutan
         # sizmis bir tanitici olabilir: flock acik dosya TANIMINA baglidir ve
@@ -400,6 +554,8 @@ def build_state() -> dict:
         "max_positions": CONFIG.max_concurrent_positions,
         "r_level": CONFIG.r_notify_level,
         "telegram": telegram_saglik(),
+        # Dağıtım döngüsünün sağlığı. Gözcünün hazır sonucu okunur (ağ beklemez).
+        "dagitim": _dagitim_durum,
         # Tek tek işlemlere bakınca bu strateji "hep kaybediyor" gibi görünür:
         # işlemlerin çoğu zarardır, kâr az sayıda büyük kazançtan gelir. Karar
         # duyguyla değil BEKLENTİYLE verilsin diye tablo panelde duruyor.
@@ -619,6 +775,7 @@ PAGE = """<!doctype html>
   .uyari .n { color:var(--ink2); font-size:12.5px; }
 </style></head><body>
 <div class="uyari" id="tgUyari"></div>
+<div class="uyari" id="dagUyari"></div>
 <div class="top">
   <h1><span class="pulse" id="pulse"></span>AL-SAT Paneli</h1>
   <span class="chip" id="mode"></span>
@@ -750,6 +907,22 @@ async function refresh() {
       el.className = "uyari bilinmiyor goster";
       el.innerHTML = `<span>❔</span><div><b>Telegram durumu bilinmiyor</b>
         <div class="n">${kacir(t.sebep || "")}</div></div>`;
+    } else { el.className = "uyari"; } }
+
+  // DAGITIM DONGUSU. 2026-09-15: sunucu bes gun boyunca yeni kod cekmedi ve uc
+  // gosterge birden yesil kaldi (kalp atisi taze, git "geride degilsin", panel
+  // "cron: saglikli"). Basarisizlik basariyla ayni gorunmesin diye bu bant var.
+  { const g = d.dagitim || {}; const el = $("dagUyari");
+    if (g.alarm) {
+      el.className = "uyari goster";
+      el.innerHTML = `<span>⛔</span><div><b>Otomatik güncelleme DÖNGÜSÜ arızalı</b>
+        <div class="n">${kacir(g.sebep || "sebep bilinmiyor")} · bot çalışmaya
+        devam eder ama ESKİ sürümle. Teşhis: <code>/api/deploy-durum</code></div></div>`;
+    } else if (!g.bakildi) {
+      // Gozcu henuz bakmadi: "sorun yok" DEGIL, "bilinmiyor". Ikisi ayri.
+      el.className = "uyari bilinmiyor goster";
+      el.innerHTML = `<span>❔</span><div><b>Dağıtım döngüsü henüz kontrol edilmedi</b>
+        <div class="n">${kacir(g.not || "gözcü ilk turunu bekliyor")}</div></div>`;
     } else { el.className = "uyari"; } }
 
   $("pulse").className = "pulse" + (d.bot_running ? "" : " off");
@@ -1251,6 +1424,7 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     threading.Thread(target=watchdog, daemon=True).start()
+    threading.Thread(target=dagitim_gozcusu, daemon=True).start()
     addr = (CONFIG.panel_host, CONFIG.panel_port)
     server = ThreadingHTTPServer(addr, Handler)
     print(f"Panel hazır: http://{CONFIG.panel_host}:{CONFIG.panel_port}  (Ctrl+C ile durdurun)")

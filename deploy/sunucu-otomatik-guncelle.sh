@@ -95,15 +95,80 @@ cd "$PROJE" || { kayit "HATA: $PROJE yok"; exit 1; }
 # tetiklendi" bilgisi kaydedilsin — yoksa iki ayri ariza ayni sessizligi uretir.
 date -u '+%Y-%m-%dT%H:%M:%S+00:00' > "${PROJE}/logs/.son-kosu"
 
+# KONTROL DAMGASI — kalp atisinin yapamadigi seyi yapar.
+# .son-kosu yalnizca "cron TETIKLEDI" der. Bu damga "kontrol TAMAMLANDI" der ve
+# neyi neyle karsilastirdigini yazar. 2026-09-15 dersi: kalp atisi bes gun boyunca
+# taptazeydi, panel "cron: saglikli" diyordu, ama betik kilitte takilip her turda
+# sessizce cikiyordu. Tek damgayla "tetiklendi" ile "isini yapti" ayni goruntuyu
+# uretiyordu; ikinci damga ikisini birbirinden ayirir.
+kontrol_damgasi() {   # $1=yerel sha  $2=uzak sha  $3=sonuc etiketi
+  printf '%s %s %s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%S+00:00')" "$1" "$2" "$3" \
+    > "${PROJE}/logs/.son-kontrol"
+}
+
+# ---------------------------------------------------------------------- KILIT
 # Ayni anda iki guncelleme calismasin (cron ust uste binebilir).
-exec 9>"${PROJE}/logs/.guncelle.lock"
-flock -n 9 || exit 0
+#
+# 2026-09-15 ARIZASI — bu blogun varlik sebebi:
+#   09-10'daki basarili dagitimdan sonra fd 9 uzun omurlu bir alt surece sizdi.
+#   flock acik dosya TANIMINA baglidir; tanitici yasadikca kilit tutulu kalir.
+#   Sonuc: BES GUN boyunca her cron turu kalp atisini yazdi, sonra `flock -n 9 ||
+#   exit 0` ile SESSIZCE cikti. git fetch hic calismadigi icin origin/main de
+#   bayat kaldi; `git status` "geride degilsin" dedi, panel "cron: saglikli" dedi.
+#   Uc gosterge de yesildi, dongu oluydu.
+#
+# IKI DUZELTME:
+#   1) Kilidi alan surecin PID'i yan dosyaya yazilir. Kilit alinamazsa sahibine
+#      bakilir: sahip OLU ya da bu betigin bir ornegi DEGILSE kilit sizmistir.
+#   2) Sizmis kilit KURTARILABILIR: flock dosyanin INODE'una baglidir, adina
+#      degil. Dosyayi silip yeniden acmak yeni bir inode verir; sizdiran surec
+#      eski inode'u tutmaya devam eder ama kimseyi engellemez.
+# Ve en onemlisi: bu yoldan cikis artik ASLA sessiz degil.
+KILIT="${PROJE}/logs/.guncelle.lock"
+KILIT_PID="${PROJE}/logs/.guncelle.lock.pid"
+
+kilit_al() {
+  exec 9>"$KILIT"
+  if flock -n 9; then echo "$$" > "$KILIT_PID"; return 0; fi
+
+  local sahip; sahip=$(cat "$KILIT_PID" 2>/dev/null || true)
+  # Sahip gercekten calisan bir guncelleme mi? /proc/PID/cmdline NUL ayracli,
+  # o yuzden grep -a ile ham okuyoruz.
+  if [ -n "$sahip" ] && kill -0 "$sahip" 2>/dev/null \
+     && grep -qa "sunucu-otomatik-guncelle" "/proc/${sahip}/cmdline" 2>/dev/null; then
+    kayit "Kilit ${sahip} nolu canli guncellemede — bu tur atlandi (normal)"
+    return 1
+  fi
+
+  kayit "!! KILIT SIZMIS — sahip='${sahip:-bilinmiyor}' canli bir guncelleme degil."
+  kayit "   Kilit dosyasi yenileniyor (yeni inode); sizan tanitici artik engellemeyecek."
+  rm -f "$KILIT"
+  exec 9>"$KILIT"
+  if ! flock -n 9; then
+    kayit "!! Kilit yenilendi ama yine alinamadi — tur atlandi, sebep bilinmiyor"
+    return 1
+  fi
+  echo "$$" > "$KILIT_PID"
+  BILDIR_MESAJ="🔓 Otomatik guncelleme KILITTE TAKILMISTI, kurtarildi.
+Sizan bir dosya taniticisi kilidi tutuyordu; bu sure boyunca sunucu yeni kod
+CEKMEDI ve bunu kimseye soylemedi. Kilit yenilendi, dongu devam ediyor." \
+    BILDIR_TIP=send_error bildir
+  kayit "   Kilit kurtarildi, guncellemeye devam ediliyor."
+  return 0
+}
+
+kilit_al || exit 0
 
 # ---------------------------------------------------------------- yeni kod var mi
+# Damga YAZILMAZ: fetch patladiysa kontrol TAMAMLANMAMISTIR. Damgayi yine de
+# yazsaydik "her sey yolunda" derdik — tam da kacindigimiz yalan bu.
 git fetch origin "$DAL" --quiet 2>/dev/null || { kayit "fetch basarisiz (ag?)"; exit 0; }
 YEREL=$(git rev-parse HEAD)
 UZAK=$(git rev-parse "origin/${DAL}")
-[ "$YEREL" = "$UZAK" ] && exit 0        # degisiklik yok, sessizce cik
+if [ "$YEREL" = "$UZAK" ]; then
+  kontrol_damgasi "$YEREL" "$UZAK" guncel   # log'a yazmaz ama damgayi tazeler
+  exit 0
+fi
 
 kayit "Yeni surum: ${YEREL:0:7} -> ${UZAK:0:7}"
 
@@ -143,6 +208,7 @@ Panel okunamiyor: ${PANEL}
 Acik pozisyonlar dogrulanamadigi icin yeni kod uygulanmadi.
 Bot eski surumde calismaya devam ediyor." BILDIR_TIP=send_error bildir
   fi
+  kontrol_damgasi "$YEREL" "$UZAK" ertelendi-panel
   exit 0
 fi
 rm -f "$DAMGA"
@@ -163,6 +229,7 @@ if ! "$PY" -m tests.kritik_testler >> "$LOG" 2>&1; then
   BILDIR_MESAJ="⛔️ Otomatik guncelleme DURDURULDU — ${UZAK:0:7} testleri gecemedi.
 Bot eski surumde (${YEREL:0:7}) calismaya devam ediyor.
 Detay: logs/otomatik-guncelle.log" BILDIR_TIP=send_error bildir
+  kontrol_damgasi "$YEREL" "$UZAK" test-basarisiz
   exit 1
 fi
 kayit "Testler gecti."
@@ -197,4 +264,7 @@ BILDIR_MESAJ="🚀 Otomatik guncelleme ${YEREL:0:7} → ${UZAK:0:7}
 • Testler: gecti
 • ${DURUM}" BILDIR_TIP="$TIP" bildir
 
+# Artik yereldeki surum UZAK'a esit — damga bunu yazar ki panel "geride" alarmini
+# dusursun. Damgadaki iki sha esitse dongu saglikli demektir.
+kontrol_damgasi "$UZAK" "$UZAK" dagitildi
 kayit "Tamamlandi."

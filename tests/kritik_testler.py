@@ -21,6 +21,7 @@ Kapsam (gerçek DB'ye DOKUNMAZ, geçici dosya kullanır):
   - Panel JS: gömülü script ayrışıyor mu, aradığı id'ler var mı
   - Zaman: damgalar ofsetli gidiyor mu (kırpılırsa 3 saat sessizce kayar)
   - Dağıtım teşhisi: /api/deploy-durum çökmeden durum veriyor mu
+  - Dağıtım gerilik alarmı: döngü ölünce panel kırmızıya dönüyor mu
 
     python -m tests.kritik_testler
 """
@@ -599,6 +600,123 @@ def test_deploy_teshis():
         ok("bozuk damga → çökmüyor, sağlıksız sayıyor")
 
 
+def test_dagitim_gerilik_alarmi():
+    """Dağıtım döngüsü öldüğünde bunu PANEL bağırmalı — ölen kendini duyuramaz.
+
+    2026-09-15 ARIZASI: sızmış bir dosya tanıtıcısı `flock`u tutuyordu; güncelleme
+    betiği BEŞ GÜN boyunca her cron turunda kalp atışını yazıp sessizce çıktı.
+    Tek fetch bile yapmadığı için `origin/main` de bayat kaldı ve üç gösterge
+    birden yeşil göründü: kalp atışı taze, `git status` "geride değilsin",
+    panel "cron: sağlıklı". Bu dosyanın değişmez dersi: başarısızlık başarıyla
+    aynı görünmemeli.
+
+    Buradaki testler iki şeyi çivilyor:
+      1) "cron tetiklendi" ile "kontrol tamamlandı" ayrı ayrı ölçülüyor,
+      2) gerilik sayacı panel yeniden başlayınca SIFIRLANMIYOR (nöbetçi paneli
+         5 dakikada bir diriltebiliyor; bellekte tutulsa eşiğe hiç varılmazdı).
+    """
+    print("\nDAĞITIM GERİLİK ALARMI")
+    from src import panel
+
+    TAZE = {"zaman": "x", "yas_sn": 60, "saglikli": True, "sonuc": "guncel"}
+    AYNI = "a" * 40
+
+    # --- 1) Her şey yolunda: alarm YOK (yanlış alarm da güveni öldürür)
+    d = panel._dagitim_degerlendir(AYNI, AYNI, None, TAZE, 99999)
+    assert d["alarm"] is False and d["geride"] is False, d
+    ok("yerel = uzak ve kontrol taze → alarm yok")
+
+    # --- 2) Geride ama HENÜZ kısa süredir: alarm yok (tek tur kaçmak gürültü)
+    d = panel._dagitim_degerlendir("a" * 40, "b" * 40, 300, TAZE, 99999)
+    assert d["geride"] is True and d["alarm"] is False, d
+    ok("5 dakikadır geride → henüz alarm yok (eşik 15 dk)")
+
+    # --- 3) Eşiği aştı: alarm ve sebepte İKİ sha da görünmeli
+    d = panel._dagitim_degerlendir("a" * 40, "b" * 40, 1200, TAZE, 99999)
+    assert d["alarm"] is True and "aaaaaaa" in d["sebep"] and "bbbbbbb" in d["sebep"]
+    assert "20 dakika" in d["sebep"], d["sebep"]
+    ok("20 dakikadır geride → alarm, sebepte süre ve iki sürüm birden")
+
+    # --- 4) ASIL ARIZA: yeni commit YOK ama betik kontrolü bitiremiyor.
+    # Gerilik yok, yine de alarm çalmalı — 2026-09-15'te tam olarak bu oldu.
+    bayat = {"zaman": "x", "yas_sn": 5 * 86400, "saglikli": False}
+    d = panel._dagitim_degerlendir(AYNI, AYNI, None, bayat, 99999)
+    assert d["geride"] is False and d["alarm"] is True, d
+    assert "bitiremiyor" in d["sebep"], d["sebep"]
+    ok("sha'lar eşit ama kontrol 5 gündür bitmiyor → alarm [2026-09-15 regresyonu]")
+
+    # --- 5) Damga yoksa: yeni kurulumda SUSMALI, uzun süredir yoksa BAĞIRMALI
+    yok = {"zaman": None, "yas_sn": None, "saglikli": False}
+    assert panel._dagitim_degerlendir(AYNI, AYNI, None, yok, 60)["alarm"] is False
+    ok("damga yok + gözcü yeni başladı → alarm yok (taze kurulum yanlış alarm vermez)")
+    d = panel._dagitim_degerlendir(AYNI, AYNI, None, yok, 1200)
+    assert d["alarm"] is True and "hiç tamamlanmış kontrol" in d["sebep"]
+    ok("damga yok + 20 dakika geçti → alarm (hiç yazılmıyor demektir)")
+
+    kok = Path(tempfile.mkdtemp())
+    (kok / "logs").mkdir()
+    with patch.object(panel, "SON_KONTROL", kok / "logs" / ".son-kontrol"), \
+         patch.object(panel, "GERILIK_BASI", kok / "logs" / ".gerilik-basladi"), \
+         patch.object(panel, "GERILIK_ALARM_DAMGASI", kok / "logs" / ".gerilik-bildirildi"):
+
+        # --- 6) Damga okuma: betiğin yazdığı biçim birebir ayrışmalı
+        assert panel._son_kontrol()["saglikli"] is False
+        ok("kontrol damgası yoksa 'sağlıklı' denmiyor")
+
+        zaman = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        panel.SON_KONTROL.write_text(f"{zaman} {AYNI} {AYNI} guncel\n", encoding="utf-8")
+        s = panel._son_kontrol()
+        assert s["saglikli"] is True and s["sonuc"] == "guncel" and s["yerel"] == AYNI
+        ok("betiğin yazdığı damga ayrışıyor: zaman + iki sha + sonuç etiketi")
+
+        eski = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        panel.SON_KONTROL.write_text(f"{eski} {AYNI} {AYNI} guncel\n", encoding="utf-8")
+        assert panel._son_kontrol()["saglikli"] is False
+        ok("3 saatlik damga → sağlıksız (kalp atışı taze olsa bile)")
+
+        panel.SON_KONTROL.write_text("bozuk içerik", encoding="utf-8")
+        assert panel._son_kontrol()["saglikli"] is False
+        ok("bozuk damga → çökmüyor, sağlıksız sayıyor")
+
+        # --- 7) GERİLİK SAYACI DİSKTE: panel restart'ı sayacı sıfırlamamalı
+        t0 = datetime.now(timezone.utc)
+        assert panel._gerilik_suresi(True, t0) == 0
+        assert panel.GERILIK_BASI.exists(), "gerilik başlangıcı diske yazılmadı"
+        # 20 dakika sonra panel yeniden başlamış gibi (bellek yok, sadece dosya)
+        assert panel._gerilik_suresi(True, t0 + timedelta(minutes=20)) == 1200
+        ok("gerilik sayacı diskte tutuluyor → panel restart'ı eşiği sıfırlamıyor")
+
+        # Gerilik bitince iz KALMAMALI, yoksa alarm bir daha hiç susmaz.
+        panel.GERILIK_ALARM_DAMGASI.write_text("x", encoding="utf-8")
+        assert panel._gerilik_suresi(False, t0) is None
+        assert not panel.GERILIK_BASI.exists() and not panel.GERILIK_ALARM_DAMGASI.exists()
+        ok("gerilik kapanınca sayaç ve alarm damgası siliniyor")
+
+        # --- 8) Telegram: alarm BİR KEZ gider (her 5 dk tekrar = gürültü = görmezden gelme)
+        with patch("src.notifier.TelegramNotifier") as sahte:
+            panel._gerilik_bildir({"alarm": True, "sebep": "test"})
+            panel._gerilik_bildir({"alarm": True, "sebep": "test"})
+            assert sahte.return_value.send_error.call_count == 1, "alarm tekrar tekrar gitti"
+            mesaj = sahte.return_value.send_error.call_args[0][0]
+            assert "ESKİ sürümle" in mesaj and "deploy-durum" in mesaj
+        ok("gerilik alarmı Telegram'a BİR KEZ gidiyor, ne yapılacağını da yazıyor")
+
+        # Telegram patlasa bile gözcü ölmemeli — panel bandı ikinci kanal.
+        with patch("src.notifier.TelegramNotifier", side_effect=OSError("ağ yok")):
+            panel.GERILIK_ALARM_DAMGASI.unlink(missing_ok=True)
+            panel._gerilik_bildir({"alarm": True, "sebep": "test"})
+        ok("Telegram bozuksa alarm yutuluyor ama gözcü çökmüyor (bant hâlâ kırmızı)")
+
+    # --- 9) Uçlar ve panel bandı: veri yayınlanmazsa alarm görünmez
+    d = panel.deploy_durum()
+    assert "son_kontrol" in d and "dagitim" in d, "teşhis ucunda yeni alanlar yok"
+    ok("/api/deploy-durum hem kontrol damgasını hem gerilik durumunu yayınlıyor")
+    assert "function dagitim" in panel.PAGE or 'id="dagUyari"' in panel.PAGE
+    assert "d.dagitim" in panel.PAGE, "panel gerilik durumunu okumuyor"
+    assert "DÖNGÜSÜ arızalı" in panel.PAGE, "kırmızı bant metni yok"
+    ok("panelde kırmızı dağıtım bandı var ve /api/state'ten besleniyor")
+
+
 # ------------------------------------------------------------- BORSA kanalı
 def borsa_kur(sembol="NVDA"):
     """İzole borsa trader'ı — ağ YOK, market sahte."""
@@ -1126,7 +1244,8 @@ def main() -> int:
                test_manuel_stop_ret, test_manuel_stop_sikma,
                test_manuel_stop_gevsetme, test_short, test_komut_kuyrugu,
                test_komut_sonucu, test_panel_komut_seridi, test_panel_js,
-               test_panel_saat, test_deploy_teshis, test_borsa_kanali,
+               test_panel_saat, test_deploy_teshis, test_dagitim_gerilik_alarmi,
+               test_borsa_kanali,
                test_telegram_saglik, test_canli_altyapi, test_canli_kapisi,
                test_performans_karnesi]
     for fn in testler:
