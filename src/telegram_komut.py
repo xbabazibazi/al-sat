@@ -302,11 +302,16 @@ class TelegramKomut:
         Kaydedilmezse komutlar ÇALIŞIR ama görünmez; ezberden yazmak gerekir.
         Görünmeyen yetenek, olmayan yetenekle aynı kapıya çıkıyor.
         """
-        if self._cagir("setMyCommands", commands=MENU) is None:
+        # KAPSAM sahibin sohbeti. Küresel kaydedilseydi bota yazan HERKES
+        # komut listesini görürdü. Yetkiyi tek kişide tutup listeyi herkese
+        # göstermek tutarsız olurdu — görünmeyen kapı denenmez.
+        kapsam = {"type": "chat", "chat_id": int(self.sahip)}
+        if self._cagir("setMyCommands", commands=MENU, scope=kapsam) is None:
             log.warning("Telegram komut menüsü kaydedilemedi — komutlar yine de "
                         "elle yazılarak çalışır")
         else:
-            log.info("Telegram komut menüsü kaydedildi (%d komut)", len(MENU))
+            log.info("Telegram komut menüsü kaydedildi (%d komut, yalnız sahibe)",
+                     len(MENU))
 
     def calistir(self) -> None:
         if not (self.cfg.telegram_token and self.sahip):

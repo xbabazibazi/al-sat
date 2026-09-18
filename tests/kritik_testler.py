@@ -1360,6 +1360,12 @@ def test_telegram_komut():
     assert all(c.get("description") for c in menu[0]["commands"]), "açıklamasız komut var"
     ok("komut menüsü Telegram'a kaydediliyor ('/' menüsünde görünür)")
 
+    # Menü SAHİBİN sohbetine kapsamlanmalı: küresel olsaydı bota yazan herkes
+    # komut listesini görürdü. Yetki tek kişideyse liste de tek kişiye.
+    assert menu[0].get("scope", {}).get("type") == "chat", menu[0].get("scope")
+    assert str(menu[0]["scope"]["chat_id"]) == "555", menu[0]["scope"]
+    ok("menü yalnız sahibin sohbetine kapsamlanıyor (yabancı listeyi görmez)")
+
     # --- Kapalıyken token/chat yoksa katman hiç açılmamalı
     sessiz = TelegramKomut(replace(CONFIG, telegram_token="", telegram_chat_id=""),
                            state, None, market)
