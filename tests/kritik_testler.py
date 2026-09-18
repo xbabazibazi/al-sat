@@ -1236,6 +1236,127 @@ def test_performans_karnesi():
     ok("panel karneyi hem kripto hem borsa sekmesinde çiziyor")
 
 
+def test_telegram_komut():
+    """Telefondan pozisyon kapatabilen bir kapı açtık. Bu kapının yanlış
+    açılması, botun yanlış işlem açmasından daha pahalıya patlar: yabancı
+    komut çalışırsa ya da kazara /kapat gönderilirse para gider.
+    Buradaki her test o kapının bir kilidini sınıyor."""
+    print("\nTELEGRAM KOMUT KATMANI (yetki + onay)")
+    from src.telegram_komut import OFFSET_ANAHTARI, TelegramKomut
+
+    state, _, _, _ = kur()
+    poz(state, sym="SOLUSDT", entry=100.0, stop=96.0, side="LONG")
+    cfg = replace(CONFIG, telegram_token="t", telegram_chat_id="555",
+                  symbols=("SOLUSDT", "BTCUSDT"))
+    market = MagicMock()
+    market.last_price.return_value = 104.0
+    k = TelegramKomut(cfg, state, None, market)
+
+    # --- /durum ANLIK veri vermeli (kayıtlı değil, canlı fiyat)
+    d = k._isle("/durum")
+    assert "SOLUSDT" in d and "104" in d, d
+    assert "beklenti" in d, "durumda karne yok"
+    ok("/durum canlı fiyat + karne ile anlık tablo veriyor")
+
+    # --- Yıkıcı komut TEK BAŞINA uygulanmamalı
+    c = k._isle("/kapat SOLUSDT")
+    assert "onay" in c.lower(), c
+    assert state.get_kv("cmd_SOLUSDT", "") == "", "onaysız komut kuyruğa düştü!"
+    ok("/kapat tek başına İŞ YAPMIYOR — önce onay kodu istiyor")
+
+    # --- Yanlış kod uygulamamalı
+    assert "tutmadı" in k._isle("/onay 0000")
+    assert state.get_kv("cmd_SOLUSDT", "") == "", "yanlış kodla komut geçti!"
+    ok("yanlış onay kodu komutu uygulamıyor")
+
+    # --- Doğru kod uygulamalı
+    kod = k._bekleyen["kod"]
+    assert "Kuyruğa" in k._isle(f"/onay {kod}")
+    assert state.get_kv("cmd_SOLUSDT") == "CLOSE"
+    assert k._bekleyen is None, "onaylanan işlem bekleyende kaldı (tekrar kullanılabilir)"
+    ok("doğru kod komutu kuyruğa alıyor ve onayı TÜKETİYOR")
+
+    # --- Aynı kod ikinci kez çalışmamalı (tekrar saldırısı)
+    state.set_kv("cmd_SOLUSDT", "")
+    assert "Bekleyen işlem yok" in k._isle(f"/onay {kod}")
+    assert state.get_kv("cmd_SOLUSDT", "") == ""
+    ok("kullanılmış onay kodu ikinci kez çalışmıyor [tekrar saldırısı]")
+
+    # --- Onay süresi dolduysa uygulamamalı
+    k._isle("/kapat SOLUSDT")
+    kod2 = k._bekleyen["kod"]
+    k._bekleyen["son"] = 0.0                     # süreyi geçmişe al
+    assert "süresi doldu" in k._isle(f"/onay {kod2}")
+    assert state.get_kv("cmd_SOLUSDT", "") == ""
+    ok("süresi dolan onay reddediliyor")
+
+    # --- /iptal bekleyeni gerçekten düşürmeli
+    k._isle("/kapat SOLUSDT")
+    k._isle("/iptal")
+    assert k._bekleyen is None
+    ok("/iptal bekleyen işlemi düşürüyor")
+
+    # --- STOP: kuyruğa panelle AYNI biçimde düşmeli (bot aynı kodu işler)
+    k._isle("/stop SOLUSDT 98.5")
+    assert k._bekleyen["fiyat"] == 98.5
+    k._isle(f"/onay {k._bekleyen['kod']}")
+    assert state.get_kv("cmd_SOLUSDT") == "STOP:98.5", state.get_kv("cmd_SOLUSDT")
+    ok("/stop panelle aynı komut biçimini üretiyor (tek işleyici)")
+
+    # --- Gevşetme kullanıcıya AÇIKÇA söylenmeli (riski artırır)
+    state.set_kv("cmd_SOLUSDT", "")
+    g = k._isle("/stop SOLUSDT 90")
+    assert "GEVŞETME" in g, g
+    ok("stop gevşetmesi onay metninde 'riski artırır' diye uyarıyor")
+
+    # --- Pozisyonsuz/bilinmeyen sembolde iş yapmamalı
+    state.clear_position("SOLUSDT")
+    k._bekleyen = None
+    assert "açık pozisyon yok" in k._isle("/kapat SOLUSDT")
+    assert "takip listesinde yok" in k._isle("/kapat YOKSUSDT")
+    assert k._bekleyen is None, "geçersiz istek için onay beklentisi kuruldu"
+    ok("pozisyonsuz ve bilinmeyen sembol reddediliyor (onay bile istemiyor)")
+
+    # --- YETKİ: yabancı sohbetin mesajı ASLA çalıştırılmamalı
+    poz(state, sym="SOLUSDT", entry=100.0, stop=96.0, side="LONG")
+    yazilan = []
+    k2 = TelegramKomut(cfg, state, None, market)
+    k2._cagir = lambda metot, **v: yazilan.append((metot, v)) or []
+    guncelleme = [{"update_id": 7, "message": {"text": "/kapat SOLUSDT",
+                                               "chat": {"id": 999}}}]
+    cagri = {"n": 0}
+
+    def sahte(metot, **v):
+        if metot != "getUpdates":
+            yazilan.append((metot, v))
+            return []
+        cagri["n"] += 1
+        if cagri["n"] == 1:
+            return guncelleme
+        raise KeyboardInterrupt        # döngüyü tek turda kes
+    k2._cagir = sahte
+    state.set_kv(OFFSET_ANAHTARI, "7")
+    try:
+        k2.calistir()
+    except KeyboardInterrupt:
+        pass
+    assert state.get_kv("cmd_SOLUSDT", "") == "", "YABANCI KOMUT ÇALIŞTI!"
+    uyari = [v for m, v in yazilan if m == "sendMessage"]
+    assert uyari and str(uyari[0]["chat_id"]) == "555", "sahibe uyarı gitmedi"
+    assert "Yetkisiz" in uyari[0]["text"]
+    ok("yabancı sohbetin komutu ÇALIŞMIYOR ve sahibe haber veriliyor")
+
+    # --- Offset kaydı: yeniden başlayınca eski komut dirilmemeli
+    assert state.get_kv(OFFSET_ANAHTARI) == "8", state.get_kv(OFFSET_ANAHTARI)
+    ok("offset kaydediliyor — yeniden başlatma eski komutu tekrar işlemiyor")
+
+    # --- Kapalıyken token/chat yoksa katman hiç açılmamalı
+    sessiz = TelegramKomut(replace(CONFIG, telegram_token="", telegram_chat_id=""),
+                           state, None, market)
+    sessiz.calistir()        # anında dönmeli, ağa çıkmamalı
+    ok("token/chat_id yoksa komut katmanı hiç açılmıyor [beyaz liste yoksa kapı yok]")
+
+
 def main() -> int:
     print("=" * 74)
     print("  KRİTİK TESTLER — geçici DB, gerçek pozisyona DOKUNULMAZ")
@@ -1247,7 +1368,7 @@ def main() -> int:
                test_panel_saat, test_deploy_teshis, test_dagitim_gerilik_alarmi,
                test_borsa_kanali,
                test_telegram_saglik, test_canli_altyapi, test_canli_kapisi,
-               test_performans_karnesi]
+               test_performans_karnesi, test_telegram_komut]
     for fn in testler:
         try:
             fn()

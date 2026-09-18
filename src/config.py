@@ -159,6 +159,14 @@ class Config:
     # Telegram
     telegram_token: str = _env("TELEGRAM_BOT_TOKEN")
     telegram_chat_id: str = _env("TELEGRAM_CHAT_ID")
+    # ÇİFT YÖNLÜ KOMUT (/durum, /kapat, /stop) — kapatmak için .env'e
+    # TELEGRAM_KOMUT=false.
+    # GÜVENLİK: bot kullanıcı adını bilen HERKES bota yazabilir. Komutu
+    # çalıştırma yetkisi YALNIZCA TELEGRAM_CHAT_ID'dedir; başkasının mesajı
+    # uygulanmaz, sahibe bir kez haber verilir. Yıkıcı komutlar (/kapat,
+    # /stop) ayrıca 4 haneli, 2 dakika ömürlü onay kodu ister.
+    # chat_id boşsa katman hiç açılmaz — beyaz liste yoksa kapı da yok.
+    telegram_komut: bool = _env("TELEGRAM_KOMUT", "true").lower() == "true"
 
     # Zamanlama
     poll_seconds: int = 30             # ana döngü periyodu (stop takibi + mum kontrolü)

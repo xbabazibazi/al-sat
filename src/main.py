@@ -77,6 +77,23 @@ def borsa_dongusu(notifier: TelegramNotifier) -> None:
         time.sleep(CONFIG.borsa_poll_seconds)
 
 
+def telegram_komut_dongusu(market) -> None:
+    """Telegram komut dinleyicisi — kendi iş parçacığında, kendi bağlantısıyla.
+
+    SQLite bağlantı nesnesi iş parçacıkları arasında paylaşılmaz; bu yüzden
+    burada YENİ StateStore açılır (borsa döngüsündeki desenin aynısı).
+    Pozisyona dokunmaz, komut kuyruğuna yazar — tek yazıcı hâlâ bot.
+    """
+    log = logging.getLogger("tgkomut")
+    try:
+        from .telegram_komut import TelegramKomut
+        state = StateStore(CONFIG.db_path)
+        borsa = StateStore(CONFIG.borsa_db_path) if CONFIG.borsa_enabled else None
+        TelegramKomut(CONFIG, state, borsa, market).calistir()
+    except Exception as e:  # noqa: BLE001
+        log.error("Telegram komut katmanı başlatılamadı: %s", e, exc_info=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Binance trend-takip botu")
     parser.add_argument("--once", action="store_true", help="tek döngü çalıştır ve çık")
@@ -147,6 +164,14 @@ def main() -> None:
     if CONFIG.borsa_enabled and not args.once:
         threading.Thread(target=borsa_dongusu, args=(notifier,),
                          name="borsa", daemon=True).start()
+
+    # TELEGRAM KOMUT KATMANI — telefondan /durum, /kapat, /stop.
+    # DAEMON OLMASI KASITLI: bot ölürse komut katmanı da ölsün. Aksi hâlde
+    # "komut kabul edildi" cevabı gelir ama uygulayacak bot yoktur — bu
+    # projedeki en tehlikeli arıza tipi (başarısızlık başarı gibi görünür).
+    if CONFIG.telegram_komut and not args.once:
+        threading.Thread(target=telegram_komut_dongusu, args=(market,),
+                         name="tgkomut", daemon=True).start()
 
     while True:
         state.set_kv("bot_heartbeat", datetime.now(timezone.utc).isoformat())
