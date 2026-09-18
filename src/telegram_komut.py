@@ -54,8 +54,9 @@ SIMGE = {"USD": "$", "TRY": "₺"}
 YARDIM = (
     "*AL-SAT komutları*\n"
     "`/durum` — anlık tablo (kripto + borsa)\n"
-    "`/kapat SEMBOL` — pozisyonu kapat (onay düğmesi çıkar)\n"
-    "`/stop SEMBOL FİYAT` — stop seviyesini değiştir (onay düğmesi çıkar)\n"
+    "`/kapat` — açık pozisyonları düğme olarak listeler, seç ve onayla\n"
+    "`/kapat SEMBOL` — doğrudan o pozisyonu hedefler\n"
+    "`/stop SEMBOL FİYAT` — stop seviyesini istediğin rakama çeker\n"
     "`/onay KOD` · `/iptal` — düğme çalışmazsa elle onay / vazgeçme\n"
     "`/yardim` — bu liste\n\n"
     "_Komutlar panelle aynı kuyruğa düşer; uygulamayı bot yapar "
@@ -68,8 +69,8 @@ YARDIM = (
 # Var olan bir yeteneğin görünmez olması, olmamasıyla aynı kapıya çıkıyor.
 MENU = [
     {"command": "durum", "description": "Anlık tablo — pozisyonlar, K/Z, stop, karne"},
-    {"command": "kapat", "description": "Pozisyonu kapat (onay ister) — /kapat SEMBOL"},
-    {"command": "stop", "description": "Stop seviyesini değiştir — /stop SEMBOL FİYAT"},
+    {"command": "kapat", "description": "Pozisyon kapat — yazınca liste çıkar, seç ve onayla"},
+    {"command": "stop", "description": "Stop'u istediğin rakama çek — /stop SEMBOL FİYAT"},
     {"command": "onay", "description": "Bekleyen işlemi onayla — /onay KOD"},
     {"command": "iptal", "description": "Bekleyen işlemden vazgeç"},
     {"command": "yardim", "description": "Komut listesi"},
@@ -147,13 +148,19 @@ class TelegramKomut:
             varlik += p.margin + upnl
             r = (((fiyat - p.entry_price) if p.side == "LONG"
                   else (p.entry_price - fiyat)) / p.risk_unit) if p.risk_unit > 0 else None
-            # Stop tetiklenirse BANKAYA girecek olan — "anlık kâr" ile karıştırılmasın.
+            # ŞİMDİ STOP OLURSA BANKAYA GİRECEK OLAN. "Anlık kâr" ile aynı şey
+            # DEĞİL: anlık kâr fiyat oradayken kâğıt üstündeki değer, bu ise
+            # stop tetiklenirse gerçekten cebe girecek/çıkacak tutar. Kullanıcı
+            # kararını buna göre veriyor, o yüzden ayrı satırda ve açık yazılır.
             stop_pnl = p.qty * ((p.trailing_stop - p.entry_price) if p.side == "LONG"
                                 else (p.entry_price - p.trailing_stop))
+            kilit = "🔒 kilitli kâr" if stop_pnl >= 0 else "göze alınan zarar"
             satirlar.append(
                 f"• `{p.symbol}` {p.side} `{fiyat:,.6g}`\n"
-                f"   anlık `{upnl:+,.2f}`" + (f" · `{r:+.2f}R`" if r is not None else "") +
-                f" · stop `{p.trailing_stop:,.6g}` (`{stop_pnl:+,.2f}`)"
+                f"   anlık `{upnl:+,.2f}` USDT" +
+                (f" · `{r:+.2f}R`" if r is not None else "") + "\n"
+                f"   stop `{p.trailing_stop:,.6g}` → *şimdi stop olursa* "
+                f"`{stop_pnl:+,.2f}` USDT _({kilit})_"
             )
         o = ozet(self.state.pnl_sirali())
         bas = (f"*KRİPTO* — varlık `{varlik:,.2f}` USDT "
@@ -189,8 +196,17 @@ class TelegramKomut:
                     yas = f" _({yas_dk:.0f} dk önce)_"
             except Exception:  # noqa: BLE001
                 pass
-            satirlar.append(f"• `{p.symbol}` {p.side} `{s}{f:,.2f}`{yas}\n"
-                            f"   anlık `{upnl:+,.2f} {cur}` · stop `{s}{p.trailing_stop:,.2f}`")
+            # Kripto tarafıyla aynı bilgi: stop şimdi tetiklenirse ne olacak.
+            # Burada hiç yoktu — aynı soruya iki kanalda farklı cevap vermek
+            # kullanıcıyı kanal değiştirdiğinde kör bırakıyordu.
+            stop_pnl = p.qty * ((p.trailing_stop - p.entry_price) if p.side == "LONG"
+                                else (p.entry_price - p.trailing_stop))
+            kilit = "🔒 kilitli kâr" if stop_pnl >= 0 else "göze alınan zarar"
+            satirlar.append(
+                f"• `{p.symbol}` {p.side} `{s}{f:,.2f}`{yas}\n"
+                f"   anlık `{upnl:+,.2f} {cur}`\n"
+                f"   stop `{s}{p.trailing_stop:,.2f}` → *şimdi stop olursa* "
+                f"`{stop_pnl:+,.2f} {cur}` _({kilit})_")
         return "\n\n*BORSA* (sanal cüzdan)\n" + (
             "\n".join(satirlar) if satirlar else "_açık pozisyon yok_")
 
@@ -278,11 +294,38 @@ class TelegramKomut:
         eklenir. Böylece "hangi cevaba düğme konur" kararı tek yerde kalır;
         her yıkıcı komut yolu ayrı ayrı hatırlamak zorunda değil.
         """
+        parcalar = metin.strip().split()
+        komut = parcalar[0].split("@")[0].lower().lstrip("/") if parcalar else ""
+        # Argümansız /kapat: sembol YAZDIRMAK yerine açık pozisyonları
+        # düğme olarak sun. Kullanıcı sembolü ezberlemek ya da doğru yazmak
+        # zorunda kalmasın — yanlış yazılan sembol zaten reddedilirdi ama
+        # her seferinde bir tur kaybettiriyordu.
+        if komut == "kapat" and len(parcalar) == 1:
+            return self._pozisyon_secimi()
+
         onceki = self._bekleyen
         cevap = self._isle(metin)
         if self._bekleyen is not None and self._bekleyen is not onceki:
             return cevap, self._onay_dugmeleri(self._bekleyen["kod"])
         return cevap, None
+
+    def _acik_pozisyonlar(self) -> list[tuple[StateStore, str]]:
+        acik = [(self.state, p.symbol) for p in self.state.all_positions()]
+        if self.borsa_state is not None:
+            acik += [(self.borsa_state, p.symbol) for p in self.borsa_state.all_positions()]
+        return acik
+
+    def _pozisyon_secimi(self) -> tuple[str, dict | None]:
+        """Açık pozisyonları tek tek düğme yapar — /kapat argümansız çağrıldığında."""
+        acik = self._acik_pozisyonlar()
+        if not acik:
+            return "⛔ Açık pozisyon yok.", None
+        # Her satırda bir sembol: dar telefon ekranında yan yana düğmeler
+        # kırpılıyor ve yanlışa basma riski doğuyor.
+        tuslar = [[{"text": f"❌ {sym}", "callback_data": f"kapat:{sym}"}]
+                  for _, sym in acik]
+        return ("Hangi pozisyonu kapatayım?\n_Seçtikten sonra ayrıca onay soracağım._",
+                {"inline_keyboard": tuslar})
 
     def _isle(self, metin: str) -> str:
         parcalar = metin.strip().split()
@@ -359,11 +402,16 @@ class TelegramKomut:
                         text="Yetkiniz yok.", show_alert=True)
             return
 
+        yeni_dugmeler = None
         if veri == "iptal":
             self._bekleyen = None
             cevap = "🚫 Vazgeçildi — hiçbir işlem yapılmadı."
         elif veri.startswith("onay:"):
             cevap = self._onayla(veri[5:])
+        elif veri.startswith("kapat:"):
+            # Pozisyon SEÇİLDİ, henüz kapatılmadı. Seçim tek başına yıkıcı
+            # olmamalı: yanlış satıra basmak kolaydır, ikinci kapı şart.
+            cevap, yeni_dugmeler = self._cevapla(f"/kapat {veri[6:]}")
         else:
             cevap = "❓ Anlaşılmayan düğme."
 
@@ -376,7 +424,7 @@ class TelegramKomut:
                         message_id=mesaj["message_id"],
                         reply_markup={"inline_keyboard": []})
         self._cagir("answerCallbackQuery", callback_query_id=cbid)
-        self._yaz(self.sahip, cevap)
+        self._yaz(self.sahip, cevap, yeni_dugmeler)
 
     def calistir(self) -> None:
         if not (self.cfg.telegram_token and self.sahip):

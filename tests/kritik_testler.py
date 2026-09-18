@@ -1366,6 +1366,52 @@ def test_telegram_komut():
     ok("yabancının düğme basması çalışmıyor [mesaj yolundan bağımsız kapı]")
     k._bekleyen = None
 
+    # --- SEMBOL YAZMADAN KAPATMA. 2026-09-18: "kodu nasıl alacağım, sembol
+    # yazmak zorunda mıyım?" Argümansız /kapat açık pozisyonları düğme yapar.
+    state.set_kv("cmd_SOLUSDT", "")
+    cevap, dug = k._cevapla("/kapat")
+    assert dug, "argümansız /kapat pozisyon listesi vermiyor"
+    satirlar = dug["inline_keyboard"]
+    assert all(len(s) == 1 for s in satirlar), "dar ekranda yan yana düğme riskli"
+    assert satirlar[0][0]["callback_data"] == "kapat:SOLUSDT", satirlar[0][0]
+    ok("/kapat argümansız çağrılınca pozisyonları düğme olarak listeliyor")
+
+    # Pozisyon seçmek TEK BAŞINA kapatmamalı — ikinci kapı (onay) şart
+    cagrilar.clear()
+    k._dugme({"id": "cb4", "from": {"id": 555}, "data": "kapat:SOLUSDT",
+              "message": {"message_id": 12, "chat": {"id": 555}}})
+    assert state.get_kv("cmd_SOLUSDT", "") == "", "SEÇİM TEK BAŞINA KAPATTI!"
+    assert k._bekleyen is not None, "seçimden sonra onay beklentisi kurulmadı"
+    gonderilen = [v for m, v in cagrilar if m == "sendMessage"]
+    assert gonderilen and gonderilen[-1].get("reply_markup"), "onay düğmesi gelmedi"
+    ok("pozisyon seçmek tek başına kapatmıyor, onay düğmesi çıkarıyor")
+
+    # Sonra onaylayınca kapanmalı — akış uçtan uca tamam
+    k._dugme({"id": "cb5", "from": {"id": 555}, "data": f"onay:{k._bekleyen['kod']}",
+              "message": {"message_id": 13, "chat": {"id": 555}}})
+    assert state.get_kv("cmd_SOLUSDT") == "CLOSE"
+    ok("seç → onayla akışı uçtan uca çalışıyor (hiç yazı yazmadan)")
+
+    # --- /durum "şimdi stop olursa" tutarı AÇIKÇA yazmalı. Anlık kâr ile
+    # karıştırılırsa yanlış karar alınır: biri kâğıt üstünde, biri cebe girecek.
+    state.clear_position("SOLUSDT")
+    poz(state, sym="SOLUSDT", entry=100.0, stop=104.0, side="LONG", qty=10.0)
+    d2 = k._isle("/durum")
+    assert "şimdi stop olursa" in d2, d2
+    assert "+40.00" in d2, f"kilitli kâr (10×(104−100)) yazılmamış: {d2}"
+    assert "kilitli kâr" in d2
+    ok("/durum 'şimdi stop olursa ne olur' tutarını açıkça yazıyor")
+
+    state.clear_position("SOLUSDT")
+    poz(state, sym="SOLUSDT", entry=100.0, stop=96.0, side="LONG", qty=10.0)
+    d3 = k._isle("/durum")
+    assert "-40.00" in d3 and "göze alınan zarar" in d3, d3
+    ok("stop zararda olduğunda 'göze alınan zarar' diye ayrışıyor")
+
+    # Sonraki testler "kuyruk boş" varsayıyor — bıraktığımız komutu temizle.
+    state.set_kv("cmd_SOLUSDT", "")
+    k._bekleyen = None
+
     # --- YETKİ: yabancı sohbetin mesajı ASLA çalıştırılmamalı
     poz(state, sym="SOLUSDT", entry=100.0, stop=96.0, side="LONG")
     yazilan = []
