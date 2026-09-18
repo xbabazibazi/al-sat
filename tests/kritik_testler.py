@@ -1317,6 +1317,55 @@ def test_telegram_komut():
     assert k._bekleyen is None, "geçersiz istek için onay beklentisi kuruldu"
     ok("pozisyonsuz ve bilinmeyen sembol reddediliyor (onay bile istemiyor)")
 
+    # --- ONAY DÜĞMESİ. Kodu elle yazdırmak koruma sağlıyordu ama zahmetliydi
+    # (2026-09-18: "neden 4821 yazmak zorundayım?"). Düğme aynı korumayı tek
+    # dokunuşla vermeli — kolaylık, korumanın yerine değil yanına geçmeli.
+    poz(state, sym="SOLUSDT", entry=100.0, stop=96.0, side="LONG")
+    state.set_kv("cmd_SOLUSDT", "")
+    k._bekleyen = None
+    _, dug = k._cevapla("/durum")
+    assert dug is None, "zararsız komuta onay düğmesi konmuş"
+    cevap, dug = k._cevapla("/kapat SOLUSDT")
+    assert dug, "yıkıcı komuta onay düğmesi konmamış"
+    tuslar = dug["inline_keyboard"][0]
+    assert tuslar[0]["callback_data"] == f"onay:{k._bekleyen['kod']}"
+    assert tuslar[1]["callback_data"] == "iptal"
+    ok("yıkıcı komut onay düğmesiyle geliyor, zararsız komut düğmesiz")
+
+    # Düğmeye basmak, kod yazmakla AYNI işi yapmalı
+    cagrilar = []
+    k._cagir = lambda metot, **v: cagrilar.append((metot, v)) or {}
+    k._dugme({"id": "cb1", "from": {"id": 555}, "data": f"onay:{k._bekleyen['kod']}",
+              "message": {"message_id": 9, "chat": {"id": 555}}})
+    assert state.get_kv("cmd_SOLUSDT") == "CLOSE", "düğme komutu uygulamadı"
+    assert k._bekleyen is None
+    ok("onay düğmesi kod yazmakla aynı işi yapıyor (tek dokunuş)")
+
+    # Basıldıktan sonra düğme kaldırılmalı — aynı mesaja ikinci kez basılmasın
+    duzenle = [v for m, v in cagrilar if m == "editMessageReplyMarkup"]
+    assert duzenle and duzenle[0]["reply_markup"]["inline_keyboard"] == []
+    ok("basılan düğme mesajdan kaldırılıyor (ikinci basış imkânsız)")
+
+    # ESKİ mesajın düğmesine basmak işlem DİRİLTMEMELİ (kod tükenmişti)
+    state.set_kv("cmd_SOLUSDT", "")
+    k._dugme({"id": "cb2", "from": {"id": 555}, "data": "onay:9999",
+              "message": {"message_id": 9, "chat": {"id": 555}}})
+    assert state.get_kv("cmd_SOLUSDT", "") == "", "eski düğme komutu diriltti!"
+    ok("eski/kullanılmış düğme işlem diriltmiyor")
+
+    # YETKİ düğme yolunda da denetlenmeli: düğmeli mesaj İLETİLEBİLİR ve
+    # iletilen mesajdaki düğmeye başkası basarsa callback yine bize gelir.
+    poz(state, sym="SOLUSDT", entry=100.0, stop=96.0, side="LONG")
+    k._bekleyen = None
+    k._cevapla("/kapat SOLUSDT")
+    cagrilar.clear()
+    k._dugme({"id": "cb3", "from": {"id": 999}, "data": f"onay:{k._bekleyen['kod']}",
+              "message": {"message_id": 11, "chat": {"id": 999}}})
+    assert state.get_kv("cmd_SOLUSDT", "") == "", "YABANCI DÜĞMEYE BASTI VE ÇALIŞTI!"
+    assert k._bekleyen is not None, "yabancı basış sahibin beklentisini düşürdü"
+    ok("yabancının düğme basması çalışmıyor [mesaj yolundan bağımsız kapı]")
+    k._bekleyen = None
+
     # --- YETKİ: yabancı sohbetin mesajı ASLA çalıştırılmamalı
     poz(state, sym="SOLUSDT", entry=100.0, stop=96.0, side="LONG")
     yazilan = []

@@ -54,9 +54,9 @@ SIMGE = {"USD": "$", "TRY": "₺"}
 YARDIM = (
     "*AL-SAT komutları*\n"
     "`/durum` — anlık tablo (kripto + borsa)\n"
-    "`/kapat SEMBOL` — pozisyonu kapat (onay ister)\n"
-    "`/stop SEMBOL FİYAT` — stop seviyesini değiştir (onay ister)\n"
-    "`/onay KOD` · `/iptal` — bekleyen işlemi onayla / vazgeç\n"
+    "`/kapat SEMBOL` — pozisyonu kapat (onay düğmesi çıkar)\n"
+    "`/stop SEMBOL FİYAT` — stop seviyesini değiştir (onay düğmesi çıkar)\n"
+    "`/onay KOD` · `/iptal` — düğme çalışmazsa elle onay / vazgeçme\n"
     "`/yardim` — bu liste\n\n"
     "_Komutlar panelle aynı kuyruğa düşer; uygulamayı bot yapar "
     "(~1 dk). Reddedilirse sebebini yazar._"
@@ -105,9 +105,26 @@ class TelegramKomut:
             return None
         return govde.get("result")
 
-    def _yaz(self, chat_id, metin: str) -> None:
-        self._cagir("sendMessage", chat_id=chat_id, text=metin,
-                    parse_mode="Markdown", disable_web_page_preview=True)
+    def _yaz(self, chat_id, metin: str, dugmeler: dict | None = None) -> None:
+        veri = {"chat_id": chat_id, "text": metin, "parse_mode": "Markdown",
+                "disable_web_page_preview": True}
+        if dugmeler:
+            veri["reply_markup"] = dugmeler
+        self._cagir("sendMessage", **veri)
+
+    @staticmethod
+    def _onay_dugmeleri(kod: str) -> dict:
+        """Onay/vazgeç düğmeleri — kod düğmenin İÇİNE gömülür.
+
+        Kodu elle yazdırmak koruma sağlıyordu ama zahmetliydi. Düğme aynı
+        korumayı tek dokunuşla verir: callback_data o mesaja ait kodu taşır,
+        kod kullanılınca tükenir, eski bir mesajın düğmesine basmak bu yüzden
+        iş görmez. Yani kolaylık koruma pahasına değil.
+        """
+        return {"inline_keyboard": [[
+            {"text": "✅ ONAYLA", "callback_data": f"onay:{kod}"},
+            {"text": "🚫 Vazgeç", "callback_data": "iptal"},
+        ]]}
 
     # ------------------------------------------------------------- /durum
     def _fiyat(self, sym: str) -> float | None:
@@ -196,8 +213,8 @@ class TelegramKomut:
         self._bekleyen = {"kod": kod, "tur": tur, "sembol": sembol,
                           "fiyat": fiyat, "son": time.time() + BEKLEYEN_TTL_S}
         return (f"{ozet_metin}\n\n"
-                f"Onaylamak için: `/onay {kod}`\n"
-                f"_{BEKLEYEN_TTL_S // 60} dakika geçerli · vazgeçmek için /iptal_")
+                f"_{BEKLEYEN_TTL_S // 60} dakika geçerli. Düğme çalışmazsa "
+                f"elle: _`/onay {kod}`")
 
     def _kapat_iste(self, sembol: str) -> str:
         depo, _, sembol = self._hedef_bul(sembol)
@@ -254,6 +271,19 @@ class TelegramKomut:
                 f"_Bot bir sonraki turunda uygular (~1 dk) ve sonucu bildirir._")
 
     # ------------------------------------------------------------- yönlendirme
+    def _cevapla(self, metin: str) -> tuple[str, dict | None]:
+        """Komutu işler ve (cevap, düğmeler) döndürür.
+
+        Düğmeler TAM OLARAK bu çağrıda yeni bir onay beklentisi doğduysa
+        eklenir. Böylece "hangi cevaba düğme konur" kararı tek yerde kalır;
+        her yıkıcı komut yolu ayrı ayrı hatırlamak zorunda değil.
+        """
+        onceki = self._bekleyen
+        cevap = self._isle(metin)
+        if self._bekleyen is not None and self._bekleyen is not onceki:
+            return cevap, self._onay_dugmeleri(self._bekleyen["kod"])
+        return cevap, None
+
     def _isle(self, metin: str) -> str:
         parcalar = metin.strip().split()
         if not parcalar:
@@ -313,6 +343,41 @@ class TelegramKomut:
             log.info("Telegram komut menüsü kaydedildi (%d komut, yalnız sahibe)",
                      len(MENU))
 
+    def _dugme(self, sorgu: dict) -> None:
+        """Onay/vazgeç düğmesine basıldığında çalışır.
+
+        YETKİ BURADA DA DENETLENİR. Düğmeli mesaj iletilebilir; iletilen
+        mesajdaki düğmeye BAŞKASI basarsa callback yine bize gelir. Mesaj
+        yolundaki beyaz liste bu yolu kapatmaz — ayrıca bakılmak zorunda.
+        """
+        kimlik = str((sorgu.get("from") or {}).get("id", ""))
+        veri = sorgu.get("data") or ""
+        cbid = sorgu.get("id")
+        if kimlik != self.sahip:
+            log.warning("Yetkisiz düğme basımı (from=%s): %r", kimlik, veri)
+            self._cagir("answerCallbackQuery", callback_query_id=cbid,
+                        text="Yetkiniz yok.", show_alert=True)
+            return
+
+        if veri == "iptal":
+            self._bekleyen = None
+            cevap = "🚫 Vazgeçildi — hiçbir işlem yapılmadı."
+        elif veri.startswith("onay:"):
+            cevap = self._onayla(veri[5:])
+        else:
+            cevap = "❓ Anlaşılmayan düğme."
+
+        # Önce düğmeyi kaldır: aynı mesaja ikinci kez basılmasın. Kod zaten
+        # tükeniyor ama kullanıcıya da "bu iş bitti" demek gerekiyor.
+        mesaj = sorgu.get("message") or {}
+        if mesaj.get("message_id"):
+            self._cagir("editMessageReplyMarkup",
+                        chat_id=(mesaj.get("chat") or {}).get("id"),
+                        message_id=mesaj["message_id"],
+                        reply_markup={"inline_keyboard": []})
+        self._cagir("answerCallbackQuery", callback_query_id=cbid)
+        self._yaz(self.sahip, cevap)
+
     def calistir(self) -> None:
         if not (self.cfg.telegram_token and self.sahip):
             log.error("TELEGRAM KOMUT KATMANI KAPALI — token/chat_id eksik")
@@ -325,13 +390,16 @@ class TelegramKomut:
             try:
                 guncellemeler = self._cagir("getUpdates", offset=offset,
                                             timeout=UZUN_BEKLEME_S,
-                                            allowed_updates=["message"])
+                                            allowed_updates=["message", "callback_query"])
                 if guncellemeler is None:
                     time.sleep(10)          # ağ/API arızası — döngü ölmesin
                     continue
                 for g in guncellemeler:
                     offset = g["update_id"] + 1
                     self.state.set_kv(OFFSET_ANAHTARI, str(offset))
+                    if "callback_query" in g:
+                        self._dugme(g["callback_query"])
+                        continue
                     mesaj = g.get("message") or {}
                     metin = (mesaj.get("text") or "").strip()
                     chat = str((mesaj.get("chat") or {}).get("id", ""))
@@ -348,9 +416,9 @@ class TelegramKomut:
                                       f"şunu yazdı: `{metin[:60]}`\nÇalıştırılmadı.")
                         continue
                     log.info("Telegram komutu: %r", metin[:60])
-                    cevap = self._isle(metin)
+                    cevap, dugmeler = self._cevapla(metin)
                     if cevap:
-                        self._yaz(chat, cevap)
+                        self._yaz(chat, cevap, dugmeler)
             except Exception as e:  # noqa: BLE001
                 # Komut katmanı ÖLMEMELİ: öldüğü an kullanıcı telefondan
                 # müdahale edemez ve bunu ancak ihtiyacı olduğunda fark eder.
