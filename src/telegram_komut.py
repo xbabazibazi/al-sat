@@ -62,6 +62,19 @@ YARDIM = (
     "(~1 dk). Reddedilirse sebebini yazar._"
 )
 
+# TELEGRAM MENÜSÜ. Bunu kaydetmezsek sohbette "/" yazınca HİÇBİR ŞEY
+# çıkmaz ve komutlar ezberden yazılmak zorunda kalır — kullanıcı da haklı
+# olarak "komut yok galiba" diye okur (2026-09-18'de tam bu oldu).
+# Var olan bir yeteneğin görünmez olması, olmamasıyla aynı kapıya çıkıyor.
+MENU = [
+    {"command": "durum", "description": "Anlık tablo — pozisyonlar, K/Z, stop, karne"},
+    {"command": "kapat", "description": "Pozisyonu kapat (onay ister) — /kapat SEMBOL"},
+    {"command": "stop", "description": "Stop seviyesini değiştir — /stop SEMBOL FİYAT"},
+    {"command": "onay", "description": "Bekleyen işlemi onayla — /onay KOD"},
+    {"command": "iptal", "description": "Bekleyen işlemden vazgeç"},
+    {"command": "yardim", "description": "Komut listesi"},
+]
+
 
 class TelegramKomut:
     """Telegram'ı dinler, yetkiyi denetler, komutu kuyruğa bırakır."""
@@ -283,11 +296,24 @@ class TelegramKomut:
             log.info("Telegram kuyruğunda bekleyen mesajlar atlandı (offset=%d)", off)
         return off
 
+    def _menuyu_kur(self) -> None:
+        """Komutları Telegram'a kaydeder — sohbetteki "/" menüsü buradan doğar.
+
+        Kaydedilmezse komutlar ÇALIŞIR ama görünmez; ezberden yazmak gerekir.
+        Görünmeyen yetenek, olmayan yetenekle aynı kapıya çıkıyor.
+        """
+        if self._cagir("setMyCommands", commands=MENU) is None:
+            log.warning("Telegram komut menüsü kaydedilemedi — komutlar yine de "
+                        "elle yazılarak çalışır")
+        else:
+            log.info("Telegram komut menüsü kaydedildi (%d komut)", len(MENU))
+
     def calistir(self) -> None:
         if not (self.cfg.telegram_token and self.sahip):
             log.error("TELEGRAM KOMUT KATMANI KAPALI — token/chat_id eksik")
             return
         offset = self._ilk_offset()
+        self._menuyu_kur()
         log.info("Telegram komut katmanı başladı (yetkili sohbet: …%s)", self.sahip[-4:])
 
         while True:

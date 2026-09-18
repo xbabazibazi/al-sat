@@ -1350,6 +1350,16 @@ def test_telegram_komut():
     assert state.get_kv(OFFSET_ANAHTARI) == "8", state.get_kv(OFFSET_ANAHTARI)
     ok("offset kaydediliyor — yeniden başlatma eski komutu tekrar işlemiyor")
 
+    # --- MENÜ: kaydedilmezse komutlar ÇALIŞIR ama GÖRÜNMEZ. 2026-09-18'de
+    # kullanıcı tam bu yüzden "sadece durum var sanırım" dedi — var olan
+    # yetenek görünmeyince olmayan yetenekle aynı kapıya çıktı.
+    menu = [v for m, v in yazilan if m == "setMyCommands"]
+    assert menu, "komut menüsü Telegram'a hiç kaydedilmiyor"
+    adlar = {c["command"] for c in menu[0]["commands"]}
+    assert {"durum", "kapat", "stop", "onay", "iptal"} <= adlar, adlar
+    assert all(c.get("description") for c in menu[0]["commands"]), "açıklamasız komut var"
+    ok("komut menüsü Telegram'a kaydediliyor ('/' menüsünde görünür)")
+
     # --- Kapalıyken token/chat yoksa katman hiç açılmamalı
     sessiz = TelegramKomut(replace(CONFIG, telegram_token="", telegram_chat_id=""),
                            state, None, market)
