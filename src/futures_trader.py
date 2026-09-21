@@ -573,6 +573,429 @@ class FuturesPaperTrader:
         return equity
 
 
+def _timeframe_ms(tf: str) -> int:
+    carpan = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}.get(tf[-1])
+    if carpan is None:
+        raise ValueError(f"Bilinmeyen zaman dilimi: {tf!r}")
+    return int(tf[:-1]) * carpan
+
+
+class FuturesLiveTrader(FuturesPaperTrader):
+    """FuturesPaperTrader'ın canlı/testnet karşılığı — GERÇEK Binance emirleri.
+
+    Karar mantığı (poll, _try_enter, assess, _process_manual_commands, devre
+    kesici, pozisyon tavanı) DEĞİŞTİRİLMEDEN miras alınır: kâğıt ve canlı AYNI
+    strateji kodunu çalıştırmalı, yoksa 100 işlemlik kâğıt doğrulaması canlı
+    hakkında hiçbir şey kanıtlamaz. Yalnızca BORSAYA DOKUNAN dikişler override
+    edilir. Mimari kararın tamamı: docs/07-Canliya-Gecis.md.
+
+    _stop_hit() burada iki iş birden yapar (poll() değişmediği için tek yer
+    burası): (1) stopun borsada gerçekten tetiklenip tetiklenmediğine bakar,
+    (2) HER TURDA "stop nöbeti" tutar — stop emri borsada yoksa (elle iptal,
+    ağ hatası, tetiklenip yenisi kurulamamış) derhal yeniden kurar; kuramazsa
+    pozisyonu güvenlik için kapattırır (True döner, poll() zaten _close()'u
+    çağırır).
+    """
+
+    def __init__(self, symbol: str, cfg: Config, market: MarketData,
+                 state: StateStore, notifier: TelegramNotifier, breaker: CircuitBreaker,
+                 broker) -> None:
+        self.broker = broker
+        super().__init__(symbol, cfg, market, state, notifier, breaker)
+        self.filters = broker.filtreler(symbol)  # borsa filtreleri (paper'daki market.filters DEĞİL)
+        if not broker.kaldirac_ayarla(symbol, int(cfg.leverage)):
+            raise RuntimeError(
+                f"{symbol}: kaldıraç {cfg.leverage:.0f}x borsada ayarlanamadı — "
+                "canlıya güvenle başlanamaz")
+
+    # ------------------------------------------------------------- gerçek cüzdan
+    def _balance(self) -> float:
+        return self.broker.bakiye_usdt()
+
+    def account_equity(self) -> float:
+        return self.broker.varlik_usdt()
+
+    # ---------------------------------------------------------------- yardımcılar
+    def _gercek_cikis_fiyati(self, pos: Position, yedek_fiyat: float) -> float:
+        """Pozisyon borsada BİZDEN BAĞIMSIZ kapanmışsa (stop tetiklendi)
+        gerçek dolum fiyatını işlem geçmişinden okur. Tahmine (trailing_stop
+        ya da anlık fiyat) güvenmek PnL kaydını yanlış yapar — STOP_MARKET
+        genelde tetik fiyatından biraz kayarak dolar."""
+        try:
+            islemler = self.broker.client.futures_account_trades(symbol=self.symbol, limit=10)
+            for t in reversed(islemler):
+                if int(t.get("orderId", 0)) == (pos.stop_order_id or -1):
+                    return float(t["price"])
+            if islemler:
+                return float(islemler[-1]["price"])
+        except Exception as e:  # noqa: BLE001
+            log.error("[%s] Gerçek çıkış fiyatı okunamadı, yaklaşık kullanılıyor: %s", self.symbol, e)
+        return yedek_fiyat
+
+    def _gercek_net_pnl(self, pos: Position) -> float | None:
+        """Bu pozisyonun net PnL'ini (kâr/zarar + komisyon + funding) borsanın
+        KENDİ muhasebesinden okur — paper modda olduğu gibi elle hesaplamak
+        yerine. Binance income history üçünü ayrı ayrı tutar; toplamı en
+        dürüst rakamdır. Okunamazsa None döner (çağıran yaklaşığa düşer)."""
+        try:
+            baslangic_ms = int(datetime.fromisoformat(pos.entry_time).timestamp() * 1000)
+            toplam = 0.0
+            for tur in ("REALIZED_PNL", "COMMISSION", "FUNDING_FEE"):
+                for kayit in self.broker.client.futures_income_history(
+                        symbol=self.symbol, incomeType=tur, startTime=baslangic_ms, limit=1000):
+                    toplam += float(kayit.get("income", 0))
+            return toplam
+        except Exception as e:  # noqa: BLE001
+            log.error("[%s] Gerçek net PnL okunamadı, yaklaşık hesaba dönülüyor: %s", self.symbol, e)
+            return None
+
+    # ------------------------------------------------------------------ stop nöbeti
+    def _stop_hit(self, pos: Position, price: float) -> bool:
+        gercek = self.broker.pozisyon(self.symbol)
+        if gercek is None:
+            return True  # borsada pozisyon yok → tetiklenmiş (ya da elle kapatılmış) say
+
+        stop = self.broker.stop_var_mi(self.symbol)
+        if stop is None:
+            log.error("[%s] STOP NÖBETİ: pozisyon açık ama stop YOK — derhal yeniden kuruluyor",
+                      self.symbol)
+            yeni_id = self.broker.stop_kur(self.symbol, pos.side, pos.trailing_stop)
+            if yeni_id is None:
+                log.critical("[%s] Stop yeniden kurulamadı — pozisyon güvenlik için kapatılıyor",
+                             self.symbol)
+                self.notifier.send_error(
+                    f"🚨 {self.symbol}: stop kayıptı ve yeniden kurulamadı — pozisyon acil kapatılıyor."
+                )
+                return True
+            pos.stop_order_id = yeni_id
+            self.state.save_position(pos)
+            self.notifier.send_error(
+                f"⚠️ {self.symbol}: stop kayıptı, yeniden kuruldu (${pos.trailing_stop:,.6g})."
+            )
+        elif stop["id"] != pos.stop_order_id:
+            pos.stop_order_id = stop["id"]  # DB'yi borsayla senkron tut
+            self.state.save_position(pos)
+        return False
+
+    # ------------------------------------------------------------------ kapatma
+    def _close(self, pos: Position, exit_price: float, reason: str) -> None:
+        hala_acik = self.broker.pozisyon(self.symbol) is not None
+        if hala_acik:
+            dolum = self.broker.pozisyonu_kapat(self.symbol, pos.side, pos.qty, pos.stop_order_id)
+            if dolum is None:
+                log.critical("[%s] Kapatma emri BAŞARISIZ — pozisyon borsada AÇIK KALDI", self.symbol)
+                self.notifier.send_error(
+                    f"🚨 {self.symbol}: kapatma emri gönderilemedi, pozisyon borsada HÂLÂ AÇIK! "
+                    "Hemen Binance'ten elle kontrol et."
+                )
+                return
+            gercek_fiyat = dolum.ort_fiyat
+        else:
+            gercek_fiyat = self._gercek_cikis_fiyati(pos, exit_price)
+
+        net = self._gercek_net_pnl(pos)
+        if net is None:
+            net = self._unrealized(pos, gercek_fiyat)  # yaklaşık yedek (funding zaten cüzdanda düşülmüş)
+
+        etiket = f"{reason} · {'kâr kilitlendi' if net >= 0 else 'zarar kesildi'}"
+        now = datetime.now(timezone.utc).isoformat()
+        self.state.record_trade(
+            self.symbol, pos.entry_time, now, pos.entry_price, gercek_fiyat, pos.qty,
+            etiket, side=pos.side, pnl_override=net,
+        )
+        self.state.clear_position(self.symbol)
+        emoji = "🟢" if net >= 0 else "🔴"
+        arrow = "📈 LONG" if pos.side == "LONG" else "📉 SHORT"
+        baslik = "KÂR KİLİTLENDİ" if net >= 0 else "ZARAR KESİLDİ"
+        r_metni = ""
+        if pos.risk_unit > 0 and pos.qty > 0:
+            r = ((gercek_fiyat - pos.entry_price) if pos.side == "LONG"
+                 else (pos.entry_price - gercek_fiyat)) / pos.risk_unit
+            r_metni = f" · `{r:+.2f}R`"
+        self.notifier.send(
+            f"{emoji} *{self.symbol} {arrow} — {baslik}* (CANLI)\n"
+            f"• Sebep: {reason}\n"
+            f"• Giriş: `${pos.entry_price:,.6g}` → Çıkış: `${gercek_fiyat:,.6g}`\n"
+            f"• Net PnL: `{net:+,.2f} USDT`{r_metni} (borsa kaydından)\n"
+            f"• {self._seri_notu()}"
+        )
+        log.info("[%s] %s kapandı (%s): net %+.2f USDT", self.symbol, pos.side, etiket, net)
+
+    # ------------------------------------------------------------------ iz süren stop
+    def _update_trailing(self, pos: Position, row: pd.Series) -> None:
+        atr = float(row["atr"])
+        if pd.isna(atr):
+            return
+        if pos.side == "LONG":
+            if float(row["high"]) > pos.highest_price:
+                pos.highest_price = float(row["high"])
+            aday = pos.highest_price - atr * self.cfg.strategy.atr_multiplier
+            if pos.stop_manual_ref > 0:
+                if aday <= pos.stop_manual_ref:
+                    self.state.save_position(pos)
+                    return
+                log.info("[%s] Manuel stop kilidi açıldı (aday %.6g > ref %.6g)",
+                         self.symbol, aday, pos.stop_manual_ref)
+                pos.stop_manual_ref = 0.0
+            new_stop = updated_trailing_stop(pos.trailing_stop, pos.highest_price, atr, self.cfg.strategy)
+        else:
+            if float(row["low"]) < pos.highest_price:
+                pos.highest_price = float(row["low"])
+            aday = pos.highest_price + atr * self.cfg.strategy.atr_multiplier
+            if pos.stop_manual_ref > 0:
+                if aday >= pos.stop_manual_ref:
+                    self.state.save_position(pos)
+                    return
+                log.info("[%s] Manuel stop kilidi açıldı (aday %.6g < ref %.6g)",
+                         self.symbol, aday, pos.stop_manual_ref)
+                pos.stop_manual_ref = 0.0
+            new_stop = min(pos.trailing_stop, aday)
+
+        moved = new_stop > pos.trailing_stop if pos.side == "LONG" else new_stop < pos.trailing_stop
+        if not moved:
+            self.state.save_position(pos)  # highest_price güncellenmiş olabilir
+            return
+
+        yeni_id = self.broker.stop_tasi(self.symbol, pos.side, pos.stop_order_id, new_stop)
+        if yeni_id == pos.stop_order_id:
+            log.error("[%s] İz süren stop taşınamadı, eski seviye korunuyor: %.6g",
+                      self.symbol, pos.trailing_stop)
+            self.state.save_position(pos)
+            return
+        log.info("[%s] %s stop taşındı (borsada): %.6g → %.6g (id=%s)",
+                 self.symbol, pos.side, pos.trailing_stop, new_stop, yeni_id)
+        pos.trailing_stop = new_stop
+        pos.stop_order_id = yeni_id
+        self.state.save_position(pos)
+
+    # ------------------------------------------------------------------ veri tazeliği
+    def _try_enter(self, row: pd.Series, assessment) -> None:
+        """Paper'daki mantığın aynısı + VERİ TAZELİĞİ KAPISI: bayat mumla
+        canlıda giriş yapılmaz (kâğıtta bu risk yoktu — hep prod veri okunsa
+        da gerçek para riske girmiyordu)."""
+        acilis_ms = int(row["open_time"])
+        tf_ms = _timeframe_ms(self.cfg.timeframe)
+        gecikme_ms = datetime.now(timezone.utc).timestamp() * 1000 - (acilis_ms + tf_ms)
+        if gecikme_ms > tf_ms * 1.5:
+            log.warning("[%s] Veri bayat (mum kapanışının üzerinden %.0f dk geçmiş) — giriş atlandı",
+                        self.symbol, gecikme_ms / 60_000)
+            self.notifier.send_error(
+                f"⚠️ {self.symbol}: veri bayat görünüyor ({gecikme_ms/60_000:.0f} dk gecikme) — giriş atlandı."
+            )
+            return
+        super()._try_enter(row, assessment)
+
+    # ------------------------------------------------------------------ giriş
+    def _open(self, side: str, atr: float | None = None,
+              reason: str = "", manual: bool = False) -> None:
+        if atr is None:
+            df = self.market.klines(self.symbol, self.cfg.timeframe, limit=300)
+            ind = compute_indicators(df.iloc[:-1], self.cfg.strategy)
+            atr = float(ind.iloc[-1]["atr"])
+            if pd.isna(atr) or atr <= 0:
+                log.warning("[%s] Manuel açılış: ATR hesaplanamadı", self.symbol)
+                return
+
+        today = datetime.now(timezone.utc).date().isoformat()
+        equity = self.account_equity()
+        allowed, day_pnl = self.breaker.entries_allowed(today, equity)
+        if not allowed:
+            log.warning("[%s] Devre kesici aktif (günlük %%%.1f) — giriş yok",
+                        self.symbol, day_pnl * 100)
+            if manual:
+                self.notifier.send_error(
+                    f"{self.symbol}: manuel açılış reddedildi — günlük sermaye stopu aktif."
+                )
+            return
+
+        tavan = self.cfg.max_concurrent_positions
+        if tavan > 0:
+            diger = [p for p in self.state.all_positions() if p.symbol != self.symbol]
+            if len(diger) >= tavan:
+                if manual:
+                    self.notifier.send_error(
+                        f"⚠️ {self.symbol} manuel açılıyor ama zaten {len(diger)} pozisyon "
+                        f"açık (tavan {tavan}) — portföy riski tavanın üstüne çıkıyor."
+                    )
+                else:
+                    log.info("[%s] %s sinyali var ama eşzamanlı pozisyon tavanı dolu "
+                             "(%d/%d) — GİRİŞ ERTELENDİ",
+                             self.symbol, side, len(diger), tavan)
+                    return
+
+        balance = self._balance()
+        stop_distance = atr * self.cfg.strategy.atr_multiplier
+        if stop_distance <= 0:
+            return
+        ref_price = self.market.last_price(self.symbol)
+        qty = min((balance * self.cfg.risk_pct) / stop_distance,
+                  (balance * self.cfg.max_balance_usage * self.cfg.leverage) / ref_price)
+        qty = floor_to_step(qty, self.filters.step_size)
+        notional_tahmini = qty * ref_price
+
+        if qty < self.filters.min_qty or notional_tahmini < self.filters.min_notional:
+            log.info("[%s] %s: boyut/bakiye yetersiz (qty=%s notional≈%.2f)",
+                     self.symbol, side, qty, notional_tahmini)
+            if manual:
+                self.notifier.send_error(f"{self.symbol}: manuel açılış — bakiye/miktar yetersiz.")
+            return
+
+        # Stop fiyatı GERÇEK fiyat henüz bilinmeden (emir gönderilmeden önce)
+        # hesaplanır — market emrinin dolum fiyatı ancak gönderildikten sonra
+        # kesinleşir. Likit vadeli paritelerde kayma genelde ihmal edilebilir;
+        # giris_ve_stop() zaten bu tahmini stopu borsaya kurar.
+        stop_fiyat = ref_price - stop_distance if side == "LONG" else ref_price + stop_distance
+
+        log.warning("[%s] CANLI %s AÇILIYOR — miktar=%s tahmini_fiyat=%.6g stop=%.6g",
+                    self.symbol, side, qty, ref_price, stop_fiyat)
+        sonuc = self.broker.giris_ve_stop(self.symbol, side, qty, stop_fiyat)
+
+        if sonuc is None:
+            log.error("[%s] Giriş denendi, stop kurulamadığı için pozisyon güvenle geri kapatıldı",
+                      self.symbol)
+            self.notifier.send_error(
+                f"⚠️ {self.symbol}: {side} girişi denendi, stop kurulamadığı için ANINDA geri "
+                "kapatıldı (para riske girmedi)."
+            )
+            return
+
+        if sonuc["acil"]:
+            log.critical("[%s] ACİL: pozisyon açık, stop YOK ve kapatma da başarısız", self.symbol)
+            self.notifier.send_error(
+                f"🚨🚨 ACİL — {self.symbol}: pozisyon AÇIK ({side} {sonuc['miktar']}) ama STOP YOK "
+                "ve kapatılamadı! HEMEN Binance'e gir ve elle müdahale et."
+            )
+            pos = Position(
+                symbol=self.symbol, qty=sonuc["miktar"], entry_price=sonuc["giris"],
+                highest_price=sonuc["giris"], trailing_stop=stop_fiyat, stop_order_id=None,
+                entry_time=datetime.now(timezone.utc).isoformat(), side=side,
+                margin=(sonuc["giris"] * sonuc["miktar"]) / self.cfg.leverage,
+                risk_unit=stop_distance,
+            )
+            self.state.save_position(pos)
+            return
+
+        pos = Position(
+            symbol=self.symbol, qty=sonuc["miktar"], entry_price=sonuc["giris"],
+            highest_price=sonuc["giris"], trailing_stop=stop_fiyat, stop_order_id=sonuc["stop_id"],
+            entry_time=datetime.now(timezone.utc).isoformat(), side=side,
+            margin=(sonuc["giris"] * sonuc["miktar"]) / self.cfg.leverage,
+            risk_unit=stop_distance,
+        )
+        self.state.save_position(pos)
+        arrow = "📈 LONG" if side == "LONG" else "📉 SHORT"
+        etiket = "🖐 MANUEL" if manual else reason
+        self.notifier.send(
+            f"{arrow} *{self.symbol} CANLI AÇILDI* ({etiket})\n"
+            f"• Giriş: `${sonuc['giris']:,.2f}`  Miktar: `{sonuc['miktar']}`  "
+            f"Kaldıraç: `{self.cfg.leverage}x`\n"
+            f"• Stop (borsada): `${stop_fiyat:,.2f}`"
+        )
+        log.info("[%s] %s açıldı (CANLI): fiyat=%.2f qty=%s stop=%.2f",
+                 self.symbol, side, sonuc["giris"], sonuc["miktar"], stop_fiyat)
+
+    # ------------------------------------------------------------------ mutabakat
+    def reconcile(self) -> None:
+        """Açılışta borsa gerçeği ile DB'yi eşitler. Borsa HER ZAMAN esas
+        alınır — DB'nin dediği değil (bkz. docs/07-Canliya-Gecis.md §2)."""
+        kayitli = self.state.get_position(self.symbol)
+        gercek = self.broker.pozisyon(self.symbol)
+
+        if gercek is None:
+            if kayitli is not None:
+                log.warning("[%s] Mutabakat: DB'de pozisyon var, borsada YOK — "
+                            "stop tetiklenmiş kabul edilip kapanmış yazılıyor", self.symbol)
+                fiyat = self._gercek_cikis_fiyati(kayitli, self.market.last_price(self.symbol))
+                net = self._gercek_net_pnl(kayitli)
+                if net is None:
+                    net = self._unrealized(kayitli, fiyat)
+                now = datetime.now(timezone.utc).isoformat()
+                self.state.record_trade(
+                    self.symbol, kayitli.entry_time, now, kayitli.entry_price, fiyat,
+                    kayitli.qty, "mutabakat: borsada pozisyon yok", side=kayitli.side,
+                    pnl_override=net,
+                )
+                self.state.clear_position(self.symbol)
+                self.notifier.send(
+                    f"♻️ *{self.symbol}*: mutabakat — borsada pozisyon bulunamadı, kapanmış "
+                    f"olarak işlendi (net `{net:+,.2f}` USDT)."
+                )
+            else:
+                kalan = self.broker.stop_var_mi(self.symbol)
+                if kalan:
+                    self.broker.emir_iptal(self.symbol, kalan["id"])
+                    log.info("[%s] Mutabakat: sahipsiz stop emri iptal edildi", self.symbol)
+            return
+
+        if kayitli is None:
+            log.warning("[%s] Mutabakat: borsada pozisyon VAR, DB'de YOK — benimseniyor", self.symbol)
+            stop = self.broker.stop_var_mi(self.symbol)
+            pos = Position(
+                symbol=self.symbol, qty=gercek["miktar"], entry_price=gercek["giris"],
+                highest_price=gercek["giris"],
+                trailing_stop=stop["stop"] if stop else gercek["giris"],
+                stop_order_id=stop["id"] if stop else None,
+                entry_time=datetime.now(timezone.utc).isoformat(), side=gercek["yon"],
+                margin=(gercek["giris"] * gercek["miktar"]) / max(gercek["kaldirac"], 1),
+            )
+            self.state.save_position(pos)
+            if stop is None:
+                log.critical("[%s] Sahiplenilen pozisyonun STOPU YOK — acil stop kuruluyor", self.symbol)
+                tahmini_mesafe = gercek["giris"] * 0.02
+                yeni_stop = (gercek["giris"] - tahmini_mesafe if gercek["yon"] == "LONG"
+                            else gercek["giris"] + tahmini_mesafe)
+                yeni_id = self.broker.stop_kur(self.symbol, gercek["yon"], yeni_stop)
+                if yeni_id:
+                    pos.trailing_stop = yeni_stop
+                    pos.stop_order_id = yeni_id
+                    self.state.save_position(pos)
+                    self.notifier.send_error(
+                        f"⚠️ {self.symbol}: sahipsiz pozisyon bulundu, stopsuzdu — acil stop "
+                        f"kuruldu (${yeni_stop:,.6g})."
+                    )
+                else:
+                    self.notifier.send_error(
+                        f"🚨 {self.symbol}: sahipsiz VE stopsuz pozisyon, stop kurulamadı — "
+                        "HEMEN elle müdahale et!"
+                    )
+            else:
+                self.notifier.send(
+                    f"♻️ *{self.symbol}*: borsada bilinmeyen pozisyon bulundu, DB'ye benimsendi "
+                    f"({gercek['yon']} {gercek['miktar']})."
+                )
+            return
+
+        if kayitli.side != gercek["yon"] or abs(kayitli.qty - gercek["miktar"]) > self.filters.min_qty:
+            log.warning("[%s] Mutabakat: DB ile borsa UYUŞMUYOR (DB: %s %.6g, borsa: %s %.6g) — "
+                        "borsa esas alınıyor", self.symbol, kayitli.side, kayitli.qty,
+                        gercek["yon"], gercek["miktar"])
+            kayitli.side = gercek["yon"]
+            kayitli.qty = gercek["miktar"]
+            kayitli.entry_price = gercek["giris"]
+            self.state.save_position(kayitli)
+
+        stop = self.broker.stop_var_mi(self.symbol)
+        if stop is None:
+            log.critical("[%s] Mutabakat: pozisyon var ama STOP YOK — derhal kuruluyor", self.symbol)
+            yeni_id = self.broker.stop_kur(self.symbol, kayitli.side, kayitli.trailing_stop)
+            if yeni_id:
+                kayitli.stop_order_id = yeni_id
+                self.state.save_position(kayitli)
+                self.notifier.send_error(f"⚠️ {self.symbol}: yeniden başlarken stop bulunamadı — yeniden kuruldu.")
+            else:
+                self.notifier.send_error(
+                    f"🚨 {self.symbol}: yeniden başlarken stop YOK ve kurulamadı — HEMEN elle kontrol et!"
+                )
+        elif stop["id"] != kayitli.stop_order_id:
+            kayitli.stop_order_id = stop["id"]
+            self.state.save_position(kayitli)
+
+        self.notifier.send(
+            f"♻️ *{self.symbol}*: bot yeniden başladı, açık {kayitli.side} pozisyon ve stop "
+            "borsada doğrulandı."
+        )
+
+
 def snapshot_equity(traders: list[FuturesPaperTrader], state: StateStore) -> None:
     """Panel grafiği için varlık anlık görüntüsü (dakikada bir yeterli)."""
     if not traders:

@@ -17,8 +17,8 @@ from logging.handlers import RotatingFileHandler
 
 from .config import CONFIG
 from .exchange import MarketData, build_broker
-from .futures_trader import (FuturesPaperTrader, maybe_send_futures_daily_report,
-                             snapshot_equity)
+from .futures_trader import (FuturesLiveTrader, FuturesPaperTrader,
+                             maybe_send_futures_daily_report, snapshot_equity)
 from .notifier import TelegramNotifier
 from .risk import CircuitBreaker
 from .state import StateStore
@@ -116,14 +116,34 @@ def main() -> None:
     notifier.dogrula()   # token'ı ilk işlemi beklemeden sına
     breaker = CircuitBreaker(state, CONFIG.max_daily_loss_pct)
 
-    futures_mode = CONFIG.mode == "futures_paper"
-    if futures_mode:
+    futures_mode = CONFIG.mode in ("futures_paper", "futures_testnet", "futures_live")
+    futures_paper_mode = CONFIG.mode == "futures_paper"
+
+    if futures_paper_mode:
         traders = [
             FuturesPaperTrader(sym, CONFIG, market, state, notifier, breaker)
             for sym in CONFIG.symbols
         ]
         log.info("Vadeli PAPER mod | kaldıraç=%.0fx | long=%s short=%s | panel: python -m src.panel",
                  CONFIG.leverage, CONFIG.allow_long, CONFIG.allow_short)
+    elif futures_mode:  # futures_testnet / futures_live
+        from .futures_exchange import FuturesBroker
+        futures_broker = FuturesBroker(CONFIG)
+        if CONFIG.mode == "futures_live":
+            log.warning("VADELİ CANLI MOD — GERÇEK PARAYLA emir gönderilecek")
+        traders = [
+            FuturesLiveTrader(sym, CONFIG, market, state, notifier, breaker, futures_broker)
+            for sym in CONFIG.symbols
+        ]
+        log.info("Vadeli %s mod | kaldıraç=%.0fx | long=%s short=%s",
+                 CONFIG.mode, CONFIG.leverage, CONFIG.allow_long, CONFIG.allow_short)
+        # Açılış mutabakatı: borsa gerçeği DB'yi ezer (bkz. docs/07-Canliya-Gecis.md)
+        for t in traders:
+            try:
+                t.reconcile()
+            except Exception as e:
+                log.error("[%s] Mutabakat hatası: %s", t.symbol, e)
+                notifier.send_error(f"{t.symbol} mutabakat hatası: {e}")
     else:
         broker = build_broker(CONFIG, market, state)
         traders = [
@@ -186,7 +206,11 @@ def main() -> None:
         try:
             if futures_mode:
                 snapshot_equity(traders, state)  # panel varlık grafiği için
-                maybe_send_futures_daily_report(CONFIG, traders, state, notifier)
+                if futures_paper_mode:
+                    # $10.000 sanal başlangıç varsayar — canlı/testnet'te bakiye
+                    # keyfi olduğu için burada YANLIŞ yüzde üretirdi. Canlı
+                    # günlük özeti henüz yazılmadı (bilinçli eksik, bkz. docs/07).
+                    maybe_send_futures_daily_report(CONFIG, traders, state, notifier)
             else:
                 maybe_send_daily_report(CONFIG, market, broker, state, notifier)
         except Exception as e:

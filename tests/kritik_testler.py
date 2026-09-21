@@ -44,7 +44,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import CONFIG  # noqa: E402
-from src.futures_trader import FuturesPaperTrader  # noqa: E402
+from src.futures_trader import FuturesLiveTrader, FuturesPaperTrader  # noqa: E402
 from src.state import Position, StateStore  # noqa: E402
 
 GECEN, KALAN = 0, []
@@ -1118,6 +1118,152 @@ def test_canli_altyapi():
     ok("hedge modu tespit ediliyor (tek yön varsayımı sınanıyor)")
 
 
+def canli_kur(sembol="BTCUSDT"):
+    """FuturesLiveTrader için: gerçek FuturesBroker AMA istemcisi (Client)
+    yamalı, hiçbir ağ isteği doğmaz — sahte_broker() ile aynı desen."""
+    db = Path(tempfile.mkdtemp()) / "test.db"
+    state = StateStore(db)
+    market = MagicMock()
+    market.last_price.return_value = 100.0
+    breaker = MagicMock()
+    breaker.entries_allowed.return_value = (True, 0.0)
+    notifier = MagicMock()
+    cfg = replace(CONFIG, max_concurrent_positions=4, r_notify_level=4.0,
+                  mode="futures_testnet", leverage=2)
+    broker, istemci = sahte_broker(replace(CONFIG, mode="futures_testnet"))
+    t = FuturesLiveTrader(sembol, cfg, market, state, notifier, breaker, broker)
+    return state, notifier, market, broker, t
+
+
+def test_canli_trader():
+    """FuturesLiveTrader — FuturesPaperTrader'ın karar mantığını miras alır,
+    yalnızca borsaya dokunan dikişleri gerçek emirlerle değiştirir. Buradaki
+    her test paper simülasyonunun canlıda ASLA yapmaması gereken bir şeyi
+    (tahmine güvenmek, borsayı sormadan karar vermek) yasaklıyor."""
+    print("\nCANLI TRADER (FuturesLiveTrader)")
+    from src.futures_exchange import Dolum
+
+    # --- _open mutlu yol: gerçek dolum fiyatı/miktarı ve borsa stop id'si ---
+    state, notifier, market, broker, t = canli_kur()
+    with patch.object(broker, "bakiye_usdt", return_value=10000.0), \
+         patch.object(broker, "varlik_usdt", return_value=10000.0), \
+         patch.object(broker, "giris_ve_stop",
+                       return_value={"giris": 100.5, "miktar": 0.5, "stop_id": 77, "acil": False}):
+        t._open("LONG", atr=3.0, reason="test")
+    pos = state.get_position("BTCUSDT")
+    assert pos is not None and pos.entry_price == 100.5 and pos.qty == 0.5 and pos.stop_order_id == 77
+    ok("canlı _open: gerçek dolum fiyatı/miktarı ve borsa stop id'si kaydediliyor")
+
+    # --- _open: stop kurulamadı → giris_ve_stop None döner → pozisyon YOK ---
+    state, notifier, market, broker, t = canli_kur()
+    with patch.object(broker, "bakiye_usdt", return_value=10000.0), \
+         patch.object(broker, "varlik_usdt", return_value=10000.0), \
+         patch.object(broker, "giris_ve_stop", return_value=None):
+        t._open("LONG", atr=3.0, reason="test")
+    assert state.get_position("BTCUSDT") is None
+    ok("canlı _open: stop kurulamayınca pozisyon KAYDEDİLMİYOR (güvenle geri kapatıldı)")
+
+    # --- _open: acil bayrağı → yine de DB'ye yazılır (panelde görünsün) + alarm ---
+    state, notifier, market, broker, t = canli_kur()
+    with patch.object(broker, "bakiye_usdt", return_value=10000.0), \
+         patch.object(broker, "varlik_usdt", return_value=10000.0), \
+         patch.object(broker, "giris_ve_stop",
+                       return_value={"giris": 100.0, "miktar": 0.5, "stop_id": None, "acil": True}):
+        t._open("LONG", atr=3.0, reason="test")
+    pos = state.get_position("BTCUSDT")
+    assert pos is not None and pos.stop_order_id is None
+    assert notifier.send_error.called and "ACİL" in notifier.send_error.call_args[0][0]
+    ok("canlı _open: ACİL durumda pozisyon yine DB'ye yazılıyor (görünmez kalmıyor) ve alarm veriliyor")
+
+    # --- stop nöbeti: stop kayıpsa derhal yeniden kuruluyor ---
+    state, notifier, market, broker, t = canli_kur()
+    p = poz(state, sym="BTCUSDT", entry=100.0, stop=95.0, side="LONG")
+    with patch.object(broker, "pozisyon", return_value={"yon": "LONG", "miktar": 10.0}), \
+         patch.object(broker, "stop_var_mi", return_value=None), \
+         patch.object(broker, "stop_kur", return_value=999) as kur_stop:
+        sonuc = t._stop_hit(p, 101.0)
+    assert sonuc is False and kur_stop.called
+    assert state.get_position("BTCUSDT").stop_order_id == 999
+    ok("canlı stop nöbeti: stop kayıpsa derhal yeniden kuruluyor")
+
+    # --- stop nöbeti: yeniden kurulamazsa acil kapatma sinyali (True) ---
+    state, notifier, market, broker, t = canli_kur()
+    p = poz(state, sym="BTCUSDT", entry=100.0, stop=95.0, side="LONG")
+    with patch.object(broker, "pozisyon", return_value={"yon": "LONG", "miktar": 10.0}), \
+         patch.object(broker, "stop_var_mi", return_value=None), \
+         patch.object(broker, "stop_kur", return_value=None):
+        sonuc = t._stop_hit(p, 101.0)
+    assert sonuc is True, "stop yeniden kurulamadı ama acil kapatma sinyali verilmedi"
+    assert notifier.send_error.called
+    ok("canlı stop nöbeti: yeniden kurulamazsa pozisyon acil kapatma sinyali veriyor")
+
+    # --- stop nöbeti: borsada pozisyon zaten yoksa tetiklenmiş sayılır ---
+    state, notifier, market, broker, t = canli_kur()
+    p = poz(state, sym="BTCUSDT", entry=100.0, stop=95.0, side="LONG")
+    with patch.object(broker, "pozisyon", return_value=None):
+        assert t._stop_hit(p, 94.0) is True
+    ok("canlı stop nöbeti: borsada pozisyon kalmamışsa tetiklenmiş sayılıyor")
+
+    # --- _close: pozisyon hâlâ açıksa GERÇEK emirle kapatılır, tahmin fiyatı GÖRMEZDEN gelinir ---
+    state, notifier, market, broker, t = canli_kur()
+    p = poz(state, sym="BTCUSDT", entry=100.0, stop=95.0, side="LONG", qty=0.5)
+    with patch.object(broker, "pozisyon", return_value={"yon": "LONG", "miktar": 0.5}), \
+         patch.object(broker, "pozisyonu_kapat",
+                       return_value=Dolum(ort_fiyat=105.0, miktar=0.5, emir_id=5)) as kapat, \
+         patch.object(t, "_gercek_net_pnl", return_value=2.4):
+        t._close(p, 999.0, "manuel kapatma")   # 999.0 yalnızca bir TAHMİN, kullanılmamalı
+    assert kapat.called
+    kayit = state.recent_trades(1)[0]
+    assert abs(kayit["exit_price"] - 105.0) < 1e-9, "gerçek dolum fiyatı yerine tahmin kullanıldı"
+    assert abs(kayit["pnl_usdt"] - 2.4) < 1e-9, "borsanın gerçek net PnL'i yerine yaklaşık kullanıldı"
+    ok("canlı _close: pozisyon açıksa gerçek emirle kapatılıyor, gerçek fiyat/PnL kaydediliyor")
+
+    # --- _close: borsa zaten kapatmışsa (stop tetiklendi) gerçek fiyat/PnL işlem geçmişinden ---
+    state, notifier, market, broker, t = canli_kur()
+    p = poz(state, sym="BTCUSDT", entry=100.0, stop=95.0, side="LONG", qty=0.5)
+    with patch.object(broker, "pozisyon", return_value=None), \
+         patch.object(t, "_gercek_cikis_fiyati", return_value=94.8), \
+         patch.object(t, "_gercek_net_pnl", return_value=-3.1):
+        t._close(p, 999.0, "izleyen stop")
+    kayit = state.recent_trades(1)[0]
+    assert abs(kayit["exit_price"] - 94.8) < 1e-9
+    assert abs(kayit["pnl_usdt"] - (-3.1)) < 1e-9
+    ok("canlı _close: borsa zaten kapatmışsa gerçek dolum fiyatı işlem geçmişinden okunuyor")
+
+    # --- mutabakat: borsada bilinmeyen pozisyon → DB'ye benimseniyor ---
+    state, notifier, market, broker, t = canli_kur()
+    with patch.object(broker, "pozisyon",
+                       return_value={"yon": "SHORT", "miktar": 1.2, "giris": 200.0,
+                                     "kaldirac": 2, "likidasyon": 0.0}), \
+         patch.object(broker, "stop_var_mi", return_value={"id": 42, "stop": 210.0}):
+        t.reconcile()
+    pos = state.get_position("BTCUSDT")
+    assert pos is not None and pos.side == "SHORT" and pos.stop_order_id == 42
+    ok("canlı mutabakat: borsada bilinmeyen pozisyon DB'ye benimseniyor")
+
+    # --- mutabakat: DB'de pozisyon var, borsada yok → kapanmış olarak işleniyor ---
+    state, notifier, market, broker, t = canli_kur()
+    p = poz(state, sym="BTCUSDT", entry=100.0, stop=95.0, side="LONG", qty=0.5)
+    with patch.object(broker, "pozisyon", return_value=None), \
+         patch.object(broker, "stop_var_mi", return_value=None), \
+         patch.object(t, "_gercek_cikis_fiyati", return_value=95.2), \
+         patch.object(t, "_gercek_net_pnl", return_value=-2.0):
+        t.reconcile()
+    assert state.get_position("BTCUSDT") is None
+    kayit = state.recent_trades(1)[0]
+    assert "mutabakat" in kayit["exit_reason"]
+    ok("canlı mutabakat: DB'de pozisyon var ama borsada yoksa kapanmış olarak işleniyor")
+
+    # --- veri tazeliği kapısı: bayat mumla giriş denenmiyor ---
+    state, notifier, market, broker, t = canli_kur()
+    row = pd.Series({"open_time": 0, "atr": 1.0})  # epoch = kesinlikle bayat
+    with patch("src.futures_trader.FuturesPaperTrader._try_enter") as ust:
+        t._try_enter(row, MagicMock())
+    assert not ust.called, "bayat veriyle giriş denemesi engellenmeliydi"
+    assert notifier.send_error.called
+    ok("canlı veri tazeliği kapısı: bayat mumla giriş denenmiyor")
+
+
 def test_canli_kapisi():
     """Kazara gerçek paraya geçiş İMKÂNSIZ olmalı."""
     print("\nGERÇEK PARA KAPISI")
@@ -1169,6 +1315,23 @@ def test_canli_kapisi():
     replace(CONFIG, mode="futures_testnet", testnet_key="k",
             testnet_secret="s").validate()
     ok("kâğıt ve testnet modları kapıdan etkilenmiyor [regresyon]")
+
+    # KAPI GEÇİLSE BİLE main.py YANLIŞ DALA DÜŞMEMELİ.
+    # config.validate() yalnızca "bu ayarlar tutarlı mı" der; "bu modu
+    # çalıştıracak kod var mı" DEMEZ. FuturesLiveTrader bağlandıktan sonra
+    # bile futures_testnet/futures_live'ın SPOT dalına (build_broker +
+    # SymbolTrader) düşmediğini, FuturesLiveTrader'a gittiğini doğrula.
+    ana = (Path(__file__).resolve().parent.parent / "src" / "main.py"
+           ).read_text(encoding="utf-8")
+    assert "FuturesLiveTrader(" in ana,         "main.py artık FuturesLiveTrader'ı bağlamıyor"
+    assert 'futures_mode = CONFIG.mode in ("futures_paper", "futures_testnet", "futures_live")' in ana,         "futures_mode üç modu da kapsamıyor — testnet/live spot dalına düşebilir"
+    futures_mode_yeri = ana.index('futures_mode = CONFIG.mode in')
+    broker_yeri = ana.index("= build_broker(")   # yorum değil, ÇAĞRI yeri
+    assert futures_mode_yeri < broker_yeri,         "futures_mode kontrolü build_broker()'dan SONRA tanımlı"
+    arasi = ana[futures_mode_yeri:broker_yeri]
+    assert "elif futures_mode:" in arasi,         "build_broker() öncesinde futures_mode dalı yok — testnet/live spot dalına düşebilir"
+    assert "FuturesLiveTrader(" in arasi,         "futures_mode dalı FuturesLiveTrader kurmuyor"
+    ok("main.py vadeli canlı/testnet modunda FuturesLiveTrader'a bağlanıyor [sessiz spot işlemi yok]")
 
 
 def test_performans_karnesi():
@@ -1478,7 +1641,7 @@ def main() -> int:
                test_komut_sonucu, test_panel_komut_seridi, test_panel_js,
                test_panel_saat, test_deploy_teshis, test_dagitim_gerilik_alarmi,
                test_borsa_kanali,
-               test_telegram_saglik, test_canli_altyapi, test_canli_kapisi,
+               test_telegram_saglik, test_canli_altyapi, test_canli_trader, test_canli_kapisi,
                test_performans_karnesi, test_telegram_komut]
     for fn in testler:
         try:

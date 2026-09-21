@@ -106,6 +106,18 @@ class FuturesBroker:
                 return float(b.get("availableBalance", b.get("balance", 0)))
         return 0.0
 
+    def varlik_usdt(self) -> float:
+        """Toplam hesap varlığı (cüzdan + gerçekleşmemiş kâr/zarar) — Binance'in
+        kendi hesapladığı totalMarginBalance. Bunu kullanmak, kendi elle
+        toplama yapmaktan (bakiye + her pozisyonun upnl'ini tek tek çekmek)
+        daha güvenilir: izole/çapraz marjin farkları ve yuvarlama borsayla
+        aramızda tutarsızlık yaratmaz — tek doğru kaynak borsanın kendisi."""
+        try:
+            return float(self.client.futures_account().get("totalMarginBalance", 0))
+        except Exception as e:  # noqa: BLE001
+            log.error("Toplam varlık okunamadı, kullanılabilir bakiyeye dönülüyor: %s", e)
+            return self.bakiye_usdt()
+
     def pozisyon(self, symbol: str) -> Optional[dict]:
         """Borsadaki GERÇEK pozisyon. Yoksa None. Mutabakatın temeli budur:
         kendi kaydımıza değil, borsanın söylediğine bakarız."""
