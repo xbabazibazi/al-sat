@@ -107,6 +107,16 @@ def telegram_saglik() -> dict:
     gitmedi; kullanıcı işlemi panelde tesadüfen gördü. Kanalın kendi arızası
     ikinci bir kanaldan görünmek zorunda.
     """
+    # ÇAKIŞMA ÖNCE BAKILIR: "iki bot birden çalışıyor" bildirimin bozuk
+    # olmasından daha ağır bir arıza. 2026-09-30'da sekiz gün sürdü ve
+    # yalnızca log'a yazıldığı için kimse görmedi.
+    catisma = state.get_kv("telegram_catisma", "")
+    if catisma:
+        return {"ok": False, "sebep":
+                "İKİ BOT BİRDEN ÇALIŞIYOR — Telegram aynı token'ı iki süreçte "
+                "görüyor. Fazladan süreç durdurulmalı (çifte pozisyon riski).",
+                "catisma": catisma}
+
     ham = state.get_kv("telegram_saglik", "")
     if not ham:
         # Kayıt yok: bot bu sürümden önce başlamış olabilir. "Sorun yok"

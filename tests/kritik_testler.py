@@ -28,6 +28,7 @@ Kapsam (gerçek DB'ye DOKUNMAZ, geçici dosya kullanır):
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import sys
 import tempfile
@@ -1631,6 +1632,89 @@ def test_telegram_komut():
     ok("token/chat_id yoksa komut katmanı hiç açılmıyor [beyaz liste yoksa kapı yok]")
 
 
+def test_tek_ornek():
+    """2026-09-30: sunucuda SEKİZ GÜN iki bot birden çalıştı (pid 8986 ve
+    18256). İkisi de aynı SQLite'a yazdı, aynı log dosyasını döndürdü, aynı
+    Telegram kuyruğunu çekti. Eski koruma kalp atışının YAŞINA bakıyordu:
+    yarışa açıktı ve yalnızca açılışta bakıyordu. Bu testler gerçek kilidi
+    sınıyor."""
+    print("\nTEK ÖRNEK KİLİDİ (iki bot asla birlikte çalışmamalı)")
+    from src.telegram_komut import CATISMA_ANAHTARI, CATISMA_ESIGI, TelegramKomut
+    from src.tekil import KilitTutulu, TekOrnekKilidi
+
+    yol = Path(tempfile.mkdtemp()) / "alt" / "bot.lock"
+    birinci = TekOrnekKilidi(yol)
+    birinci.al()
+    assert yol.exists(), "kilit dosyası oluşmadı (alt dizin açılmamış olabilir)"
+    ok("kilit alınıyor, gerekirse dizini kendi açıyor")
+
+    ikinci = TekOrnekKilidi(yol)
+    try:
+        ikinci.al()
+        raise AssertionError("İKİNCİ BOT KİLİDİ ALDI — çifte çalışma mümkün!")
+    except KilitTutulu as e:
+        assert str(os.getpid()) in str(e), f"sahip pid'i raporlanmıyor: {e}"
+    ok("ikinci örnek kilidi ALAMIYOR ve sahibin pid'ini raporluyor")
+
+    # Reddedilen örnek sahiplik kaydını BOZMAMALI: "w" ile açsaydı kilidi
+    # alamadan içeriği sıfırlar, sahibin pid'i kaybolurdu.
+    assert birinci._pid_yolu.read_text(encoding="utf-8").strip() == str(os.getpid())
+    ok("reddedilen örnek sahiplik kaydını bozmuyor [regresyon]")
+
+    # Bırakılınca devralınabilmeli — yeniden başlatma kilitli kalmamalı.
+    birinci.birak()
+    ucuncu = TekOrnekKilidi(yol)
+    ucuncu.al()
+    ok("kilit bırakılınca yeni örnek devralabiliyor (yeniden başlatma tıkanmaz)")
+    ucuncu.birak()
+
+    with TekOrnekKilidi(yol):
+        dorduncu = TekOrnekKilidi(yol)
+        try:
+            dorduncu.al()
+            raise AssertionError("with bloğu içinde kilit tutulmuyor!")
+        except KilitTutulu:
+            pass
+    ok("with bloğu kilidi tutuyor ve çıkışta bırakıyor")
+
+    # --- Çakışma ARTIK SESSİZ KALMAMALI. Asıl ders bu: sekiz gün boyunca
+    # log saniyede bir hata bastı ama hiçbir yere alarm gitmedi.
+    state, _, _, _ = kur()
+    cfg = replace(CONFIG, telegram_token="t", telegram_chat_id="555")
+    k = TelegramKomut(cfg, state, None, MagicMock())
+    k._cagir = TelegramKomut._cagir.__get__(k)   # gerçek yöntemi kullan
+
+    class SahteYanit:
+        def __init__(self, govde): self._g = govde
+        def json(self): return self._g
+
+    catisma = {"ok": False, "description":
+               "Conflict: terminated by other getUpdates request"}
+    with patch("src.telegram_komut.requests.post", return_value=SahteYanit(catisma)):
+        for _ in range(CATISMA_ESIGI - 1):
+            k._cagir("getUpdates")
+        assert state.get_kv(CATISMA_ANAHTARI, "") == "", "tek çakışmada alarm erken çaldı"
+        k._cagir("getUpdates")
+        assert state.get_kv(CATISMA_ANAHTARI, ""), "ÇAKIŞMA SESSİZ KALDI — 8 gün dersi"
+    ok(f"{CATISMA_ESIGI} çakışmadan sonra durum kv'ye yazılıyor (sessizlik yok)")
+
+    # Düzelince temizlenmeli, yoksa uyarı sonsuza kadar asılı kalır.
+    with patch("src.telegram_komut.requests.post",
+               return_value=SahteYanit({"ok": True, "result": []})):
+        k._cagir("getUpdates")
+    assert state.get_kv(CATISMA_ANAHTARI, "") == "", "çakışma bitince uyarı inmiyor"
+    ok("çakışma bitince uyarı kendiliğinden iniyor")
+
+    # Panel bunu bildirim sağlığından ÖNCE göstermeli (daha ağır arıza).
+    from src import panel
+    with patch.object(panel, "state", state):
+        state.set_kv(CATISMA_ANAHTARI, "2026-09-30T13:00:00+00:00")
+        state.set_kv("telegram_saglik", json.dumps({"ok": True}))
+        s = panel.telegram_saglik()
+        assert s["ok"] is False and "İKİ BOT" in s["sebep"], s
+    ok("panel çakışmayı 'sağlıklı' kaydının ÖNÜNDE gösteriyor")
+
+
 def main() -> int:
     print("=" * 74)
     print("  KRİTİK TESTLER — geçici DB, gerçek pozisyona DOKUNULMAZ")
@@ -1642,7 +1726,8 @@ def main() -> int:
                test_panel_saat, test_deploy_teshis, test_dagitim_gerilik_alarmi,
                test_borsa_kanali,
                test_telegram_saglik, test_canli_altyapi, test_canli_trader, test_canli_kapisi,
-               test_performans_karnesi, test_telegram_komut]
+               test_performans_karnesi, test_telegram_komut,
+               test_tek_ornek]
     for fn in testler:
         try:
             fn()

@@ -22,6 +22,7 @@ from .futures_trader import (FuturesLiveTrader, FuturesPaperTrader,
 from .notifier import TelegramNotifier
 from .risk import CircuitBreaker
 from .state import StateStore
+from .tekil import KilitTutulu, TekOrnekKilidi
 from .trader import SymbolTrader, maybe_send_daily_report
 
 
@@ -94,6 +95,32 @@ def telegram_komut_dongusu(market) -> None:
         log.error("Telegram komut katmanı başlatılamadı: %s", e, exc_info=True)
 
 
+def _tek_ornek_ol(args, log) -> TekOrnekKilidi | None:
+    """Başka bir bot çalışıyorsa BAŞLAMADAN çıkar.
+
+    2026-09-30: sunucuda sekiz gün boyunca iki bot birden çalıştı. Eski
+    koruma kalp atışının yaşına bakıyordu — yarışa açıktı ve yalnızca
+    açılışta bakıyordu, bir kez ikisi de geçince bir daha hiç. Artık
+    işletim sistemi kilidi: atomik ve bayatlamaz. Ayrıntı: src/tekil.py.
+
+    KİLİT HER ŞEYDEN ÖNCE ALINIR — borsa bağlantısı, Telegram bildirimi,
+    thread'ler hiç doğmadan. Fazladan örnek "Bot başlatıldı" mesajı bile
+    göndermemeli; eski sürümde gönderiyordu ve gürültü kimin gerçek
+    olduğunu belirsizleştiriyordu.
+    """
+    if args.once:
+        return None        # tek turluk doğrulama koşusu kilide takılmasın
+    kilit = TekOrnekKilidi(CONFIG.db_path.parent / "bot.lock")
+    try:
+        kilit.al()
+    except KilitTutulu as e:
+        log.error("BAŞLATILMADI — zaten çalışan bir bot var. %s", e)
+        log.error("İki bot aynı veritabanına yazarsa çifte pozisyon ve "
+                  "bozuk bakiye riski doğar; bu süreç çıkıyor.")
+        sys.exit(1)
+    return kilit
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Binance trend-takip botu")
     parser.add_argument("--once", action="store_true", help="tek döngü çalıştır ve çık")
@@ -101,6 +128,11 @@ def main() -> None:
 
     setup_logging()
     log = logging.getLogger("main")
+
+    # İLK İŞ. Kilit `kilit` değişkeninde TUTULUYOR: bırakılırsa (çöp
+    # toplayıcı dosyayı kapatırsa) kilit de düşer, o yüzden main() boyunca
+    # yaşamalı. Süreç ölünce çekirdek kendiliğinden bırakır.
+    kilit = _tek_ornek_ol(args, log)  # noqa: F841 — ömrü kasıtlı olarak main() kadar
 
     CONFIG.validate()
     log.info("Bot başlıyor | mod=%s | semboller=%s | zaman dilimi=%s | risk=%%%.1f | ATR×%.1f",
@@ -163,21 +195,9 @@ def main() -> None:
         f"semboller: `{', '.join(CONFIG.symbols)}` | tf: `{CONFIG.timeframe}`"
     )
 
-    # ÇİFTE ÇALIŞMA KİLİDİ: başka bir bot canlıysa (kalp atışı taze) çık.
-    # İki bot aynı DB'ye yazarsa çifte pozisyon açılabilir.
-    hb = state.get_kv("bot_heartbeat")
-    other_pid = state.get_kv("bot_pid")
-    if hb and other_pid != str(os.getpid()):
-        try:
-            age = (datetime.now(timezone.utc) - datetime.fromisoformat(hb)).total_seconds()
-        except ValueError:
-            age = 1e9
-        if age < 120 and not args.once:
-            log.error("Zaten çalışan bir bot var (pid=%s, kalp atışı %.0f sn önce). "
-                      "Çifte işlem riski nedeniyle çıkılıyor.", other_pid, age)
-            sys.exit(1)
-
-    # Panelin "çalışıyor mu" bilmesi için kalp atışı + süreç kimliği
+    # Panelin "çalışıyor mu" bilmesi için kalp atışı + süreç kimliği.
+    # NOT: çifte çalışma koruması ARTIK BURADA DEĞİL — main()'in en başında,
+    # işletim sistemi kilidiyle yapılıyor (aşağıdaki _tek_ornek_ol).
     state.set_kv("bot_pid", str(os.getpid()))
 
     # BORSA kanalı (daemon: ana süreç ölünce o da ölür; --once turunda açılmaz)

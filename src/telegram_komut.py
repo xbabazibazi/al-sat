@@ -47,6 +47,11 @@ log = logging.getLogger("tgkomut")
 
 API = "https://api.telegram.org/bot{token}/{metot}"
 OFFSET_ANAHTARI = "tg_offset"
+# İki bot aynı token'ı çekerse Telegram "Conflict" döner. Tek bir Conflict
+# geçici olabilir (dağıtım sırasında eski süreç henüz ölmemiştir), o yüzden
+# eşik var — ama eşik aşılırsa bu ARTIK gürültü değil, arızadır.
+CATISMA_ANAHTARI = "telegram_catisma"
+CATISMA_ESIGI = 3
 BEKLEYEN_TTL_S = 120          # onay penceresi
 UZUN_BEKLEME_S = 50           # getUpdates long-polling süresi
 SIMGE = {"USD": "$", "TRY": "₺"}
@@ -89,6 +94,7 @@ class TelegramKomut:
         self.sahip = str(cfg.telegram_chat_id or "").strip()
         self._bekleyen: dict | None = None      # {kod, tur, sembol, fiyat, son}
         self._yabanci_uyarildi: set[str] = set()
+        self._catisma = 0                       # üst üste kaç "Conflict"
 
     # ------------------------------------------------------------- alt seviye
     def _cagir(self, metot: str, **veri):
@@ -102,8 +108,22 @@ class TelegramKomut:
         if not govde.get("ok"):
             # Telegram'ın KENDİ açıklamasını yaz; "başarısız" demek yetmiyor,
             # bu projede tam da o yüzden bir arıza günlerce görünmez kaldı.
-            log.error("Telegram %s reddetti: %s", metot, govde.get("description"))
+            aciklama = str(govde.get("description") or "")
+            log.error("Telegram %s reddetti: %s", metot, aciklama)
+            # "Conflict" = bu token'ı BAŞKA bir süreç de çekiyor, yani iki bot
+            # birden çalışıyor. 2026-09-30'da bu tam sekiz gün sürdü: log
+            # saniyede bir hata bastı ama hiçbir yere ALARM gitmedi, kimse
+            # bakmadı. Sayıp eşiği aşınca durumu kv'ye yazıyoruz ki panel
+            # görsün — log'a bakmak zorunda kalmadan.
+            if "Conflict" in aciklama:
+                self._catisma += 1
+                if self._catisma == CATISMA_ESIGI:
+                    log.critical("İKİ BOT BİRDEN ÇALIŞIYOR — Telegram aynı "
+                                 "token'ı iki süreçte görüyor (%d kez).", self._catisma)
+                    self.state.set_kv(CATISMA_ANAHTARI, datetime.now(timezone.utc).isoformat())
             return None
+        self._catisma = 0
+        self.state.set_kv(CATISMA_ANAHTARI, "")
         return govde.get("result")
 
     def _yaz(self, chat_id, metin: str, dugmeler: dict | None = None) -> None:
