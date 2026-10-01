@@ -123,9 +123,29 @@ def telegram_saglik() -> dict:
         # DEMEK DEĞİL — bilinmiyor demek; ikisini karıştırmıyoruz.
         return {"ok": None, "sebep": "henüz rapor yok (bot yeniden başlayınca gelir)"}
     try:
-        return json.loads(ham)
+        kayit = json.loads(ham)
     except ValueError:
         return {"ok": None, "sebep": "durum kaydı okunamadı"}
+
+    # KAYDIN YAŞI. 2026-10-01: 01:58'deki geçici DNS arızası saat 04:40'ta
+    # hâlâ "Telegram BOZUK" diye duruyordu, çünkü kayıt yalnızca bildirim
+    # gönderilince tazeleniyordu ve bot saatlerce sakin kalmıştı. Yaşı
+    # göstermeden "bozuk" demek, geçmişi şimdi gibi sunmak olur.
+    yas = None
+    try:
+        yas = (datetime.now(timezone.utc)
+               - datetime.fromisoformat(kayit["ts"])).total_seconds()
+    except (KeyError, ValueError, TypeError):
+        pass
+    kayit["yas_sn"] = None if yas is None else round(yas)
+    # Komut katmanı ~50 sn'de bir yokluyor; 10 dakika sessizlik kaydın
+    # artık ŞU ANI anlatmadığı anlamına gelir.
+    kayit["bayat"] = bool(yas is not None and yas > 600)
+    if kayit["bayat"] and not kayit.get("ok"):
+        kayit["sebep"] = (f"{kayit.get('sebep', '')} "
+                          f"— DİKKAT: bu kayıt {yas / 60:.0f} dakika önceye ait, "
+                          f"şu anki durumu YANSITMIYOR").strip()
+    return kayit
 
 
 def spawn_bot() -> bool:

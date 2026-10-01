@@ -33,6 +33,20 @@ log = logging.getLogger("notifier")
 # Panelin okuduğu anahtar. Değerin biçimi: JSON (bkz. _saglik).
 SAGLIK_ANAHTARI = "telegram_saglik"
 
+# GEÇİCİ ARIZADA YENİDEN DENE. 2026-10-01 01:55-01:59 arasında sunucunun
+# DNS'i düştü (NameResolutionError) ve Telegram'a da Binance'e de
+# ulaşılamadı. O pencerede gönderilen bildirimler KALICI OLARAK KAYBOLDU —
+# tek deneme yapılıyordu. Pozisyon kapanış bildirimi kaybolursa kullanıcı
+# işlemi hiç duymaz; ağ birkaç saniyelik hıçkırık yüzünden bu kabul edilemez.
+DENEME_SAYISI = 3
+DENEME_BEKLEME_S = (2, 5)        # 1. ve 2. başarısızlıktan sonraki bekleme
+
+# Kalıcı hatalar: yeniden denemek anlamsız, sadece gecikme üretir.
+# 401 (geçersiz token), 400 (bozuk markdown), 403 (bot engellendi),
+# 404 (chat yok) — bunlar tekrar denemekle düzelmez.
+# 429 (hız sınırı) ve 5xx (Telegram tarafı) GEÇİCİDİR, denenir.
+KALICI_HTTP = (400, 401, 403, 404)
+
 
 class TelegramNotifier:
     def __init__(self, token: str, chat_id: str, saglik_yaz=None):
@@ -107,14 +121,28 @@ class TelegramNotifier:
 
     # ----------------------------------------------------------------- gönderim
     def send(self, message: str) -> bool:
+        """Bildirimi gönderir. Geçici arızada yeniden dener, kalıcıda denemez.
+
+        Ayrımın önemi: ağ hıçkırığında (DNS, timeout, 5xx) tekrar denemek
+        bildirimi KURTARIR; geçersiz token ya da bozuk Markdown'da tekrar
+        denemek yalnızca gecikme üretir ve ana döngüyü bekletir.
+        """
         if not self.enabled:
             return False
-        try:
-            resp = requests.post(
-                f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": self.chat_id, "text": message, "parse_mode": "Markdown"},
-                timeout=8,
-            )
+        son_sebep = "bilinmiyor"
+        for deneme in range(DENEME_SAYISI):
+            try:
+                resp = requests.post(
+                    f"https://api.telegram.org/bot{self.token}/sendMessage",
+                    json={"chat_id": self.chat_id, "text": message,
+                          "parse_mode": "Markdown"},
+                    timeout=8,
+                )
+            except Exception as e:  # noqa: BLE001 — ağ katmanı: GEÇİCİ say
+                son_sebep = str(e)[:200]
+                if self._bekle(deneme, son_sebep):
+                    continue
+                break
             if resp.status_code >= 400:
                 # Gövdeyi oku: Telegram sebebi burada yazar ("chat not found",
                 # "Unauthorized", "can't parse entities"). Sebepsiz hata,
@@ -123,18 +151,37 @@ class TelegramNotifier:
                     sebep = resp.json().get("description", resp.text[:200])
                 except Exception:  # noqa: BLE001
                     sebep = resp.text[:200]
-                self._hata += 1
-                log.error("Telegram gönderilemedi (HTTP %s): %s", resp.status_code, sebep)
-                self._saglik(False, f"HTTP {resp.status_code}: {sebep}")
-                return False
+                son_sebep = f"HTTP {resp.status_code}: {sebep}"
+                if resp.status_code in KALICI_HTTP:
+                    self._hata += 1
+                    log.error("Telegram gönderilemedi (KALICI, HTTP %s): %s",
+                              resp.status_code, sebep)
+                    self._saglik(False, son_sebep)
+                    return False
+                if self._bekle(deneme, son_sebep):
+                    continue
+                break
             self._basari += 1
             self._saglik(True, "")
+            if deneme:
+                log.info("Telegram bildirimi %d. denemede gitti", deneme + 1)
             return True
-        except Exception as e:  # noqa: BLE001
-            self._hata += 1
-            log.error("Telegram bildirimi gönderilemedi: %s", e)
-            self._saglik(False, str(e)[:200])
+
+        self._hata += 1
+        log.error("Telegram bildirimi %d denemede de gönderilemedi: %s",
+                  DENEME_SAYISI, son_sebep)
+        self._saglik(False, son_sebep)
+        return False
+
+    def _bekle(self, deneme: int, sebep: str) -> bool:
+        """Yeniden deneme hakkı varsa bekler ve True döner."""
+        if deneme >= DENEME_SAYISI - 1:
             return False
+        sure = DENEME_BEKLEME_S[min(deneme, len(DENEME_BEKLEME_S) - 1)]
+        log.warning("Telegram geçici arıza (%d/%d), %d sn sonra tekrar: %s",
+                    deneme + 1, DENEME_SAYISI, sure, sebep)
+        time.sleep(sure)
+        return True
 
     def send_error(self, message: str) -> bool:
         """Hata bildirimi — aynı mesajı 5 dakika içinde tekrarlamaz."""
@@ -144,3 +191,29 @@ class TelegramNotifier:
         self._last_error_msg = message
         self._last_error_ts = now
         return self.send(f"⚠️ *HATA*\n`{message[:500]}`")
+
+
+def saglik_canli_yaz(set_kv, ok: bool, sebep: str = "") -> None:
+    """Komut katmanının getUpdates sonucunu sağlık kaydına işler.
+
+    NEDEN GEREKLİ (2026-10-01): kayıt yalnızca bir bildirim GÖNDERİLDİĞİNDE
+    güncelleniyordu. Bot sakin geçen saatlerde hiç göndermiyor, dolayısıyla
+    kayıt donuyor: 01:58'deki geçici DNS arızası saat 04:40'ta hâlâ "Telegram
+    BOZUK" diye duruyordu. Oysa komut katmanı ~50 saniyede bir getUpdates
+    çağırıyor — kanalın canlı olup olmadığını zaten BİLİYORUZ, sadece
+    yazmıyorduk. Elde olan sinyali kullanmamak, körlüğü kendi elimizle
+    sürdürmek demekti.
+
+    Panel bu kaydın YAŞINA da bakar; taze bir "ok" ile üç saatlik bir
+    "bozuk" aynı şey değildir.
+    """
+    try:
+        set_kv(SAGLIK_ANAHTARI, json.dumps({
+            "ok": ok,
+            "sebep": sebep,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "kaynak": "komut-katmani",   # gönderim değil, canlılık yoklaması
+            "yapilandirildi": True,
+        }, ensure_ascii=False))
+    except Exception as e:  # noqa: BLE001
+        log.warning("Telegram canlılık durumu yazılamadı: %s", e)

@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 import requests
 
 from .config import Config
+from .notifier import saglik_canli_yaz
 from .performans import ozet
 from .state import StateStore
 
@@ -124,6 +125,11 @@ class TelegramKomut:
             return None
         self._catisma = 0
         self.state.set_kv(CATISMA_ANAHTARI, "")
+        # KANAL CANLI. Bu bilgi bedava: getUpdates zaten ~50 sn'de bir
+        # dönüyor. Yazmazsak sağlık kaydı yalnızca bildirim gönderildiğinde
+        # tazelenir ve sakin saatlerde eski bir arıza donup kalır.
+        if metot == "getUpdates":
+            saglik_canli_yaz(self.state.set_kv, True)
         return govde.get("result")
 
     def _yaz(self, chat_id, metin: str, dugmeler: dict | None = None) -> None:

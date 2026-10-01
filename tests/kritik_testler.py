@@ -1715,6 +1715,112 @@ def test_tek_ornek():
     ok("panel çakışmayı 'sağlıklı' kaydının ÖNÜNDE gösteriyor")
 
 
+def test_bildirim_dayanikliligi():
+    """2026-10-01 01:55-01:59: sunucunun DNS'i düştü. Üç sonuç doğurdu ve
+    hepsi ayrı bir kusuru açığa çıkardı:
+      1) O pencerede gönderilen bildirimler KALICI OLARAK KAYBOLDU (tek deneme).
+      2) Sağlık kaydı 01:58'de donup kaldı; saat 04:40'ta hâlâ "Telegram
+         BOZUK" diyordu, oysa arıza 3 saat önce bitmişti.
+      3) Yavaş poll'lar turu 100 sn'ye çıkardı, kalp atışı bayatladı, nöbetçi
+         sağlıklı botu "ölmüş" sanıp 20 saniyede bir yenisini başlattı."""
+    print("\nBİLDİRİM DAYANIKLILIĞI (ağ hıçkırığı bildirimi yutmamalı)")
+    from src.notifier import (DENEME_SAYISI, KALICI_HTTP, SAGLIK_ANAHTARI,
+                              TelegramNotifier, saglik_canli_yaz)
+
+    class Yanit:
+        def __init__(self, kod, govde=None):
+            self.status_code = kod
+            self._g = govde or {}
+            self.text = json.dumps(self._g)
+        def json(self): return self._g
+
+    kayitlar = {}
+    n = TelegramNotifier("t", "555", saglik_yaz=lambda k, v: kayitlar.__setitem__(k, v))
+
+    # --- GEÇİCİ arıza: yeniden denenmeli ve SONUNDA gitmeli
+    cagri = {"n": 0}
+
+    def once_patla(*a, **k):
+        cagri["n"] += 1
+        if cagri["n"] < 3:
+            raise OSError("NameResolutionError: api.telegram.org")
+        return Yanit(200, {"ok": True})
+
+    with patch("src.notifier.requests.post", side_effect=once_patla), \
+         patch("src.notifier.time.sleep"):          # testi bekletmeyelim
+        assert n.send("deneme") is True, "geçici arızada bildirim kurtarılamadı"
+    assert cagri["n"] == 3, f"yeniden deneme olmadı (çağrı {cagri['n']})"
+    assert json.loads(kayitlar[SAGLIK_ANAHTARI])["ok"] is True
+    ok(f"DNS hıçkırığında bildirim yeniden denenip gönderiliyor ({DENEME_SAYISI} hak)")
+
+    # --- KALICI hata: denememeli, anında pes etmeli (ana döngüyü bekletmez)
+    for kod in KALICI_HTTP:
+        cagri["n"] = 0
+
+        def kalici(*a, **k):
+            cagri["n"] += 1
+            return Yanit(kod, {"description": "Unauthorized"})
+
+        with patch("src.notifier.requests.post", side_effect=kalici), \
+             patch("src.notifier.time.sleep"):
+            assert n.send("x") is False
+        assert cagri["n"] == 1, f"HTTP {kod} için boşuna {cagri['n']} deneme yapıldı"
+    ok(f"kalıcı hatalar {list(KALICI_HTTP)} tekrar DENENMİYOR (gecikme üretmez)")
+
+    # --- 429/5xx GEÇİCİ sayılmalı: hız sınırı ve Telegram arızası geçer
+    for kod in (429, 500, 503):
+        cagri["n"] = 0
+
+        def gecici(*a, **k):
+            cagri["n"] += 1
+            return Yanit(kod, {"description": "retry"})
+
+        with patch("src.notifier.requests.post", side_effect=gecici), \
+             patch("src.notifier.time.sleep"):
+            n.send("x")
+        assert cagri["n"] == DENEME_SAYISI, f"HTTP {kod} geçici sayılmamış"
+    ok("429 ve 5xx geçici sayılıp yeniden deneniyor")
+
+    # --- Komut katmanı sağlık kaydını TAZELEMELİ (bedava canlılık sinyali)
+    saglik_canli_yaz(kayitlar.__setitem__, True)
+    k2 = json.loads(kayitlar[SAGLIK_ANAHTARI])
+    assert k2["ok"] is True and k2["kaynak"] == "komut-katmani"
+    ok("komut katmanının getUpdates başarısı sağlık kaydını tazeliyor")
+
+    # --- Panel BAYAT kaydı şu anki durum gibi sunmamalı
+    from src import panel
+    state, _, _, _ = kur()
+    with patch.object(panel, "state", state):
+        eski = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+        state.set_kv(SAGLIK_ANAHTARI, json.dumps(
+            {"ok": False, "sebep": "NameResolutionError", "ts": eski}))
+        s = panel.telegram_saglik()
+        assert s["bayat"] is True, "3 saatlik kayıt bayat sayılmadı"
+        assert "YANSITMIYOR" in s["sebep"], s["sebep"]
+        assert s["yas_sn"] > 3000
+        ok("panel 3 saatlik arıza kaydını 'şu anı yansıtmıyor' diye işaretliyor")
+
+        taze = datetime.now(timezone.utc).isoformat()
+        state.set_kv(SAGLIK_ANAHTARI, json.dumps({"ok": True, "sebep": "", "ts": taze}))
+        s = panel.telegram_saglik()
+        assert s["bayat"] is False and s["ok"] is True
+        ok("taze 'ok' kaydı bayat işaretlenmiyor")
+
+    # --- Kalp atışı HER SEMBOLDE atmalı: yavaş tur ölüm sanılmasın
+    kaynak = Path("src/main.py").read_text(encoding="utf-8")
+    dongu = kaynak[kaynak.index("    while True:"):]
+    govde = dongu[:dongu.index("\n        try:")]
+    assert govde.count("bot_heartbeat") >= 2, (
+        "kalp atışı hâlâ tur başında bir kez atıyor — yavaş tur 'ölüm' sayılır")
+    assert govde.index("for t in traders") < govde.rindex("bot_heartbeat"), (
+        "kalp atışı sembol döngüsünün İÇİNDE atmıyor")
+    ok("kalp atışı her sembolde atıyor (yavaş tur 'bot düştü' sayılmıyor)")
+
+    # --- Kilit reddi ERROR olmamalı: kilidin çalıştığının kanıtı, arıza değil
+    assert 'log.info("Başlatılmadı' in kaynak, "kilit reddi hâlâ ERROR basıyor"
+    ok("kilit reddi INFO olarak loglanıyor (hata seli üretmiyor)")
+
+
 def main() -> int:
     print("=" * 74)
     print("  KRİTİK TESTLER — geçici DB, gerçek pozisyona DOKUNULMAZ")
@@ -1727,7 +1833,7 @@ def main() -> int:
                test_borsa_kanali,
                test_telegram_saglik, test_canli_altyapi, test_canli_trader, test_canli_kapisi,
                test_performans_karnesi, test_telegram_komut,
-               test_tek_ornek]
+               test_tek_ornek, test_bildirim_dayanikliligi]
     for fn in testler:
         try:
             fn()

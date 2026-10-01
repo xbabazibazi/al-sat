@@ -114,10 +114,13 @@ def _tek_ornek_ol(args, log) -> TekOrnekKilidi | None:
     try:
         kilit.al()
     except KilitTutulu as e:
-        log.error("BAŞLATILMADI — zaten çalışan bir bot var. %s", e)
-        log.error("İki bot aynı veritabanına yazarsa çifte pozisyon ve "
-                  "bozuk bakiye riski doğar; bu süreç çıkıyor.")
-        sys.exit(1)
+        # INFO, ERROR DEĞİL. Bu satır kilidin ÇALIŞTIĞININ kanıtı: nöbetçi
+        # fazladan bir bot başlatmayı denedi, kilit reddetti. ERROR olarak
+        # bastığımızda (2026-10-01) nöbetçi 20 saniyede bir denediği için
+        # log hata seline döndü ve gerçek hatalar içinde kayboldu. Gürültü,
+        # körlüğün bir başka biçimi.
+        log.info("Başlatılmadı — zaten çalışan bir bot var (kilit tutuluyor). %s", e)
+        sys.exit(0)   # beklenen durum; başarısızlık değil
     return kilit
 
 
@@ -214,14 +217,22 @@ def main() -> None:
                          name="tgkomut", daemon=True).start()
 
     while True:
-        state.set_kv("bot_heartbeat", datetime.now(timezone.utc).isoformat())
+        # KALP ATIŞI HER SEMBOLDE ATAR, tur başında BİR KEZ değil.
+        # 2026-10-01: sunucunun DNS'i düştü, her poll 10 sn timeout'a girdi
+        # ve 10 paritelik tur 100 saniyeyi aştı. Panelin tazelik penceresi
+        # 90 sn olduğu için SAĞLIKLI bot "düşmüş" sayıldı; nöbetçi 20
+        # saniyede bir yenisini başlattı, her biri kilide çarpıp ERROR
+        # bastı. Yani kalp atışı "yaşıyorum" değil "turu bitirdim" diyordu —
+        # ikisi aynı şey değil ve fark tam da arıza anında açılıyor.
         for t in traders:
+            state.set_kv("bot_heartbeat", datetime.now(timezone.utc).isoformat())
             try:
                 t.poll()
             except Exception as e:
                 log.error("[%s] Döngü hatası: %s", t.symbol, e, exc_info=True)
                 notifier.send_error(f"{t.symbol} döngü hatası: {e}")
             time.sleep(1)  # semboller arası kısa es — rate limit nezaketi
+        state.set_kv("bot_heartbeat", datetime.now(timezone.utc).isoformat())
 
         try:
             if futures_mode:
