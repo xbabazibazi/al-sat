@@ -235,8 +235,21 @@ class TelegramKomut:
                 f"   anlık `{upnl:+,.2f} {cur}`\n"
                 f"   stop `{s}{p.trailing_stop:,.2f}` → *şimdi stop olursa* "
                 f"`{stop_pnl:+,.2f} {cur}` _({kilit})_")
-        return "\n\n*BORSA* (sanal cüzdan)\n" + (
-            "\n".join(satirlar) if satirlar else "_açık pozisyon yok_")
+        # KARNE CÜZDAN BAŞINA. Dolar ve lira aynı ortalamaya girince
+        # "ortalama zarar" şişiyor ve beklenti anlamsızlaşıyor (bkz.
+        # panel.build_borsa_karne).
+        kovalar: dict[str, list[float]] = {}
+        for sembol, pnl in self.borsa_state.pozisyon_pnl_sembollu():
+            cur = "TRY" if sembol.upper().endswith(".IS") else "USD"
+            kovalar.setdefault(cur, []).append(pnl)
+        karne = []
+        for cur, v in sorted(kovalar.items()):
+            o = ozet(v)
+            karne.append(f"{cur}: {o['n']} pozisyon · kazanma %{o['kazanma_orani']} · "
+                         f"beklenti `{o['beklenti']:+,.2f}`")
+        return ("\n\n*BORSA* (sanal cüzdan)\n"
+                + ("\n".join(satirlar) if satirlar else "_açık pozisyon yok_")
+                + ("\n" + "\n".join(karne) if karne else ""))
 
     def _scalp_blok(self) -> str:
         """SCALP kanalı — kendi cüzdanı, kendi karnesi. Ana kanalla karışmaz."""

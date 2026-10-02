@@ -697,11 +697,24 @@ def build_borsa_state() -> dict:
         "assessments": borsa_state.latest_assessments(),
         "trades": borsa_state.recent_trades(20),
         "symbols": list(CONFIG.borsa_symbols),
-        # NOT: iki cüzdan (USD + TRY) tek listede toplanıyor. Rakamlar farklı
-        # para birimlerinden geldiği için "toplam" anlamsızdır; anlamlı olan
-        # kazanma oranı, ödeme oranı ve seri — onlar birimsizdir.
-        "performans": ozet(borsa_state.pnl_sirali()),
+        # KARNE CÜZDAN BAŞINA. Önceden iki cüzdan (USD + TRY) tek listede
+        # toplanıyordu ve yorumda "oranlar birimsizdir" deniyordu — o da
+        # yanlıştı: ₺9.000 zarar ile $90 kazanç aynı ortalamaya girince
+        # "ortalama zarar" şişer, ödeme oranı ve beklenti çöper. Canlıda
+        # beklenti −5.438 çıkıyordu, ki hiçbir şey ifade etmiyordu.
+        "performans": build_borsa_karne(),
     }
+
+
+def build_borsa_karne() -> dict:
+    """Her cüzdan için AYRI karne. Para birimleri asla toplanmaz."""
+    from .borsa_data import para_birimi
+
+    kovalar: dict[str, list[float]] = {}
+    for sembol, pnl in borsa_state.pozisyon_pnl_sembollu():
+        kovalar.setdefault(para_birimi(sembol), []).append(pnl)
+    return {cur: {**ozet(v), "simge": "₺" if cur == "TRY" else "$"}
+            for cur, v in sorted(kovalar.items())}
 
 
 def build_scalp_state() -> dict:
@@ -944,7 +957,7 @@ PAGE = """<!doctype html>
 </div>
 <div id="sayfaBorsa" style="display:none">
 <div class="grid" id="bStats"></div>
-<div class="card"><h2>Sistem Karnesi — hisse (iki cüzdan birlikte)</h2><div id="bPerf"></div></div>
+<div class="card"><h2>Sistem Karnesi — hisse (her cüzdan AYRI: dolar ve lira toplanmaz)</h2><div id="bPerf"></div></div>
 <div class="card"><h2>Açık Pozisyonlar — hisse (sanal cüzdan)</h2><div id="bKomutlar"></div><div id="bPositions"></div></div>
 <div class="card"><h2>Ön Değerlendirme — günlük mum + haftalık teyit</h2><div id="bAssess"></div></div>
 <div class="card"><h2>Son İşlemler — hisse</h2><div id="bTrades"></div></div>
@@ -1356,7 +1369,15 @@ async function refreshBorsa() {
 
   // Birim yazmiyoruz: USD ve TRY islemleri ayni listede. Oran ve seri
   // birimsizdir, anlamli olan onlar.
-  $("bPerf").innerHTML = perfKart(d.performans, "");
+  // CUZDAN BASINA AYRI KARNE. Dolar ve lira ayni ortalamaya girince
+  // "ortalama zarar" sisiyor ve beklenti anlamsizlasiyordu (-5.438 gibi).
+  $("bPerf").innerHTML = Object.entries(d.performans || {}).map(([cur, p]) =>
+    `<div style="margin-bottom:16px">
+       <div style="color:var(--ink2);font-size:13px;margin-bottom:6px">
+         <b>${cur}</b> cüzdanı — ${p.n} pozisyon</div>
+       ${perfKart(p, cur)}
+     </div>`
+  ).join("") || `<div class="empty">Henüz kapanmış işlem yok</div>`;
 
   $("bKomutlar").innerHTML = (d.komutlar || []).map(k => {
     const s = k.durum === "bekliyor" ? ["⏳", "var(--amber)"]

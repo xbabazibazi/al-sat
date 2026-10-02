@@ -275,6 +275,27 @@ class StateStore:
             toplam[k] += float(pnl)
         return [toplam[k] for k in sira]
 
+    def pozisyon_pnl_sembollu(self) -> list[tuple[str, float]]:
+        """pnl_pozisyon_bazli ile aynı gruplama, ama SEMBOLÜ de verir.
+
+        Gerekçe (2026-10-02): borsa kanalı İKİ cüzdan işletiyor (USD + TRY).
+        Hepsini tek listede toplamak karneyi anlamsız kılıyordu — ₺9.000
+        zarar ile $90 kazanç aynı ortalamaya girince "ortalama zarar" şişer,
+        ödeme oranı ve beklenti çöper. Panel buradan gelen sembolle para
+        birimini ayırıp HER CÜZDANA AYRI karne çıkarıyor.
+        """
+        cur = self._conn.execute(
+            "SELECT symbol, entry_time, pnl_usdt FROM trades ORDER BY id ASC")
+        toplam: dict[tuple[str, str], float] = {}
+        sira: list[tuple[str, str]] = []
+        for sembol, giris, pnl in cur.fetchall():
+            k = (sembol, giris)
+            if k not in toplam:
+                sira.append(k)
+                toplam[k] = 0.0
+            toplam[k] += float(pnl)
+        return [(k[0], toplam[k]) for k in sira]
+
     # ------------------------------------------------------------ anahtar/değer
     def get_kv(self, key: str, default: str = "") -> str:
         cur = self._conn.execute("SELECT value FROM kv WHERE key=?", (key,))

@@ -1632,6 +1632,59 @@ def test_telegram_komut():
     ok("token/chat_id yoksa komut katmanı hiç açılmıyor [beyaz liste yoksa kapı yok]")
 
 
+def test_borsa_karne_para_birimi():
+    """2026-10-02: borsa karnesi İKİ cüzdanı (USD + TRY) tek listede
+    topluyordu ve beklenti −5.438 çıkıyordu — hiçbir şey ifade etmeyen bir
+    sayı. ₺9.000 zarar ile $90 kazanç aynı ortalamaya girince "ortalama
+    zarar" şişiyor, ödeme oranı ve beklenti çöpe gidiyor. Eski yorumda
+    "oranlar birimsizdir" yazıyordu; o da yanlıştı."""
+    print("\nBORSA KARNESİ (dolar ve lira toplanmaz)")
+    from src import panel
+    from src.borsa_data import para_birimi
+
+    assert para_birimi("AKBNK.IS") == "TRY" and para_birimi("AAPL") == "USD"
+    ok("para birimi sembolden doğru çıkarılıyor")
+
+    db = Path(tempfile.mkdtemp()) / "borsa.db"
+    st = StateStore(db)
+    # TRY: büyük rakamlar · USD: küçük rakamlar
+    st.record_trade("AKBNK.IS", "2026-10-01T07:00:00+00:00", "2026-10-01T12:00:00+00:00",
+                    73.0, 66.5, 1475.0, "izleyen stop", pnl_override=-9000.0)
+    st.record_trade("SISE.IS", "2026-10-01T08:00:00+00:00", "2026-10-01T13:00:00+00:00",
+                    44.9, 49.2, 2077.0, "izleyen stop", pnl_override=4000.0)
+    st.record_trade("AAPL", "2026-10-01T14:00:00+00:00", "2026-10-01T18:00:00+00:00",
+                    331.0, 341.0, 3.0, "izleyen stop", pnl_override=90.0)
+    st.record_trade("AMD", "2026-10-01T15:00:00+00:00", "2026-10-01T19:00:00+00:00",
+                    521.0, 510.0, 1.0, "izleyen stop", pnl_override=-30.0)
+
+    with patch.object(panel, "borsa_state", st):
+        k = panel.build_borsa_karne()
+        assert set(k) == {"TRY", "USD"}, k
+        assert k["TRY"]["n"] == 2 and k["USD"]["n"] == 2
+        assert abs(k["TRY"]["toplam"] - (-5000.0)) < 1e-9, k["TRY"]["toplam"]
+        assert abs(k["USD"]["toplam"] - 60.0) < 1e-9, k["USD"]["toplam"]
+        assert k["TRY"]["simge"] == "₺" and k["USD"]["simge"] == "$"
+        ok("her cüzdan AYRI karne üretiyor, toplamlar karışmıyor")
+
+        # Karıştırılmış sayımın ne kadar bozuk olduğunu KANITLA
+        from src.performans import ozet as _o
+        karisik = _o([-9000.0, 4000.0, 90.0, -30.0])
+        assert karisik["ort_zarar"] > k["USD"]["ort_zarar"] * 50, (
+            "karışık sayım ortalama zararı şişirmiyor — test anlamsız")
+        assert karisik["odeme_orani"] != k["USD"]["odeme_orani"]
+        ok("karışık sayımın ödeme oranını bozduğu kanıtlandı [regresyon]")
+
+        d = panel.build_borsa_state()
+        assert isinstance(d["performans"], dict), "/api/borsa karnesi hâlâ tek sözlük"
+        assert "TRY" in d["performans"], d["performans"]
+    ok("/api/borsa karnesi cüzdan başına sözlük döndürüyor")
+
+    assert "Object.entries(d.performans" in panel.PAGE, (
+        "panel JS hâlâ tek karne çiziyor")
+    assert "dolar ve lira toplanmaz" in panel.PAGE, "başlık güncellenmemiş"
+    ok("panel iki karneyi ayrı ayrı çiziyor")
+
+
 def test_tek_ornek():
     """2026-09-30: sunucuda SEKİZ GÜN iki bot birden çalıştı (pid 8986 ve
     18256). İkisi de aynı SQLite'a yazdı, aynı log dosyasını döndürdü, aynı
@@ -2193,6 +2246,7 @@ def main() -> int:
                test_borsa_kanali,
                test_telegram_saglik, test_canli_altyapi, test_canli_trader, test_canli_kapisi,
                test_performans_karnesi, test_telegram_komut,
+               test_borsa_karne_para_birimi,
                test_tek_ornek, test_bildirim_dayanikliligi,
                test_scalp_kanali]
     for fn in testler:
