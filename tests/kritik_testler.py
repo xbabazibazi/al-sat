@@ -2017,6 +2017,35 @@ def test_scalp_kanali():
     ok("iz süren stop geri çekilmiyor [cırcır]")
 
     # --- FRENLER
+    # --- SANSÜRLEYEN FRENLER KÂĞITTA KAPALI OLABİLİR, CANLIDA ASLA.
+    # 2026-10-02: fren tetiklendi ve kanal 11 saat veri toplamadı. Fren
+    # devreye girince kötü günlerin kuyruğu ölçümden silinir ve karne
+    # olduğundan iyi görünür — kâğıdın tek işi doğru ölçmek.
+    s0, _, _, t0, _ = scalp_kur(scalp_max_gunluk_zarar=0, scalp_max_zarar_serisi=0)
+    s0.set_kv(f"spnl_{t0._bugun()}", "-9000")          # varlığın %90'ı zarar
+    s0.set_kv(f"szarar_serisi_{t0._bugun()}", "50")    # 50 üst üste zarar
+    acik, sebep = t0.girisler_acik_mi()
+    assert acik is True, f"fren 0'da hâlâ kapatıyor: {sebep}"
+    ok("fren 0 iken kâğıt kanalı durmuyor (ölçüm sansürlenmiyor)")
+
+    # Yapısal sınırlar fren 0 olsa da çalışmaya devam etmeli
+    s0.set_kv(f"sislem_{t0._bugun()}", str(CONFIG.scalp_max_gunluk_islem))
+    acik, sebep = t0.girisler_acik_mi()
+    assert acik is False and "kaçak döngü" in sebep, sebep
+    ok("işlem tavanı fren 0 iken de duruyor (kaçak döngü tamponu)")
+
+    for ad, kw in (("günlük zarar", {"scalp_max_gunluk_zarar": 0}),
+                   ("zarar serisi", {"scalp_max_zarar_serisi": 0})):
+        try:
+            replace(CONFIG, scalp_mode="live", scalp_live_key="k",
+                    scalp_live_secret="s", canli_onay="EVET_GERCEK_PARA",
+                    **{"scalp_max_gunluk_zarar": 0.03,
+                       "scalp_max_zarar_serisi": 10, **kw}).validate()
+            raise AssertionError(f"CANLIDA {ad} freni kapatılabildi!")
+        except ValueError as e:
+            assert "kapatılamaz" in str(e), str(e)
+    ok("canlıda sansürleyen frenler KAPATILAMIYOR [kâğıt ayrıcalığı orada biter]")
+
     s3, b3, _, t3, c3 = scalp_kur(scalp_max_zarar_serisi=3)
     s3.set_kv(f"szarar_serisi_{t3._bugun()}", "3")
     acik, sebep = t3.girisler_acik_mi()

@@ -1482,12 +1482,17 @@ async function refreshScalp() {
   // FRENLER gorunur olmali: scalp islem acmiyorsa sebebi log'da kalmasin.
   const f = d.frenler;
   $("sFrenler").innerHTML = `<div class="grid">` + [
-    ["Zarar serisi", f.zarar_serisi + "/" + f.max_zarar_serisi,
-     f.zarar_serisi >= f.max_zarar_serisi ? "FREN DEVREDE — bugün giriş yok" : "üst üste zarar",
-     f.zarar_serisi >= f.max_zarar_serisi ? -1 : 0],
+    // Fren 0 = KAPALI (kagitta olcumu sansurlememek icin). "0/0" gostermek
+    // "fren var ama dolu" gibi okunurdu; acikca KAPALI yaziyoruz.
+    ["Zarar serisi", f.max_zarar_serisi > 0 ? f.zarar_serisi + "/" + f.max_zarar_serisi : f.zarar_serisi,
+     f.max_zarar_serisi === 0 ? "fren KAPALI — sansürsüz ölçüm"
+       : (f.zarar_serisi >= f.max_zarar_serisi ? "FREN DEVREDE — bugün giriş yok" : "üst üste zarar"),
+     f.max_zarar_serisi > 0 && f.zarar_serisi >= f.max_zarar_serisi ? -1 : 0],
     ["Günlük işlem", f.gun_islem + "/" + f.max_gun_islem,
-     f.gun_islem >= f.max_gun_islem ? "TAVAN DOLDU" : "bugün açılan", f.gun_islem >= f.max_gun_islem ? -1 : 0],
-    ["Günlük zarar sınırı", "%" + f.max_gun_zarar_pct, "bugün " + money(f.gun_pnl), f.gun_pnl],
+     f.gun_islem >= f.max_gun_islem ? "TAVAN DOLDU" : "kaçak döngü tamponu", f.gun_islem >= f.max_gun_islem ? -1 : 0],
+    ["Günlük zarar sınırı", f.max_gun_zarar_pct > 0 ? "%" + f.max_gun_zarar_pct : "KAPALI",
+     f.max_gun_zarar_pct > 0 ? "bugün " + money(f.gun_pnl)
+       : "kâğıtta kapalı · canlıda zorunlu · bugün " + money(f.gun_pnl), f.gun_pnl],
     ["Maliyet kapısı", f.min_hedef_kat + "×", "sürtünme %" + f.surtunme_pct + " — hedef bunun katı olmalı", 0],
   ].map(([l,v,s,c]) =>
     `<div class="stat"><div class="l">${l}</div><div class="v ${cls(c)}">${v}</div><div class="s">${s}</div></div>`

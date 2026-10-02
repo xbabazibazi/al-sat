@@ -284,17 +284,29 @@ class Config:
     # (scalp_notional_tavani). Sabit sayı yazmak tehlikeliydi — 2026-10-02'de
     # %150'de kalmıştı ve 6 slotla marj fiziken sığmıyordu.
     scalp_max_notional_pct: float = float(_env("SCALP_MAX_NOTIONAL_PCT", "0"))
-    scalp_max_gunluk_zarar: float = float(_env("SCALP_MAX_GUNLUK_ZARAR", "0.03"))
-    # 1 saatlik mumla ölçülen akış ~10 işlem/gün (19 parite). Tavan 25 ile
-    # bağlayıcı değil ama kaçak bir döngüye karşı tampon kalıyor. 60'ta
-    # bırakmak "koruma var" yanılsaması üretirdi — hiç devreye girmezdi.
-    scalp_max_gunluk_islem: int = int(_env("SCALP_MAX_GUNLUK_ISLEM", "25"))
-    # Üst üste N zarar = rejim değişmiş olabilir; devam etmek komisyon bağışı.
-    # AMA eşik işlem sayısına göre ayarlanmalı. 60 işlem/günde beklenen tetik:
-    #   fren  5 → günde 1.87 kez (kanal çoğu gün KAPALI kalır)
-    #   fren 10 → günde 0.15 kez (gerçek rejim değişimini yakalar, gürültüyü değil)
-    # 5'te bırakmak "bol işlem" isteğini sessizce iptal ederdi.
-    scalp_max_zarar_serisi: int = int(_env("SCALP_MAX_ZARAR_SERISI", "10"))
+    # GÜNLÜK ZARAR KESİCİSİ — 0 = KAPALI (yalnızca kâğıtta).
+    #
+    # Kâğıtta neden kapalı: fren devreye girdiğinde ölçüm SANSÜRLENİR. Kötü
+    # günlerin yalnızca kesilmiş hâlini görürüz, stratejinin gerçek dağılımını
+    # değil — ve karne "fren sayesinde" olduğundan iyi görünür. Kâğıdın tek
+    # işi doğru ölçmek; sermaye korumaya gerek yok, para sanal.
+    # 2026-10-02'de bu tam olarak yaşandı: fren tetiklendi ve kanal 11 saat
+    # veri toplamadı.
+    #
+    # Canlıda ZORUNLU: validate() 0 olmasını reddeder. Sansürsüz ölçüm kâğıdın
+    # ayrıcalığı; gerçek parada korumasız gün diye bir şey yok.
+    scalp_max_gunluk_zarar: float = float(_env("SCALP_MAX_GUNLUK_ZARAR", "0"))
+    # İŞLEM TAVANI bir RİSK freni değil, KAÇAK DÖNGÜ tamponu. Ölçülen akış
+    # ~10 işlem/gün; 200 yalnızca bir kod hatası saniyede emir açmaya
+    # başlarsa devreye girer. Bu yüzden kâğıtta da açık kalıyor: ölçümü
+    # sansürlemiyor, sadece felaketi durduruyor.
+    scalp_max_gunluk_islem: int = int(_env("SCALP_MAX_GUNLUK_ISLEM", "200"))
+    # ZARAR SERİSİ FRENİ — 0 = KAPALI (yalnızca kâğıtta), günlük zarar
+    # kesicisiyle aynı gerekçe: seriyi kesmek dağılımın kuyruğunu ölçümden
+    # siler. Oysa bu stratejide uzun zarar serileri KURAL, istisna değil
+    # (kazanma %38 → 10 üst üste zarar olasılığı binde 6, 400 işlemde kaçınılmaz).
+    # Canlıda zorunlu: validate() 0'ı reddeder.
+    scalp_max_zarar_serisi: int = int(_env("SCALP_MAX_ZARAR_SERISI", "0"))
     scalp_allow_short: bool = _env("SCALP_ALLOW_SHORT", "true").lower() == "true"
     scalp_poll_seconds: int = int(_env("SCALP_POLL_SECONDS", "20"))
     scalp_baslangic_usdt: float = float(_env("SCALP_BASLANGIC_USDT", "10000"))
@@ -403,6 +415,20 @@ class Config:
             if self.canli_onay != "EVET_GERCEK_PARA":
                 raise ValueError(
                     "Canlı scalp KİLİTLİ. .env'e CANLI_ONAY=EVET_GERCEK_PARA ekle.")
+            # SANSÜRLEYEN FRENLER CANLIDA KAPATILAMAZ. Kâğıtta 0 = kapalı,
+            # çünkü fren devreye girince kötü günlerin kuyruğu ölçümden
+            # silinir ve karne olduğundan iyi görünür. Gerçek parada ise
+            # "korumasız gün" diye bir şey yok — ölçüm ayrıcalığı burada biter.
+            if self.scalp_max_gunluk_zarar <= 0:
+                raise ValueError(
+                    "Canlı scalp'te SCALP_MAX_GUNLUK_ZARAR kapatılamaz (0). "
+                    "Kâğıtta sansürsüz ölçüm için kapalı olabilir; gerçek "
+                    "parada günlük zarar kesicisi zorunludur.")
+            if self.scalp_max_zarar_serisi <= 0:
+                raise ValueError(
+                    "Canlı scalp'te SCALP_MAX_ZARAR_SERISI kapatılamaz (0). "
+                    "Üst üste zarar serisi rejim değişiminin en erken "
+                    "işaretidir; gerçek parada bu fren zorunludur.")
         if self.scalp_min_hedef_kat < 1.0:
             raise ValueError(
                 "SCALP_MIN_HEDEF_KAT 1'in altında olamaz: hedefin sürtünmeden "

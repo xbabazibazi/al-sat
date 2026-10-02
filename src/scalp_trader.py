@@ -122,17 +122,30 @@ class ScalpTrader:
 
     # ------------------------------------------------------------- frenler
     def girisler_acik_mi(self) -> tuple[bool, str]:
-        """Dört bağımsız fren. Scalp hızlı kanar; her biri ayrı bir yolu kapar."""
-        if self._sayac("zarar_serisi") >= self.cfg.scalp_max_zarar_serisi:
-            return False, (f"{self.cfg.scalp_max_zarar_serisi} üst üste zarar — "
+        """Frenler. 0 = o fren KAPALI (kâğıtta ölçümü sansürlememek için).
+
+        İki tür sınır var ve karıştırılmamalı:
+          • SANSÜRLEYEN frenler (günlük zarar, zarar serisi): devreye girince
+            kötü günlerin kuyruğu ölçümden silinir ve karne olduğundan iyi
+            görünür. Kâğıtta kapalı; canlıda zorunlu (config.validate).
+          • YAPISAL sınırlar (işlem tavanı, pozisyon tavanı): ölçümü
+            bozmazlar. İşlem tavanı kaçak döngü tamponu, pozisyon tavanı ise
+            marjın fiziken yetmesi için gerekli. İkisi her modda açık.
+        """
+        seri_esik = self.cfg.scalp_max_zarar_serisi
+        if seri_esik > 0 and self._sayac("zarar_serisi") >= seri_esik:
+            return False, (f"{seri_esik} üst üste zarar — "
                            f"bugün yeni giriş yok (rejim değişmiş olabilir)")
         if self._sayac("islem") >= self.cfg.scalp_max_gunluk_islem:
-            return False, f"günlük işlem tavanı ({self.cfg.scalp_max_gunluk_islem}) doldu"
-        gunluk = self._sayac("pnl")
-        varlik = self.varlik()
-        if varlik > 0 and gunluk < 0 and abs(gunluk) / varlik >= self.cfg.scalp_max_gunluk_zarar:
-            return False, (f"günlük zarar sınırı %{self.cfg.scalp_max_gunluk_zarar * 100:g} "
-                           f"aşıldı ({gunluk:+.2f} USDT)")
+            return False, (f"günlük işlem tavanı ({self.cfg.scalp_max_gunluk_islem}) "
+                           f"doldu — bu bir kaçak döngü tamponudur, normalde dolmaz")
+        zarar_esik = self.cfg.scalp_max_gunluk_zarar
+        if zarar_esik > 0:
+            gunluk = self._sayac("pnl")
+            varlik = self.varlik()
+            if varlik > 0 and gunluk < 0 and abs(gunluk) / varlik >= zarar_esik:
+                return False, (f"günlük zarar sınırı %{zarar_esik * 100:g} "
+                               f"aşıldı ({gunluk:+.2f} USDT)")
         if len(self.state.all_positions()) >= self.cfg.scalp_max_pozisyon:
             return False, f"eşzamanlı pozisyon tavanı ({self.cfg.scalp_max_pozisyon})"
         return True, ""
