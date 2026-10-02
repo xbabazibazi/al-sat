@@ -786,8 +786,13 @@ def build_scalp_state() -> dict:
         "positions": positions,
         "komutlar": komutlar,
         "symbols": list(CONFIG.scalp_symbols),
-        "trades": scalp_state.recent_trades(20),
-        "performans": ozet(scalp_state.pnl_sirali()),
+        "trades": scalp_state.recent_trades(30),
+        # POZİSYON BAZLI: scalp hedefte yarıyı kapatıp kalanı taşıdığı için
+        # tek pozisyon iki kapanış kaydı üretir. Kayıt bazlı saymak kazanma
+        # oranını şişirip ödeme oranını düşürüyordu ve ZIT teşhis veriyordu.
+        "performans": ozet(scalp_state.pnl_pozisyon_bazli()),
+        # Gizlemiyoruz: kaç kapanış kaydı kaç pozisyona denk geliyor.
+        "kayit_sayisi": len(scalp_state.pnl_sirali()),
         # FRENLER panelde görünür olmalı: "neden işlem açmıyor?" sorusunun
         # cevabı log'da kalmasın.
         "frenler": {

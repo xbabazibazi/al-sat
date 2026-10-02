@@ -2054,6 +2054,47 @@ def test_scalp_kanali():
         "scalp ana kanalın komut kuyruğunu kullanıyor olabilir")
     ok("scalp ayrı DB ve ayrı komut kuyruğu kullanıyor [ana kanal yalıtık]")
 
+    # --- KARNE POZİSYON BAZLI OLMALI. 2026-10-02: scalp hedefte yarıyı
+    # kapatıp kalanı taşıyor, her kapanış `trades`'e AYRI satır yazıyor.
+    # Kayıt bazlı sayım tek kazanan pozisyonu İKİ kazanç gibi gösteriyordu ve
+    # iki tablo ZIT teşhis veriyordu (kayıt: kazanma %42.9/ödeme 1.02 →
+    # "kazançlar küçük"; pozisyon: %27.3/2.05 → "kazanma oranı düşük").
+    s8, _, _, t8, _ = scalp_kur()
+    p8 = poz(s8, sym="BTCUSDT", entry=100.0, stop=96.0, qty=10.0, risk_unit=1.0)
+    giris8 = p8.entry_time
+    # Aynı pozisyonun iki parçası: yarısı hedefte, kalanı stopla
+    s8.record_trade("BTCUSDT", giris8, "2026-10-02T06:00:00+00:00",
+                    100.0, 101.5, 5.0, "kâr hedefi", side="LONG", pnl_override=30.0)
+    s8.record_trade("BTCUSDT", giris8, "2026-10-02T06:30:00+00:00",
+                    100.0, 103.0, 5.0, "izleyen stop", side="LONG", pnl_override=70.0)
+    # Ayrı bir pozisyon: tek parçada zarar
+    s8.record_trade("ETHUSDT", "2026-10-02T07:00:00+00:00", "2026-10-02T07:30:00+00:00",
+                    50.0, 48.0, 10.0, "izleyen stop", side="LONG", pnl_override=-40.0)
+
+    kayit = s8.pnl_sirali()
+    pozisyon = s8.pnl_pozisyon_bazli()
+    assert len(kayit) == 3, kayit
+    assert len(pozisyon) == 2, f"kısmi kapanışlar birleşmedi: {pozisyon}"
+    assert abs(pozisyon[0] - 100.0) < 1e-9, pozisyon
+    assert abs(sum(kayit) - sum(pozisyon)) < 1e-9, "toplam K/Z değişmemeli"
+    ok("kısmi kapanışlar POZİSYON bazında birleşiyor (toplam K/Z korunuyor)")
+
+    from src.performans import ozet as _ozet
+    k_karne, p_karne = _ozet(kayit), _ozet(pozisyon)
+    assert k_karne["kazanma_orani"] > p_karne["kazanma_orani"], (
+        "kayıt bazlı sayım kazanma oranını şişirmiyor — test anlamsız")
+    assert p_karne["odeme_orani"] > k_karne["odeme_orani"], (
+        "pozisyon bazlı ödeme oranı daha yüksek olmalıydı")
+    ok("kayıt bazlı sayım kazanma oranını şişirip ödemeyi düşürüyor [kanıt]")
+
+    with patch.object(panel_mod := __import__("src.panel", fromlist=["x"]),
+                      "scalp_state", s8):
+        ds = panel_mod.build_scalp_state()
+        assert ds["performans"]["n"] == 2, (
+            f"panel karnesi hâlâ kayıt bazlı: n={ds['performans']['n']}")
+        assert ds["kayit_sayisi"] == 3, "kapanış kaydı sayısı gizlenmiş"
+    ok("panel karnesi pozisyon bazlı, kayıt sayısı da ayrıca gösteriliyor")
+
     # --- PANEL sözleşmesi ve sekme kimlikleri
     from src import panel
     with patch.object(panel, "scalp_state", state):

@@ -246,6 +246,35 @@ class StateStore:
         cur = self._conn.execute("SELECT pnl_usdt FROM trades ORDER BY id ASC")
         return [float(r[0]) for r in cur.fetchall()]
 
+    def pnl_pozisyon_bazli(self) -> list[float]:
+        """K/Z'yi POZİSYON başına toplar — kısmi kapanışları birleştirir.
+
+        NEDEN GEREKLİ (2026-10-02): scalp kanalı hedefte pozisyonun yarısını
+        kapatıp kalanı iz süren stopla taşıyor. Her kapanış `trades`'e AYRI
+        satır yazıyor, dolayısıyla tek bir kazanan pozisyon İKİ kazanç kaydı
+        üretiyor. Karne bunu 14 işlem sanıyordu, gerçekte 11 pozisyon vardı
+        ve iki tablo ZIT teşhis veriyordu:
+            kayıt bazlı : kazanma %42.9 · ödeme 1.02 → "kazançlar küçük"
+            pozisyon bazlı: kazanma %27.3 · ödeme 2.05 → "kazanma oranı düşük"
+        Yanlış ölçümle yanlış parametre değiştirilecekti.
+
+        Gruplama anahtarı (sembol, giriş zamanı): aynı pozisyonun parçaları
+        aynı giriş damgasını taşır. Kısmi kapanış yapmayan kanallarda
+        (kripto, borsa) sonuç pnl_sirali() ile BİREBİR aynıdır — yani
+        güvenle her yerde kullanılabilir.
+        """
+        cur = self._conn.execute(
+            "SELECT symbol, entry_time, pnl_usdt FROM trades ORDER BY id ASC")
+        toplam: dict[tuple[str, str], float] = {}
+        sira: list[tuple[str, str]] = []
+        for sembol, giris, pnl in cur.fetchall():
+            k = (sembol, giris)
+            if k not in toplam:
+                sira.append(k)
+                toplam[k] = 0.0
+            toplam[k] += float(pnl)
+        return [toplam[k] for k in sira]
+
     # ------------------------------------------------------------ anahtar/değer
     def get_kv(self, key: str, default: str = "") -> str:
         cur = self._conn.execute("SELECT value FROM kv WHERE key=?", (key,))

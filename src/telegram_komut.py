@@ -264,7 +264,9 @@ class TelegramKomut:
                 (f" · `{r:+.2f}R`" if r is not None else "") + "\n"
                 f"   stop `{p.trailing_stop:,.6g}` → *şimdi stop olursa* "
                 f"`{stop_pnl:+,.2f}` USDT")
-        o = ozet(self.scalp_state.pnl_sirali())
+        # POZİSYON BAZLI — kısmi kapanışlar tek pozisyon sayılır (bkz.
+        # state.pnl_pozisyon_bazli; kayıt bazlı sayım zıt teşhis veriyordu).
+        o = ozet(self.scalp_state.pnl_pozisyon_bazli())
         bugun = datetime.now(timezone.utc).date().isoformat()
         gun_pnl = float(self.scalp_state.get_kv(f"spnl_{bugun}", "0") or 0)
         gun_islem = int(float(self.scalp_state.get_kv(f"sislem_{bugun}", "0") or 0))
