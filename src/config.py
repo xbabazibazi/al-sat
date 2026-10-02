@@ -140,7 +140,12 @@ class Config:
     # Varsayılan 4.0'dı; kullanıcı HER R'da haber istedi (2026-09-10) → 1.0.
     # Her tam R eşiği (1R, 2R, 3R...) BİR kez bildirilir; eşik etrafında
     # gidip gelme spam yapmaz (r_notified cırcırı yalnızca yukarı sayar).
-    r_notify_level: float = float(_env("R_NOTIFY_LEVEL", "1.0"))
+    # 0 = KAPALI. 2026-09-10'da kullanıcı "her R'da haber ver" demişti ve 1.0
+    # yapılmıştı; 2026-10-03'te "çok uyarı alıyorum, akşamdan akşama sonuca
+    # bakalım" dedi. Üç kanal + 20 parite ile her R eşiği ciddi bir sel
+    # üretiyordu. Akşam özetinde R ilerlemeleri yine görünüyor.
+    # Geri açmak için: .env'e R_NOTIFY_LEVEL=1.0
+    r_notify_level: float = float(_env("R_NOTIFY_LEVEL", "0"))
 
     # Komisyon optimizasyonu:
     # - Binance'te "BNB ile komisyon öde" açıksa spot ücret %0.10 → %0.075 düşer.
@@ -330,6 +335,13 @@ class Config:
     # Canlıda zorunlu: validate() 0'ı reddeder.
     scalp_max_zarar_serisi: int = int(_env("SCALP_MAX_ZARAR_SERISI", "0"))
     scalp_allow_short: bool = _env("SCALP_ALLOW_SHORT", "true").lower() == "true"
+    # RUTİN BİLDİRİM KAPALI (2026-10-03, kullanıcı: "çok uyarı alıyorum").
+    # 20 parite × açılış+kapanış+yarı kâr = günde 15-20 mesaj ediyordu.
+    # Bu bayrak YALNIZCA rutin açılış/kapanış mesajlarını susturur;
+    # HATA ve ACİL bildirimleri (stopsuz pozisyon, broker arızası) her
+    # zaman gider — sessizlik asla arızayı gizlemek için kullanılmaz.
+    # Sonuçlar akşam tek özette toplanıyor (bkz. gunluk_rapor.py).
+    scalp_bildirim: bool = _env("SCALP_BILDIRIM", "false").lower() == "true"
     scalp_poll_seconds: int = int(_env("SCALP_POLL_SECONDS", "20"))
     scalp_baslangic_usdt: float = float(_env("SCALP_BASLANGIC_USDT", "10000"))
 

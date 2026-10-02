@@ -1632,6 +1632,71 @@ def test_telegram_komut():
     ok("token/chat_id yoksa komut katmanı hiç açılmıyor [beyaz liste yoksa kapı yok]")
 
 
+def test_aksam_ozeti():
+    """2026-10-03: kullanıcı "çok uyarı alıyorum, akşamdan akşama sonuca
+    bakalım" dedi. Rutin bildirimler kapatıldı, sonuç tek akşam özetine
+    taşındı. KRİTİK OLAN: sessizlik arızayı GİZLEMEMELİ — hata ve acil
+    bildirimleri bu bayraktan bağımsız kalmalı."""
+    print("\nAKŞAM ÖZETİ + SESSİZLİK (arıza gizlenmemeli)")
+    from src.gunluk_rapor import DAMGA, belki_gonder, gunluk_ozet_metni
+
+    # --- RUTİN bildirim kapalıyken gönderilmemeli
+    state, _, _, t, _ = scalp_kur(scalp_bildirim=False)
+    p = poz(state, sym="BTCUSDT", entry=100.0, stop=96.0, qty=10.0, risk_unit=1.0)
+    t._kapat(p, 96.0, 1.0, "izleyen stop")
+    assert t.notifier.send.call_count == 0, "rutin kapanış mesajı yine gitti"
+    ok("SCALP_BILDIRIM=false iken rutin kapanış mesajı gitmiyor")
+
+    state, _, _, t2, _ = scalp_kur(scalp_bildirim=True)
+    p = poz(state, sym="BTCUSDT", entry=100.0, stop=96.0, qty=10.0, risk_unit=1.0)
+    t2._kapat(p, 96.0, 1.0, "izleyen stop")
+    assert t2.notifier.send.call_count >= 1, "bayrak açıkken mesaj gitmedi"
+    ok("SCALP_BILDIRIM=true iken rutin mesaj yine çalışıyor [geri dönüş mümkün]")
+
+    # --- ACİL/HATA bildirimi SUSTURULMAMIŞ olmalı
+    kaynak = Path("src/scalp_trader.py").read_text(encoding="utf-8")
+    assert "self.notifier.send_error(" in kaynak, (
+        "acil/hata bildirimi de bayrağa bağlanmış olabilir — sessizlik "
+        "ASLA arızayı gizlemek için kullanılmaz")
+    i = kaynak.index('sonuc.get("acil")')
+    assert "send_error" in kaynak[i:i + 500], "stopsuz pozisyon uyarısı susturulmuş!"
+    ok("ACİL ve HATA bildirimleri bayraktan BAĞIMSIZ (hâlâ anında gidiyor)")
+
+    # --- Özet ÜÇ kanalı birden anlatmalı
+    db = Path(tempfile.mkdtemp()) / "b.db"
+    bo = StateStore(db)
+    bo.record_trade("AKBNK.IS", "2026-10-01T07:00:00+00:00",
+                    "2026-10-01T12:00:00+00:00", 73, 66.5, 1475, "stop",
+                    pnl_override=-9000.0)
+    bo.record_trade("AAPL", "2026-10-01T14:00:00+00:00",
+                    "2026-10-01T18:00:00+00:00", 331, 341, 3, "stop",
+                    pnl_override=90.0)
+    cfg = replace(CONFIG, borsa_enabled=True, borsa_db_path=db)
+    metin = gunluk_ozet_metni(cfg)
+    for beklenen in ("AKŞAM ÖZETİ", "KRİPTO", "GENİŞ", "BORSA", "TRY:", "USD:"):
+        assert beklenen in metin, f"özette eksik: {beklenen}\n{metin}"
+    assert "-9,000.00" in metin and "+90.00" in metin, "para birimleri karışmış"
+    ok("akşam özeti üç kanalı birden ve borsa'yı cüzdan başına anlatıyor")
+
+    # --- GÜNDE BİR kez: damga TEK DB'de olmalı, yoksa kanal sayısı kadar gider
+    ana = StateStore(Path(tempfile.mkdtemp()) / "a.db")
+    bildirim = MagicMock()
+    gec = replace(cfg, daily_report_hour=0)       # saat koşulu geçsin
+    assert belki_gonder(gec, ana, bildirim) is True
+    assert bildirim.send.call_count == 1
+    assert belki_gonder(gec, ana, bildirim) is False, "aynı akşam ikinci rapor!"
+    assert bildirim.send.call_count == 1
+    assert ana.get_kv(DAMGA) == datetime.now().date().isoformat()
+    ok("akşam özeti günde BİR kez gidiyor (damga tek DB'de)")
+
+    ana2 = StateStore(Path(tempfile.mkdtemp()) / "a2.db")
+    b2 = MagicMock()
+    erken = replace(cfg, daily_report_hour=25)    # asla gelmeyecek saat
+    assert belki_gonder(erken, ana2, b2) is False
+    assert b2.send.call_count == 0
+    ok("rapor saati gelmeden özet gönderilmiyor")
+
+
 def test_borsa_karne_para_birimi():
     """2026-10-02: borsa karnesi İKİ cüzdanı (USD + TRY) tek listede
     topluyordu ve beklenti −5.438 çıkıyordu — hiçbir şey ifade etmeyen bir
@@ -2278,7 +2343,7 @@ def main() -> int:
                test_borsa_kanali,
                test_telegram_saglik, test_canli_altyapi, test_canli_trader, test_canli_kapisi,
                test_performans_karnesi, test_telegram_komut,
-               test_borsa_karne_para_birimi,
+               test_aksam_ozeti, test_borsa_karne_para_birimi,
                test_tek_ornek, test_bildirim_dayanikliligi,
                test_scalp_kanali]
     for fn in testler:

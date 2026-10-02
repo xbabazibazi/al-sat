@@ -17,6 +17,7 @@ from logging.handlers import RotatingFileHandler
 
 from .config import CONFIG
 from .exchange import MarketData, build_broker
+from .gunluk_rapor import belki_gonder
 from .futures_trader import (FuturesLiveTrader, FuturesPaperTrader,
                              maybe_send_futures_daily_report, snapshot_equity)
 from .notifier import TelegramNotifier
@@ -302,10 +303,12 @@ def main() -> None:
             if futures_mode:
                 snapshot_equity(traders, state)  # panel varlık grafiği için
                 if futures_paper_mode:
-                    # $10.000 sanal başlangıç varsayar — canlı/testnet'te bakiye
-                    # keyfi olduğu için burada YANLIŞ yüzde üretirdi. Canlı
-                    # günlük özeti henüz yazılmadı (bilinçli eksik, bkz. docs/07).
-                    maybe_send_futures_daily_report(CONFIG, traders, state, notifier)
+                    # AKŞAM ÖZETİ — üç kanal BİRDEN, günde tek mesaj.
+                    # Eski maybe_send_futures_daily_report yalnızca kripto
+                    # kanalını anlatıyordu; borsa ve geniş kanal raporsuzdu.
+                    # Rutin açılış/kapanış bildirimleri kapatıldığı için
+                    # (2026-10-03) sonucun tek toplandığı yer burası.
+                    belki_gonder(CONFIG, state, notifier)
             else:
                 maybe_send_daily_report(CONFIG, market, broker, state, notifier)
         except Exception as e:

@@ -94,6 +94,20 @@ class ScalpTrader:
         self._mum_onbellek = (simdi, df)
         return df
 
+    def _bildir(self, mesaj: str) -> None:
+        """RUTİN bildirim — SCALP_BILDIRIM kapalıysa gönderilmez.
+
+        2026-10-03: 20 parite × (açılış + yarı kâr + kapanış) günde 20'yi
+        aşan mesaj üretiyordu. Sonuçlar akşam özetine taşındı
+        (gunluk_rapor.py).
+
+        HATA ve ACİL bildirimleri bu yoldan GEÇMEZ — onlar send_error ile
+        doğrudan gider. Sessizlik hiçbir zaman arızayı gizlemek için
+        kullanılmaz; bu projede en pahalı ders buydu.
+        """
+        if self.cfg.scalp_bildirim:
+            self.notifier.send(mesaj)
+
     def _sonuc(self, durum: str, mesaj: str) -> None:
         """Manuel komutun âkıbeti — panel okur. Sessiz yutma yasak."""
         self.state.set_kv(
@@ -225,8 +239,8 @@ class ScalpTrader:
 
         emoji = "🟢" if net >= 0 else "🔴"
         pay = "tamamı" if tam else f"%{oran * 100:.0f}'ı"
-        self.notifier.send(
-            f"{emoji} *SCALP · {self.symbol} {pos.side}* — {pay} kapandı\n"
+        self._bildir(
+            f"{emoji} *{self.symbol} {pos.side}* — {pay} kapandı\n"
             f"• Sebep: {sebep}\n"
             f"• Giriş `{pos.entry_price:,.6g}` → Çıkış `{gercek_cikis:,.6g}`\n"
             f"• Net `{net:+,.2f}` USDT · `{r:+.2f}R`"
@@ -293,8 +307,8 @@ class ScalpTrader:
 
         hedef = (giris + self.cfg.scalp_kar_hedefi_r * risk_mesafe if yon == "LONG"
                  else giris - self.cfg.scalp_kar_hedefi_r * risk_mesafe)
-        self.notifier.send(
-            f"⚡ *SCALP {yon} açıldı* · `{self.symbol}`\n"
+        self._bildir(
+            f"⚡ *{yon} açıldı* · `{self.symbol}`\n"
             f"• Giriş `{giris:,.6g}` · miktar `{pos.qty:,.6g}`\n"
             f"• Stop `{pos.trailing_stop:,.6g}` (1R = `{risk_mesafe:,.6g}`)\n"
             f"• Hedef `{hedef:,.6g}` → yarısı burada kapanır "
