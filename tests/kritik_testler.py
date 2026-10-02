@@ -2054,6 +2054,26 @@ def test_scalp_kanali():
         "scalp ana kanalın komut kuyruğunu kullanıyor olabilir")
     ok("scalp ayrı DB ve ayrı komut kuyruğu kullanıyor [ana kanal yalıtık]")
 
+    # --- ÖLÇÜLMÜŞ AYARLAR KİLİTLİ. 2026-10-02'de 15dk·1×ATR·hedef 1.5R
+    # ayarı 809 geçmiş işlemde −0.724R beklenti verdi ve canlı kâğıtta
+    # günlük %3 kesiciyi tetikledi. Hangi kolun ne kattığı tek tek ölçüldü:
+    #   15dk·1×ATR·1.5R·taker −0.724R → +maker −0.094R → +1sa +0.196R
+    #   → +3×ATR/hedefi gevşet +0.195R
+    # Doğrulama: aynı simülasyon ANA KANALIN ayarını (4sa·3×ATR·hedefsiz)
+    # +0.116R buluyor; ana kanal gerçekten kârlı, model güvenilir.
+    # Bu test o ölçümün kaybolmasını engeller — varsayılanlar sessizce
+    # zarar eden bölgeye geri dönmesin.
+    assert CONFIG.scalp_timeframe not in ("1m", "3m", "5m", "15m"), (
+        f"SCALP_TIMEFRAME={CONFIG.scalp_timeframe} — 15dk ve altı ölçümde "
+        f"NEGATİF beklenti verdi (sürtünme işlem başına 0.39R yiyor)")
+    assert CONFIG.scalp_atr_carpani >= 2.0, (
+        f"ATR çarpanı {CONFIG.scalp_atr_carpani} — 1×ATR işlemlerin %75'ini "
+        f"gürültüye kurban ediyordu (kazanma %25 vs 3×ATR'de %37)")
+    assert CONFIG.scalp_kar_hedefi_r == 0 or CONFIG.scalp_kar_hedefi_r >= 2.5, (
+        f"kâr hedefi {CONFIG.scalp_kar_hedefi_r}R — 1.5R eşiği beklentinin "
+        f"üçte birini yiyor (+0.195R hedefsiz → +0.135R 1.5R'de)")
+    ok("ölçülmüş scalp ayarları kilitli (zarar eden bölgeye dönüş yasak)")
+
     # --- KARNE POZİSYON BAZLI OLMALI. 2026-10-02: scalp hedefte yarıyı
     # kapatıp kalanı taşıyor, her kapanış `trades`'e AYRI satır yazıyor.
     # Kayıt bazlı sayım tek kazanan pozisyonu İKİ kazanç gibi gösteriyordu ve

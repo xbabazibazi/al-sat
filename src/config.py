@@ -211,11 +211,27 @@ class Config:
             "INJUSDT,ARBUSDT,OPUSDT,APTUSDT,SUIUSDT,MATICUSDT"
         ).split(",") if s.strip())
 
-    # ZAMAN DİLİMİ — 2026-10-01 canlı ölçümü (5 parite, son 100 mum):
-    #   1dk ATR %0.111 · 5dk %0.208 · 15dk %0.458 · 1sa %1.056
-    # Gidiş-dönüş sürtünme ≈ %0.20. Yani 1dk'da sürtünme 1R hedefin %135'i.
-    # 15dk, matematiksel olarak kazanma şansı olan en hızlı seçenek.
-    scalp_timeframe: str = _env("SCALP_TIMEFRAME", "15m")
+    # ZAMAN DİLİMİ — 1 SAAT. 15dk ile başlandı ve ÖLÇÜMLE ÇÜRÜTÜLDÜ.
+    #
+    # 2026-10-02, 809 geçmiş işlem (19 parite, 15dk, Donchian 10, 1×ATR,
+    # hedef 1.5R, taker): beklenti −0.724R/işlem. Canlı kâğıt da bunu
+    # doğruladı (28 pozisyon, kazanma %14.8, günlük %3 kesici tetiklendi).
+    # Yani şanssızlık değil, aritmetik: sürtünme işlem başına 0.39R yiyordu.
+    #
+    # Hangi kolun ne kadar işe yaradığı ayrı ayrı ölçüldü:
+    #   15dk · 1×ATR · hedef 1.5R · taker  → −0.724R   (başlangıç)
+    #   + maker ücret                      → −0.094R   (sürtünme 0.39→0.13R)
+    #   + 1 saate çık                      → +0.196R   (kazanma %34→%41)
+    #   + 3×ATR, dar hedefi kaldır         → +0.195R   (ödeme 1.56→2.30)
+    # Doğrulama: simülasyon ANA KANALIN ayarını (4sa·3×ATR·hedefsiz)
+    # +0.116R buluyor — ana kanal gerçekten kârlı, yani model güvenilir.
+    #
+    # Seçilen ayar üç sürtünme varsayımında da ARTI:
+    #   maker+kaymasız %0.065 → +0.181R · maker+kayma %0.14 → +0.156R
+    #   taker+kayma    %0.200 → +0.136R
+    # Bu yüzden maker giriş YAZILMADI: gerek yok ve limit emrin dolum
+    # belirsizliğini modellemek yeni bir sapma kaynağı olurdu.
+    scalp_timeframe: str = _env("SCALP_TIMEFRAME", "1h")
 
     # İKİ PARAMETRE. Donchian = zamanlama, ATR çarpanı = stop mesafesi.
     # Ana kanalın 3.0'ı burada fazla geniş olurdu (hedef sürtünmeyi karşılamaz).
@@ -224,11 +240,23 @@ class Config:
     # yani sinyal kalitesini bozmadan sıklık kazandırıyor. Ana kanal da
     # .env'de 10 kullanıyor, yani bu değer projede zaten sınanmış.
     scalp_donchian: int = int(_env("SCALP_DONCHIAN", "10"))
-    scalp_atr_carpani: float = float(_env("SCALP_ATR_CARPANI", "1.0"))
+    # ATR ÇARPANI 3 — 1'den yükseltildi. 1×ATR stopu işlemlerin %75'ini
+    # gürültüye kurban ediyordu (ölçüm: 15dk'da kazanma %25, 3×ATR'de %37).
+    # Ana kanal da 3 kullanıyor; "dar stop daha az risk" sezgisi yanlış çıktı,
+    # çünkü dar stop daha SIK tetiklenir ve her tetik sürtünme öder.
+    scalp_atr_carpani: float = float(_env("SCALP_ATR_CARPANI", "3.0"))
 
     # ÇIKIŞ: hedefte YARISI kapanır, kalan iz süren stopla devam eder ve
     # stop en az girişe çekilir (koşan yarı zarar edemez).
-    scalp_kar_hedefi_r: float = float(_env("SCALP_KAR_HEDEFI_R", "1.5"))
+    #
+    # EŞİK 4R — 1.5R'den yükseltildi. Yarı kâr almak beklentiye MAL OLUYOR
+    # (ölçüm, 1sa·3×ATR, 429 işlem):
+    #   hedef yok    +0.195R      yarısı 2.5R'de  +0.163R  (−%16)
+    #   yarısı 1.5R  +0.135R      yarısı 4.0R'de  +0.184R  (−%6)
+    # Kullanıcı "belli kâr marjında çıkış" istedi; özellik korunuyor ama
+    # eşiği bedeli en düşük yere çekildi. 1.5R'de kalmak beklentinin
+    # üçte birini yiyordu — kâr alma hissinin bedeli bu kadar olmamalı.
+    scalp_kar_hedefi_r: float = float(_env("SCALP_KAR_HEDEFI_R", "4.0"))
 
     # MALİYET KAPISI — bu kanalın yaşam savaşı. Hedef, gidiş-dönüş
     # sürtünmenin en az bu kadar katı olmalı; değilse işleme GİRİLMEZ.
@@ -257,7 +285,10 @@ class Config:
     # %150'de kalmıştı ve 6 slotla marj fiziken sığmıyordu.
     scalp_max_notional_pct: float = float(_env("SCALP_MAX_NOTIONAL_PCT", "0"))
     scalp_max_gunluk_zarar: float = float(_env("SCALP_MAX_GUNLUK_ZARAR", "0.03"))
-    scalp_max_gunluk_islem: int = int(_env("SCALP_MAX_GUNLUK_ISLEM", "60"))
+    # 1 saatlik mumla ölçülen akış ~10 işlem/gün (19 parite). Tavan 25 ile
+    # bağlayıcı değil ama kaçak bir döngüye karşı tampon kalıyor. 60'ta
+    # bırakmak "koruma var" yanılsaması üretirdi — hiç devreye girmezdi.
+    scalp_max_gunluk_islem: int = int(_env("SCALP_MAX_GUNLUK_ISLEM", "25"))
     # Üst üste N zarar = rejim değişmiş olabilir; devam etmek komisyon bağışı.
     # AMA eşik işlem sayısına göre ayarlanmalı. 60 işlem/günde beklenen tetik:
     #   fren  5 → günde 1.87 kez (kanal çoğu gün KAPALI kalır)
