@@ -252,8 +252,10 @@ class Config:
     # (bağımsız sanılan %1.50 değil) — günlük %3 kesicinin rahat altında.
     scalp_max_pozisyon: int = int(_env("SCALP_MAX_POZISYON", "6"))
     # Dar stop + sabit %risk, farkında olmadan çok büyük notional üretir
-    # (küçük bölen). Tek bir scalp hesabın tamamını kilitlemesin.
-    scalp_max_notional_pct: float = float(_env("SCALP_MAX_NOTIONAL_PCT", "1.5"))
+    # (küçük bölen). 0 = otomatik: kaldıraç ve slot sayısından TÜRETİLİR
+    # (scalp_notional_tavani). Sabit sayı yazmak tehlikeliydi — 2026-10-02'de
+    # %150'de kalmıştı ve 6 slotla marj fiziken sığmıyordu.
+    scalp_max_notional_pct: float = float(_env("SCALP_MAX_NOTIONAL_PCT", "0"))
     scalp_max_gunluk_zarar: float = float(_env("SCALP_MAX_GUNLUK_ZARAR", "0.03"))
     scalp_max_gunluk_islem: int = int(_env("SCALP_MAX_GUNLUK_ISLEM", "60"))
     # Üst üste N zarar = rejim değişmiş olabilir; devam etmek komisyon bağışı.
@@ -279,6 +281,26 @@ class Config:
     log_path: Path = DATA_DIR / "bot.log"
 
     strategy: StrategyParams = field(default_factory=StrategyParams)
+
+    @property
+    def scalp_notional_tavani(self) -> float:
+        """Pozisyon başına notional tavanı — varlığın katı olarak.
+
+        2026-10-02'de ilk scalp işlemleri bunu açığa çıkardı: tavan sabit
+        %150 yazılıydı ve kaldıraç 3 ile her pozisyon varlığın %50'sini marj
+        olarak kilitliyordu. 6 slot istenince gereken marj %300 oldu, yani
+        3. pozisyondan sonrası SESSİZCE açılamazdı — "6 eşzamanlı pozisyon"
+        ayarı kâğıt üzerinde kalırdı.
+
+        Formül: tüm slotlar dolduğunda marj varlığın en çok %80'i olsun.
+            N × (notional / kaldıraç) ≤ 0.8  →  notional ≤ 0.8 × kaldıraç / N
+        Türetilmiş olması önemli: kullanıcı kaldıracı ya da slot sayısını
+        değiştirdiğinde tavan kendiliğinden uyar, elle güncellenmeyi beklemez.
+        """
+        if self.scalp_max_notional_pct > 0:
+            return self.scalp_max_notional_pct      # elle geçersiz kılma
+        n = max(self.scalp_max_pozisyon, 1)
+        return 0.8 * max(self.scalp_kaldirac, 1.0) / n
 
     @property
     def scalp_strategy(self) -> StrategyParams:

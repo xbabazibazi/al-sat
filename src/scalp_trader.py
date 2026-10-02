@@ -158,9 +158,16 @@ class ScalpTrader:
         """
         miktar = pos.qty * oran
         tam = oran >= 0.999
+        # `cikis` DOLUM FİYATI olarak geçirilir. Stop çıkışında bu STOP
+        # SEVİYESİdir: gerçek borsada STOP_MARKET fiyat seviyeye dokunduğu an
+        # tetikleniyor, 20 saniye sonraki piyasa fiyatından değil. Eskiden
+        # parametre yok sayılıyordu ve kâğıt kaybı ~2 katına çıkıyordu.
+        ek = {}
+        if cikis and hasattr(self.broker, "marj_ve_kar_geri_yaz"):
+            ek["fiyat"] = cikis      # yalnız kâğıt broker dolum fiyatı kabul eder
         dolum = self.broker.pozisyonu_kapat(
             self.symbol, pos.side, miktar,
-            stop_id=pos.stop_order_id if tam else None)
+            stop_id=pos.stop_order_id if tam else None, **ek)
         if dolum is None:
             log.error("[%s] kapatma başarısız (oran %.2f) — pozisyon duruyor",
                       self.symbol, oran)
@@ -233,7 +240,7 @@ class ScalpTrader:
         # NOTIONAL TAVANI: dar stop + sabit %risk, farkında olmadan çok büyük
         # bir pozisyon üretir (risk/mesafe bölmesi küçük bölen demek). Tek bir
         # scalp hesabın tamamını kilitlemesin.
-        tavan = varlik * self.cfg.scalp_max_notional_pct
+        tavan = varlik * self.cfg.scalp_notional_tavani
         if miktar * fiyat > tavan:
             miktar = tavan / fiyat
             log.info("[%s] miktar notional tavanına kısıldı", self.symbol)
@@ -415,7 +422,10 @@ class ScalpTrader:
         # 1) Açık pozisyon yönetimi — her poll, mum beklemeden.
         if pos is not None:
             if self._stop_tetiklendi(pos, fiyat):
-                self._kapat(pos, fiyat, 1.0, "izleyen stop")
+                # STOP SEVİYESİNDEN kapanır, o anki fiyattan değil: borsadaki
+                # STOP_MARKET seviyeye dokunduğu an tetiklenir. Ana kanal da
+                # aynısını yapıyor (futures_trader._close(pos.trailing_stop*slip)).
+                self._kapat(pos, pos.trailing_stop, 1.0, "izleyen stop")
                 return
             if not self._yari_alindi() and self._hedefe_vardi(pos, fiyat):
                 self._kapat(pos, fiyat, 0.5,

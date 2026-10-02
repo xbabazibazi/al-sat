@@ -148,15 +148,26 @@ class KagitBroker:
         return self._emir_no()
 
     def pozisyonu_kapat(self, symbol: str, yon: str, miktar: float,
-                        stop_id: Optional[int] = None) -> Optional[Dolum]:
+                        stop_id: Optional[int] = None,
+                        fiyat: Optional[float] = None) -> Optional[Dolum]:
         """Pozisyonun tamamını VEYA bir kısmını kapatır.
 
         KISMİ KAPATMADA stop_id GEÇİLMEMELİ: gerçek borsada stop emri
         `closePosition=true` olduğu için kalan miktarı korumaya devam eder;
         iptal edilirse kalan yarı STOPSUZ kalır. Aynı kuralı kâğıtta da
         uyguluyoruz ki davranış birebir olsun.
+
+        `fiyat` — DOLUMUN GERÇEKLEŞECEĞİ fiyat. Stop çıkışlarında STOP
+        SEVİYESİ verilmelidir. 2026-10-02'de ilk scalp işlemi bunu açığa
+        çıkardı: kâğıt broker her zaman o anki piyasa fiyatından kapatıyordu
+        ve tur 20 saniyede bir döndüğü için fiyat stopu çoktan geçmiş
+        oluyordu — SOLUSDT 1R yerine 1.92R kaybetti. Gerçekte stop borsada
+        `STOP_MARKET` olarak duruyor ve fiyat seviyeye DOKUNDUĞU an tetikleniyor;
+        yani canlı kayıp ≈ 1R + kayma. Verilmezse (manuel/piyasa kapatma)
+        o anki fiyat kullanılır, ki orada doğru olan da bu.
         """
-        fiyat = self._fiyat(symbol)
+        if fiyat is None:
+            fiyat = self._fiyat(symbol)
         if fiyat is None:
             return None
         cikis = fiyat * (1 - SLIPPAGE if yon == "LONG" else 1 + SLIPPAGE)

@@ -1896,6 +1896,18 @@ def test_scalp_kanali():
         f"notional tavanı aşıldı: {p2.qty * p2.entry_price:.0f}")
     ok("notional tavanı dar stopta pozisyonu kısıyor [hesabı tek işlem kilitlemez]")
 
+    # --- TAVAN TÜRETİLMELİ: 2026-10-02'de sabit %150 yazılıydı ve 6 slotla
+    # marj fiziken sığmıyordu — 3. pozisyondan sonrası SESSİZCE açılamazdı.
+    for kald, slot in ((3.0, 2), (3.0, 6), (5.0, 6), (3.0, 10)):
+        c = replace(CONFIG, scalp_kaldirac=kald, scalp_max_pozisyon=slot,
+                    scalp_max_notional_pct=0)
+        toplam_marj = c.scalp_notional_tavani / kald * slot
+        assert abs(toplam_marj - 0.8) < 1e-9, (
+            f"{kald}x/{slot} slot: tüm slotlar dolunca marj %{toplam_marj*100:.0f} "
+            f"— %80 olmalıydı")
+    assert replace(CONFIG, scalp_max_notional_pct=2.0).scalp_notional_tavani == 2.0
+    ok("notional tavanı kaldıraç ve slottan türetiliyor [6 pozisyon gerçekten sığıyor]")
+
     # --- YARI KÂR ALIMI: hedefte yarısı kapanır, kalan devam eder
     state, broker, notifier, t, cfg = scalp_kur()
     t._ac("LONG", 100.0, 1.0)
@@ -1924,6 +1936,25 @@ def test_scalp_kanali():
     assert pos.trailing_stop >= giris - 1e-9, (
         f"yarı alındı ama stop girişin altında: {pos.trailing_stop} < {giris}")
     ok("yarı kâr sonrası stop en az girişe çekiliyor (koşan yarı zarar edemez)")
+
+    # --- STOP ÇIKIŞI 1R OLMALI, 2R DEĞİL. 2026-10-02 ilk canlı scalp işlemi:
+    # SOLUSDT niyet edilen $25 (1R) yerine $60 kaybetti (1.92R). Sebep: kâğıt
+    # broker her zaman O ANKİ fiyattan kapatıyordu ve tur 20 saniyede bir
+    # döndüğü için fiyat stopu çoktan geçmiş oluyordu. Gerçekte stop borsada
+    # STOP_MARKET olarak durur ve seviyeye DOKUNDUĞU an tetiklenir.
+    s7, b7, _, t7, c7 = scalp_kur()
+    t7._ac("LONG", 100.0, 1.0)
+    p7 = s7.get_position("BTCUSDT")
+    giris7, birim7 = p7.entry_price, p7.risk_unit
+    t7.market.last_price.return_value = p7.trailing_stop - 0.6   # stopu AŞTI
+    t7.poll()
+    assert s7.get_position("BTCUSDT") is None, "stop tetiklenmedi"
+    kayit = s7.recent_trades(1)[0]
+    kayipR = (giris7 - kayit["exit_price"]) / birim7
+    assert kayipR < 1.25, (
+        f"stop çıkışı {kayipR:.2f}R — stop SEVİYESİNDEN değil, geç fark edilen "
+        f"fiyattan kapatılmış (canlıda borsa seviyeye dokununca tetikler)")
+    ok(f"stop çıkışı ~1R ({kayipR:.2f}R) — stop seviyesinden kapanıyor [regresyon]")
 
     # --- CIRCIR: stop ASLA geri çekilmez
     once = pos.trailing_stop
