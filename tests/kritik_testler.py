@@ -2145,9 +2145,12 @@ def test_scalp_kanali():
     # +0.116R buluyor; ana kanal gerçekten kârlı, model güvenilir.
     # Bu test o ölçümün kaybolmasını engeller — varsayılanlar sessizce
     # zarar eden bölgeye geri dönmesin.
-    assert CONFIG.scalp_timeframe not in ("1m", "3m", "5m", "15m"), (
-        f"SCALP_TIMEFRAME={CONFIG.scalp_timeframe} — 15dk ve altı ölçümde "
-        f"NEGATİF beklenti verdi (sürtünme işlem başına 0.39R yiyor)")
+    assert CONFIG.scalp_timeframe not in ("1m", "3m", "5m", "15m", "30m", "1h"), (
+        f"SCALP_TIMEFRAME={CONFIG.scalp_timeframe} — 1 saat ve altı ÖLÇÜMLE "
+        f"ÇÜRÜTÜLDÜ. 15dk: -0.724R (809 islem). 1sa: LONG -0.062R / SHORT "
+        f"-0.121R (3144 islem, 167 gun). 1 saatin '+0.196R' sonucu 41 GUNLUK "
+        f"pencereden geliyordu ve long yalniz o pencerede artiydi — asiri uyum. "
+        f"4 saatte 1.8 yillik veri +0.038R ve iki yarida da artı.")
     assert CONFIG.scalp_atr_carpani >= 2.0, (
         f"ATR çarpanı {CONFIG.scalp_atr_carpani} — 1×ATR işlemlerin %75'ini "
         f"gürültüye kurban ediyordu (kazanma %25 vs 3×ATR'de %37)")

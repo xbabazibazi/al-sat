@@ -943,7 +943,7 @@ PAGE = """<!doctype html>
 <div class="tabs">
   <button class="tab aktif" id="tabKripto" onclick="sekme('kripto')">KRİPTO</button>
   <button class="tab" id="tabBorsa" onclick="sekme('borsa')">BORSA <span style="font-weight:400">ABD+BIST</span></button>
-  <button class="tab" id="tabScalp" onclick="sekme('scalp')">⚡ SCALP <span style="font-weight:400">15dk</span></button>
+  <button class="tab" id="tabScalp" onclick="sekme('scalp')">⚡ GENİŞ <span style="font-weight:400">4sa · 20 parite</span></button>
 </div>
 <div id="sayfaKripto">
 <div class="grid" id="stats"></div>
@@ -965,7 +965,7 @@ PAGE = """<!doctype html>
 <div id="sayfaScalp" style="display:none">
 <div class="grid" id="sStats"></div>
 <div class="card"><h2>Frenler — "neden işlem açmıyor?" sorusunun cevabı burada</h2><div id="sFrenler"></div></div>
-<div class="card"><h2>Sistem Karnesi — scalp (ana kanaldan ayrı)</h2><div id="sPerf"></div></div>
+<div class="card"><h2>Sistem Karnesi — geniş kanal (ana kanaldan ayrı cüzdan)</h2><div id="sPerf"></div></div>
 <div class="card"><h2>Açık Pozisyonlar — scalp</h2><div id="sKomutlar"></div><div id="sPositions"></div></div>
 <div class="card"><h2>Son İşlemler — scalp</h2><div id="sTrades"></div></div>
 </div>

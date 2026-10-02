@@ -231,7 +231,27 @@ class Config:
     #   taker+kayma    %0.200 → +0.136R
     # Bu yüzden maker giriş YAZILMADI: gerek yok ve limit emrin dolum
     # belirsizliğini modellemek yeni bir sapma kaynağı olurdu.
-    scalp_timeframe: str = _env("SCALP_TIMEFRAME", "1h")
+    # 4 SAAT. Onceki iki deger (15dk, sonra 1sa) ÖLÇÜMLE ÇÜRÜTÜLDÜ.
+    #
+    # 1 SAATLİK KARARIN HATASI, açıkça yazılıyor: "+0.196R" sonucu 41 GÜNLÜK
+    # pencereden alınmıştı. 167 güne çıkarılınca LONG −0.062R, SHORT −0.121R
+    # (toplam −280R) çıktı ve long yalnızca ikinci yarıda artıydı — yani tam
+    # benim ölçtüğüm pencerede. Klasik aşırı uyum. Ders: kısa pencerede
+    # bulunan edge, edge değil; sağlamlık yarı-yarı sınanmadan karar verilmez.
+    #
+    # 4 saatte 1.8 YILLIK veri (667 gün, 20 parite, long+short):
+    #   10 parite (ana kanal)  +0.022R · +35.4R  · 2.42 islem/gun
+    #   20 parite              +0.038R · +118.8R · 4.72 islem/gun
+    # Sağlamlık (20 parite, short): ilk yarı +0.163R, ikinci yarı +0.067R —
+    # İKİSİ DE ARTI. Ayrıca bu ölçüm projenin kendi notunu bağımsız olarak
+    # doğruladı ("short tarafı kârlı ve getirinin ana kaynağı"), yani
+    # yöntem güvenilir; hatalı olan kısa pencereye güvenmekti.
+    #
+    # ADLANDIRMA NOTU: artık "scalp" değil — hızlı gir-çık fikri ölçümde
+    # çöktü. Kanal, ana kanalın GENİŞ (20 parite) versiyonu. Kod adları
+    # (scalp_*, scmd_, data/scalp_state.db) geriye uyumluluk için korundu;
+    # panelde "GENİŞ" diye görünüyor.
+    scalp_timeframe: str = _env("SCALP_TIMEFRAME", "4h")
 
     # İKİ PARAMETRE. Donchian = zamanlama, ATR çarpanı = stop mesafesi.
     # Ana kanalın 3.0'ı burada fazla geniş olurdu (hedef sürtünmeyi karşılamaz).
@@ -249,14 +269,16 @@ class Config:
     # ÇIKIŞ: hedefte YARISI kapanır, kalan iz süren stopla devam eder ve
     # stop en az girişe çekilir (koşan yarı zarar edemez).
     #
-    # EŞİK 4R — 1.5R'den yükseltildi. Yarı kâr almak beklentiye MAL OLUYOR
-    # (ölçüm, 1sa·3×ATR, 429 işlem):
-    #   hedef yok    +0.195R      yarısı 2.5R'de  +0.163R  (−%16)
-    #   yarısı 1.5R  +0.135R      yarısı 4.0R'de  +0.184R  (−%6)
-    # Kullanıcı "belli kâr marjında çıkış" istedi; özellik korunuyor ama
-    # eşiği bedeli en düşük yere çekildi. 1.5R'de kalmak beklentinin
-    # üçte birini yiyordu — kâr alma hissinin bedeli bu kadar olmamalı.
-    scalp_kar_hedefi_r: float = float(_env("SCALP_KAR_HEDEFI_R", "4.0"))
+    # EŞİK 6R. Yarı kâr almak beklentiye MAL OLUYOR ve bedel zaman dilimine
+    # göre değişiyor — 4 saatte 1.8 yıllık ölçüm (20 parite, long+short):
+    #   hedef yok      +0.038R · +118.7R
+    #   yarısı 6R'de   +0.034R · +108.2R   (−%9)
+    #   yarısı 4R'de   +0.030R · + 93.8R   (−%21)
+    # (1 saatte 4R yalnızca %6'ya mal oluyordu; 4 saatte %21. Aynı parametre,
+    #  farklı bedel — bu yüzden her ayar değişikliğinde yeniden ölçülüyor.)
+    # Kullanıcı "belli kâr marjında çıkış" istedi; özellik korunuyor,
+    # eşik bedeli en düşük yere çekildi.
+    scalp_kar_hedefi_r: float = float(_env("SCALP_KAR_HEDEFI_R", "6.0"))
 
     # MALİYET KAPISI — bu kanalın yaşam savaşı. Hedef, gidiş-dönüş
     # sürtünmenin en az bu kadar katı olmalı; değilse işleme GİRİLMEZ.
