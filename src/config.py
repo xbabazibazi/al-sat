@@ -197,9 +197,18 @@ class Config:
     # paper | testnet | live — KagitBroker mı FuturesBroker mı kullanılacağını
     # bu belirler. Trader hangisi olduğunu bilmez (bkz. kagit_broker.py).
     scalp_mode: str = _env("SCALP_MODE", "paper").lower()
+    # PARİTE SAYISI, işlem sıklığının EN UCUZ kolu. 2026-10-02 ölçümü
+    # (20 parite, 15dk, ~10 günlük veri): Donchian 20 → 145.8 sinyal/gün,
+    # Donchian 10 → 234.8. Yani "daha çok işlem" için mum boyunu düşürmeye
+    # hiç gerek yok — düşürmek sürtünmeyi hedefin önüne geçirirdi (1dk'da
+    # %135). Parite eklemek işlem başına ekonomiyi HİÇ bozmaz; sadece aynı
+    # kalitede daha çok fırsat tarar.
     scalp_symbols: tuple[str, ...] = tuple(
         s.strip().upper() for s in _env(
-            "SCALP_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,DOGEUSDT"
+            "SCALP_SYMBOLS",
+            "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT,ADAUSDT,"
+            "AVAXUSDT,LINKUSDT,DOTUSDT,LTCUSDT,ATOMUSDT,NEARUSDT,FILUSDT,"
+            "INJUSDT,ARBUSDT,OPUSDT,APTUSDT,SUIUSDT,MATICUSDT"
         ).split(",") if s.strip())
 
     # ZAMAN DİLİMİ — 2026-10-01 canlı ölçümü (5 parite, son 100 mum):
@@ -210,7 +219,11 @@ class Config:
 
     # İKİ PARAMETRE. Donchian = zamanlama, ATR çarpanı = stop mesafesi.
     # Ana kanalın 3.0'ı burada fazla geniş olurdu (hedef sürtünmeyi karşılamaz).
-    scalp_donchian: int = int(_env("SCALP_DONCHIAN", "20"))
+    # Donchian 10 = son 2.5 saatin kırılımı (20 → 5 saat). Ölçümde sinyali
+    # %61 artırıyor ve maliyet kapısına takılma oranı DEĞİŞMİYOR (%18→%19) —
+    # yani sinyal kalitesini bozmadan sıklık kazandırıyor. Ana kanal da
+    # .env'de 10 kullanıyor, yani bu değer projede zaten sınanmış.
+    scalp_donchian: int = int(_env("SCALP_DONCHIAN", "10"))
     scalp_atr_carpani: float = float(_env("SCALP_ATR_CARPANI", "1.0"))
 
     # ÇIKIŞ: hedefte YARISI kapanır, kalan iz süren stopla devam eder ve
@@ -227,16 +240,28 @@ class Config:
 
     # RİSK VE FRENLER. Scalp ana kanaldan çok daha sık işlem açar; işlem
     # başına risk bu yüzden daha küçük, frenler daha sıkı.
-    scalp_risk_pct: float = float(_env("SCALP_RISK_PCT", "0.005"))      # %0.5
+    # RİSK, İŞLEM SAYISIYLA TERS ORANTILI AYARLANIR — yoksa frenler her gün
+    # kapanır. 2026-10-02 hesabı (kazanma %40 varsayımı, günlük %3 kesici):
+    #   risk %0.50 →  6 üst üste zarar kesiciyi tetikler → 60 işlemde %100
+    #   risk %0.25 → 12 üst üste zarar gerekir           → 60 işlemde %5
+    # Yani "bol işlem" isteniyorsa risk yarıya inmek ZORUNDA; inmezse kanal
+    # her gün kendi kesicisine çarpıp durur ve hiç işlem göremezsin.
+    scalp_risk_pct: float = float(_env("SCALP_RISK_PCT", "0.0025"))      # %0.25
     scalp_kaldirac: float = float(_env("SCALP_KALDIRAC", "3"))
-    scalp_max_pozisyon: int = int(_env("SCALP_MAX_POZISYON", "2"))
+    # 6 pozisyon × %0.25, korelasyon 0.681 ile GERÇEK risk ~%1.29
+    # (bağımsız sanılan %1.50 değil) — günlük %3 kesicinin rahat altında.
+    scalp_max_pozisyon: int = int(_env("SCALP_MAX_POZISYON", "6"))
     # Dar stop + sabit %risk, farkında olmadan çok büyük notional üretir
     # (küçük bölen). Tek bir scalp hesabın tamamını kilitlemesin.
     scalp_max_notional_pct: float = float(_env("SCALP_MAX_NOTIONAL_PCT", "1.5"))
     scalp_max_gunluk_zarar: float = float(_env("SCALP_MAX_GUNLUK_ZARAR", "0.03"))
-    scalp_max_gunluk_islem: int = int(_env("SCALP_MAX_GUNLUK_ISLEM", "20"))
+    scalp_max_gunluk_islem: int = int(_env("SCALP_MAX_GUNLUK_ISLEM", "60"))
     # Üst üste N zarar = rejim değişmiş olabilir; devam etmek komisyon bağışı.
-    scalp_max_zarar_serisi: int = int(_env("SCALP_MAX_ZARAR_SERISI", "5"))
+    # AMA eşik işlem sayısına göre ayarlanmalı. 60 işlem/günde beklenen tetik:
+    #   fren  5 → günde 1.87 kez (kanal çoğu gün KAPALI kalır)
+    #   fren 10 → günde 0.15 kez (gerçek rejim değişimini yakalar, gürültüyü değil)
+    # 5'te bırakmak "bol işlem" isteğini sessizce iptal ederdi.
+    scalp_max_zarar_serisi: int = int(_env("SCALP_MAX_ZARAR_SERISI", "10"))
     scalp_allow_short: bool = _env("SCALP_ALLOW_SHORT", "true").lower() == "true"
     scalp_poll_seconds: int = int(_env("SCALP_POLL_SECONDS", "20"))
     scalp_baslangic_usdt: float = float(_env("SCALP_BASLANGIC_USDT", "10000"))

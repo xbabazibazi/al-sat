@@ -58,6 +58,7 @@ class ScalpTrader:
         self.broker = broker
         self.notifier = notifier
         self._kaldirac_ayarlandi = False
+        self._mum_onbellek: tuple[float, object] | None = None
 
     # ------------------------------------------------------------ yardımcılar
     def _bugun(self) -> str:
@@ -75,6 +76,23 @@ class ScalpTrader:
 
     def _yari_isaretle(self, deger: bool) -> None:
         self.state.set_kv(f"{YARI_ONEK}{self.symbol}", "1" if deger else "")
+
+    def _mumlar(self):
+        """15 dakikalık mumlar — kısa ömürlü önbellekle.
+
+        Tur 20 saniyede bir dönüyor ama 15dk mumu 15 dakikada bir değişiyor;
+        her turda 300 mum çekmek saf israf. 20 parite ile bu, dakikada 60
+        gereksiz istek demekti. TTL kısa tutuldu (30 sn) ki yeni mum en fazla
+        yarım dakika gecikmeyle görülsün — giriş kararı bundan etkilenmesin.
+        FİYAT önbelleğe ALINMAZ: stop kontrolü taze fiyat ister.
+        """
+        import time as _t
+        simdi = _t.time()
+        if self._mum_onbellek and simdi - self._mum_onbellek[0] < 30:
+            return self._mum_onbellek[1]
+        df = self.market.klines(self.symbol, self.cfg.scalp_timeframe, limit=300)
+        self._mum_onbellek = (simdi, df)
+        return df
 
     def _sonuc(self, durum: str, mesaj: str) -> None:
         """Manuel komutun âkıbeti — panel okur. Sessiz yutma yasak."""
@@ -384,7 +402,7 @@ class ScalpTrader:
         pos = self.state.get_position(self.symbol)
         pos = self._manuel_komutlar(pos, fiyat)
 
-        df = self.market.klines(self.symbol, self.cfg.scalp_timeframe, limit=300)
+        df = self._mumlar()
         kapanmis = df.iloc[:-1]
         if len(kapanmis) < 60:
             return
