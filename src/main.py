@@ -78,6 +78,64 @@ def borsa_dongusu(notifier: TelegramNotifier) -> None:
         time.sleep(CONFIG.borsa_poll_seconds)
 
 
+def scalp_dongusu(notifier: TelegramNotifier, market) -> None:
+    """SCALP kanalı — kendi iş parçacığı, kendi DB'si, kendi cüzdanı.
+
+    BROKER SEÇİMİ TEK YER: kâğıtta KagitBroker, testnet/canlıda FuturesBroker.
+    ScalpTrader hangisiyle çalıştığını bilmez — kullanıcının şartı buydu
+    ("altyapı doğrudan borsanın kendisine geçebilecek şekilde kurgulansın").
+
+    Ana kripto döngüsünden TAM YALITIM: burada ne olursa olsun (broker
+    çöker, ağ gider, strateji saçmalar) trend kanalı etkilenmez.
+    """
+    log = logging.getLogger("scalp")
+    try:
+        from .scalp_trader import ScalpTrader
+        state = StateStore(CONFIG.scalp_db_path)
+
+        if CONFIG.scalp_mode == "paper":
+            from .kagit_broker import KagitBroker
+            broker = KagitBroker(state, CONFIG.scalp_baslangic_usdt, market,
+                                 kaldirac=CONFIG.scalp_kaldirac)
+            log.info("SCALP: KÂĞIT broker (sanal cüzdan %.0f USDT)",
+                     CONFIG.scalp_baslangic_usdt)
+        else:
+            # Gerçek borsa. Alt hesap anahtarlarıyla ayrı bir istemci kurulur;
+            # ana hesapla aynı anahtarı kullanmak config.validate()'te yasak.
+            from dataclasses import replace as _replace
+
+            from .futures_exchange import FuturesBroker
+            alt = _replace(
+                CONFIG,
+                mode="futures_live" if CONFIG.scalp_mode == "live" else "futures_testnet",
+                live_key=CONFIG.scalp_live_key, live_secret=CONFIG.scalp_live_secret,
+                symbols=CONFIG.scalp_symbols, leverage=CONFIG.scalp_kaldirac)
+            broker = FuturesBroker(alt)
+            log.warning("SCALP: GERÇEK BORSA (%s) — alt hesap anahtarıyla",
+                        CONFIG.scalp_mode)
+
+        traders = [ScalpTrader(s, CONFIG, market, state, broker, notifier)
+                   for s in CONFIG.scalp_symbols]
+        log.info("SCALP kanalı başladı | %d sembol | %s mum | tur %ds | "
+                 "Donchian %d + ATR×%.1f | hedef %.1fR (yarısı)",
+                 len(traders), CONFIG.scalp_timeframe, CONFIG.scalp_poll_seconds,
+                 CONFIG.scalp_donchian, CONFIG.scalp_atr_carpani,
+                 CONFIG.scalp_kar_hedefi_r)
+    except Exception as e:  # noqa: BLE001
+        log.error("SCALP kanalı başlatılamadı: %s", e, exc_info=True)
+        notifier.send_error(f"SCALP kanalı devre dışı — başlatılamadı: {e}")
+        return
+
+    while True:
+        state.set_kv("scalp_heartbeat", datetime.now(timezone.utc).isoformat())
+        for t in traders:
+            try:
+                t.poll()
+            except Exception as e:  # noqa: BLE001
+                log.error("[%s] Scalp döngü hatası: %s", t.symbol, e, exc_info=True)
+        time.sleep(CONFIG.scalp_poll_seconds)
+
+
 def telegram_komut_dongusu(market) -> None:
     """Telegram komut dinleyicisi — kendi iş parçacığında, kendi bağlantısıyla.
 
@@ -90,7 +148,8 @@ def telegram_komut_dongusu(market) -> None:
         from .telegram_komut import TelegramKomut
         state = StateStore(CONFIG.db_path)
         borsa = StateStore(CONFIG.borsa_db_path) if CONFIG.borsa_enabled else None
-        TelegramKomut(CONFIG, state, borsa, market).calistir()
+        scalp = StateStore(CONFIG.scalp_db_path) if CONFIG.scalp_enabled else None
+        TelegramKomut(CONFIG, state, borsa, market, scalp_state=scalp).calistir()
     except Exception as e:  # noqa: BLE001
         log.error("Telegram komut katmanı başlatılamadı: %s", e, exc_info=True)
 
@@ -207,6 +266,11 @@ def main() -> None:
     if CONFIG.borsa_enabled and not args.once:
         threading.Thread(target=borsa_dongusu, args=(notifier,),
                          name="borsa", daemon=True).start()
+
+    # SCALP kanalı (daemon, ayrı DB/cüzdan; --once turunda açılmaz)
+    if CONFIG.scalp_enabled and not args.once:
+        threading.Thread(target=scalp_dongusu, args=(notifier, market),
+                         name="scalp", daemon=True).start()
 
     # TELEGRAM KOMUT KATMANI — telefondan /durum, /kapat, /stop.
     # DAEMON OLMASI KASITLI: bot ölürse komut katmanı da ölsün. Aksi hâlde

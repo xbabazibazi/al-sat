@@ -1821,6 +1821,274 @@ def test_bildirim_dayanikliligi():
     ok("kilit reddi INFO olarak loglanıyor (hata seli üretmiyor)")
 
 
+def scalp_kur(**ayar):
+    """İzole scalp trader + kâğıt broker. Gerçek DB'ye DOKUNMAZ."""
+    from src.kagit_broker import KagitBroker
+    from src.scalp_trader import ScalpTrader
+    db = Path(tempfile.mkdtemp()) / "scalp.db"
+    state = StateStore(db)
+    market = MagicMock()
+    market.last_price.return_value = 100.0
+    # GERÇEK mum verisi şart: poll() compute_indicators çağırıyor, MagicMock
+    # orada çöker. Fiyat 99.5-100.5 arası salınır (kazara Donchian kırılımı
+    # olmasın) ve bar aralığı 1.0 tutulur ki ATR ≈ 1.0 olsun.
+    n = 300
+    kapanis = [100.0 + (0.5 if i % 2 else -0.5) for i in range(n)]
+    market.klines.return_value = pd.DataFrame({
+        "open_time": [1_700_000_000_000 + i * 900_000 for i in range(n)],
+        "open": kapanis, "close": kapanis,
+        "high": [c + 0.5 for c in kapanis], "low": [c - 0.5 for c in kapanis],
+        "volume": [1.0] * n,
+    })
+    cfg = replace(CONFIG, scalp_atr_carpani=1.0, scalp_kar_hedefi_r=1.5,
+                  scalp_risk_pct=0.01, scalp_kaldirac=3.0,
+                  scalp_baslangic_usdt=10_000.0,
+                  **{"scalp_max_pozisyon": 2, "scalp_min_hedef_kat": 3.0, **ayar})
+    broker = KagitBroker(state, cfg.scalp_baslangic_usdt, market,
+                         kaldirac=cfg.scalp_kaldirac)
+    notifier = MagicMock()
+    return state, broker, notifier, ScalpTrader("BTCUSDT", cfg, market, state,
+                                                broker, notifier), cfg
+
+
+def test_scalp_kanali():
+    """2026-10-01: kullanıcı kısa süreli kaldıraçlı gir-çık kanalı istedi.
+    Bu kanalın hayatı komisyona bağlı: ölçtüm, 1 dakikada sürtünme 1R hedefin
+    %135'i. Projenin kendi notu da "1h backtestte komisyona yenildi" diyordu.
+    Bu testler maliyet kapısını, yarı kâr alımını ve frenleri sınıyor."""
+    print("\nSCALP KANALI (kısa süreli kaldıraçlı gir-çık)")
+    from src.kagit_broker import KagitBroker
+
+    # --- MALİYET KAPISI: ölçülmüş ATR değerleriyle
+    state, broker, notifier, t, cfg = scalp_kur()
+    assert abs(t.surtunme_pct() - 0.20) < 0.001, t.surtunme_pct()
+    for atr_pct, beklenen in [(0.111, False), (0.208, False),
+                              (0.458, True), (1.056, True)]:
+        gecer, _ = t.maliyet_kapisi(atr_pct)
+        assert gecer is beklenen, f"ATR %{atr_pct} için kapı yanlış: {gecer}"
+    ok("maliyet kapısı 1dk/5dk'yı reddediyor, 15dk/1sa'i geçiriyor [ölçümle]")
+
+    # Kapı strateji sinyalinden ÖNCE olmalı: sinyal güzel olsa da maliyeti
+    # karşılamayan işleme girilmemeli.
+    kaynak = Path("src/scalp_trader.py").read_text(encoding="utf-8")
+    poll = kaynak[kaynak.index("    def poll("):]
+    assert poll.index("maliyet_kapisi") < poll.index("donchian_high"), (
+        "maliyet kapısı Donchian kontrolünden SONRA — sinyal maliyeti eziyor")
+    ok("maliyet kapısı strateji sinyalinden ÖNCE uygulanıyor")
+
+    # --- GİRİŞ: stop mesafesi = ATR×çarpan, 1R kayda geçiyor
+    t._ac("LONG", 100.0, 1.0)
+    pos = state.get_position("BTCUSDT")
+    assert pos is not None, "pozisyon açılmadı"
+    assert abs(pos.risk_unit - 1.0) < 1e-9, pos.risk_unit
+    assert pos.trailing_stop < pos.entry_price, "LONG stopu girişin üstünde"
+    assert pos.stop_order_id, "stop emri kimliği yok — stopsuz pozisyon!"
+    ok("giriş: stop ve 1R birlikte kuruluyor (stopsuz pozisyon yok)")
+
+    # --- NOTIONAL TAVANI: dar stop sonsuz büyük pozisyon üretmemeli
+    state.clear_position("BTCUSDT")
+    s2, b2, _, t2, c2 = scalp_kur(scalp_max_notional_pct=0.5)
+    t2._ac("LONG", 100.0, 0.01)      # çok dar stop → çok büyük miktar isteği
+    p2 = s2.get_position("BTCUSDT")
+    assert p2 is not None
+    varlik = 10_000.0
+    assert p2.qty * p2.entry_price <= varlik * 0.5 * 1.01, (
+        f"notional tavanı aşıldı: {p2.qty * p2.entry_price:.0f}")
+    ok("notional tavanı dar stopta pozisyonu kısıyor [hesabı tek işlem kilitlemez]")
+
+    # --- YARI KÂR ALIMI: hedefte yarısı kapanır, kalan devam eder
+    state, broker, notifier, t, cfg = scalp_kur()
+    t._ac("LONG", 100.0, 1.0)
+    pos = state.get_position("BTCUSDT")
+    ilk_qty = pos.qty
+    # Girişte %0.05 kayma var → giriş 100.05, hedef 100.05+1.5 = 101.55.
+    t.market.last_price.return_value = 102.0
+    assert t._hedefe_vardi(pos, 102.0) is True
+    t.poll()
+    pos = state.get_position("BTCUSDT")
+    assert pos is not None, "hedefte pozisyonun TAMAMI kapandı — yarısı kalmalıydı"
+    assert abs(pos.qty - ilk_qty / 2) / ilk_qty < 0.02, f"{pos.qty} vs {ilk_qty}"
+    assert t._yari_alindi() is True
+    ok("hedefte YARISI kapanıyor, kalan yarı pozisyonda duruyor")
+
+    # Kısmi kapatmada stop emri İPTAL EDİLMEMELİ — kalan yarı korumasız kalmaz
+    assert pos.stop_order_id, "kısmi kapatmadan sonra stop kimliği kayboldu"
+    assert "stop_id=pos.stop_order_id if tam else None" in kaynak, (
+        "kısmi kapatmada stop iptal ediliyor olabilir — kalan yarı STOPSUZ kalır")
+    ok("kısmi kapatmada stop KORUNUYOR (kalan yarı stopsuz kalmıyor)")
+
+    # --- Yarı alındıktan sonra stop en az GİRİŞE çekilir: koşan yarı zarar etmez
+    giris = pos.entry_price
+    t._stop_guncelle(pos, 102.0, 1.0)
+    pos = state.get_position("BTCUSDT")
+    assert pos.trailing_stop >= giris - 1e-9, (
+        f"yarı alındı ama stop girişin altında: {pos.trailing_stop} < {giris}")
+    ok("yarı kâr sonrası stop en az girişe çekiliyor (koşan yarı zarar edemez)")
+
+    # --- CIRCIR: stop ASLA geri çekilmez
+    once = pos.trailing_stop
+    t._stop_guncelle(pos, 100.2, 1.0)                 # fiyat geri geldi
+    pos = state.get_position("BTCUSDT")
+    assert pos.trailing_stop >= once - 1e-12, "stop geri çekildi!"
+    ok("iz süren stop geri çekilmiyor [cırcır]")
+
+    # --- FRENLER
+    s3, b3, _, t3, c3 = scalp_kur(scalp_max_zarar_serisi=3)
+    s3.set_kv(f"szarar_serisi_{t3._bugun()}", "3")
+    acik, sebep = t3.girisler_acik_mi()
+    assert acik is False and "üst üste zarar" in sebep, sebep
+    ok("üst üste zarar freni yeni girişi durduruyor")
+
+    s4, b4, _, t4, c4 = scalp_kur(scalp_max_gunluk_islem=2)
+    s4.set_kv(f"sislem_{t4._bugun()}", "2")
+    acik, sebep = t4.girisler_acik_mi()
+    assert acik is False and "işlem tavanı" in sebep, sebep
+    ok("günlük işlem tavanı tutuyor")
+
+    s5, b5, _, t5, c5 = scalp_kur(scalp_max_gunluk_zarar=0.02)
+    s5.set_kv(f"spnl_{t5._bugun()}", "-250")          # 10.000'in %2.5'i
+    acik, sebep = t5.girisler_acik_mi()
+    assert acik is False and "günlük zarar" in sebep, sebep
+    ok("günlük zarar sınırı tutuyor")
+
+    s6, b6, _, t6, c6 = scalp_kur(scalp_max_pozisyon=1)
+    poz(s6, sym="BTCUSDT", entry=100.0, stop=99.0)
+    acik, sebep = t6.girisler_acik_mi()
+    assert acik is False and "pozisyon tavanı" in sebep, sebep
+    ok("eşzamanlı pozisyon tavanı tutuyor")
+
+    # --- MANUEL MÜDAHALE: komut kuyruğu (tek yazıcı ilkesi)
+    state, broker, notifier, t, cfg = scalp_kur()
+    t._ac("LONG", 100.0, 1.0)
+    state.set_kv("scmd_BTCUSDT", "CLOSE")
+    t.market.last_price.return_value = 100.5
+    t.poll()
+    assert state.get_position("BTCUSDT") is None, "manuel kapatma uygulanmadı"
+    durum = state.get_kv("scmdres_BTCUSDT", "")
+    assert durum.startswith("ok|"), durum
+    ok("manuel KAPAT komutu uygulanıyor ve sonucu yazıyor (sessiz yutma yok)")
+
+    t._ac("LONG", 100.0, 1.0)
+    state.set_kv("scmd_BTCUSDT", "STOP:99.5")
+    t.poll()
+    pos = state.get_position("BTCUSDT")
+    assert abs(pos.trailing_stop - 99.5) < 1e-6, pos.trailing_stop
+    ok("manuel STOP komutu seviyeyi taşıyor")
+
+    # Anında tetikleyecek stop REDDEDİLMELİ
+    state.set_kv("scmd_BTCUSDT", "STOP:200")
+    t.poll()
+    pos = state.get_position("BTCUSDT")
+    assert abs(pos.trailing_stop - 99.5) < 1e-6, "anında tetikleyen stop kabul edildi"
+    assert state.get_kv("scmdres_BTCUSDT", "").startswith("red|")
+    ok("anında tetikleyecek stop reddediliyor (KAPAT'a yönlendiriyor)")
+
+    # --- BROKER DEĞİŞİMİ trader'ı etkilememeli: aynı arayüz
+    from src.futures_exchange import FuturesBroker
+    gerekli = ["filtreler", "bakiye_usdt", "pozisyon", "giris_ve_stop",
+               "stop_tasi", "pozisyonu_kapat", "kaldirac_ayarla",
+               "tek_yon_modu_mu", "emir_iptal", "stop_var_mi"]
+    eksik = [m for m in gerekli if not hasattr(KagitBroker, m)]
+    assert not eksik, f"KagitBroker'da eksik arayüz: {eksik}"
+    eksik2 = [m for m in gerekli if not hasattr(FuturesBroker, m)]
+    assert not eksik2, f"FuturesBroker'da eksik arayüz: {eksik2}"
+    ok("KagitBroker ve FuturesBroker aynı arayüzü uyguluyor [canlıya geçiş konfig]")
+
+    # --- CANLI KAPISI: alt hesap şart, ana hesapla aynı anahtar YASAK
+    try:
+        replace(CONFIG, scalp_mode="live", scalp_live_key="", scalp_live_secret="",
+                canli_onay="EVET_GERCEK_PARA").validate()
+        raise AssertionError("anahtarsız canlı scalp başladı!")
+    except ValueError as e:
+        assert "ALT HESABINA" in str(e), str(e)
+    try:
+        replace(CONFIG, scalp_mode="live", scalp_live_key="AYNI",
+                scalp_live_secret="s", live_key="AYNI",
+                canli_onay="EVET_GERCEK_PARA").validate()
+        raise AssertionError("ana hesapla aynı anahtar kabul edildi!")
+    except ValueError as e:
+        assert "AYNI" in str(e), str(e)
+    ok("canlı scalp ayrı alt hesap şart kılıyor [pozisyonlar birleşmesin]")
+
+    try:
+        replace(CONFIG, scalp_min_hedef_kat=0.5).validate()
+        raise AssertionError("hedef < sürtünme kabul edildi!")
+    except ValueError as e:
+        assert "komisyon bağışlamaktır" in str(e)
+    ok("hedefin sürtünmeden küçük olmasına izin verilmiyor")
+
+    # --- Scalp ana kanala DOKUNMAMALI: ayrı DB, ayrı anahtarlar
+    assert CONFIG.scalp_db_path != CONFIG.db_path
+    assert "scmd_" in kaynak and "cmd_" not in kaynak.replace("scmd_", ""), (
+        "scalp ana kanalın komut kuyruğunu kullanıyor olabilir")
+    ok("scalp ayrı DB ve ayrı komut kuyruğu kullanıyor [ana kanal yalıtık]")
+
+    # --- PANEL sözleşmesi ve sekme kimlikleri
+    from src import panel
+    with patch.object(panel, "scalp_state", state):
+        d = panel.build_scalp_state()
+        for alan in ("varlik", "bakiye", "positions", "komutlar", "performans",
+                     "frenler", "trades", "timeframe", "donchian", "hedef_r"):
+            assert alan in d, f"/api/scalp sözleşmesinde eksik: {alan}"
+        for alan in ("zarar_serisi", "gun_islem", "min_hedef_kat", "surtunme_pct"):
+            assert alan in d["frenler"], f"frenler eksik: {alan}"
+    ok("/api/scalp sözleşmesi tam (frenler panelde görünür)")
+
+    for kimlik in ("sStats", "sFrenler", "sPerf", "sPositions", "sKomutlar",
+                   "sTrades", "sayfaScalp", "tabScalp"):
+        assert f'id="{kimlik}"' in panel.PAGE, f"panelde {kimlik} yok"
+    assert "function refreshScalp" in panel.PAGE
+    assert "function scalpKapat" in panel.PAGE and "function scalpStop" in panel.PAGE
+    ok("panelde SCALP sekmesi, frenler kartı ve KAPAT/STOP butonları var")
+
+    # --- TELEGRAM: "SCALP:" öneki ONAY TURUNDA KORUNMALI.
+    # En tehlikeli hata adayı buydu: BTCUSDT hem ana kanalda hem scalp'te var.
+    # Önek onay turunda kaybolsa YANLIŞ POZİSYON kapanırdı.
+    from src.telegram_komut import TelegramKomut
+    ana, _, _, _ = kur()
+    poz(ana, sym="BTCUSDT", entry=50_000.0, stop=49_000.0)     # ANA kanal pozisyonu
+    scfg = replace(CONFIG, telegram_token="t", telegram_chat_id="555",
+                   symbols=("BTCUSDT",), scalp_symbols=("BTCUSDT",))
+    # /durum fiyatı market'ten okur; MagicMock biçimlendirmede çöker.
+    tg_market = MagicMock()
+    tg_market.last_price.return_value = 101.0
+    tk = TelegramKomut(scfg, ana, None, tg_market, scalp_state=state)
+    state.clear_position("BTCUSDT")
+    t._ac("LONG", 100.0, 1.0)                                   # SCALP pozisyonu
+
+    _, dug = tk._cevapla("/kapat SCALP:BTCUSDT")
+    assert dug, "scalp kapatma onay düğmesi gelmedi"
+    assert tk._bekleyen["sembol"] == "SCALP:BTCUSDT", (
+        f"önek onay beklentisinde kayboldu: {tk._bekleyen['sembol']!r} — "
+        f"onaylanınca ANA KANAL pozisyonu kapanırdı!")
+    tk._isle(f"/onay {tk._bekleyen['kod']}")
+    assert state.get_kv("scmd_BTCUSDT") == "CLOSE", "scalp kuyruğuna düşmedi"
+    assert ana.get_kv("cmd_BTCUSDT", "") == "", "ANA KANALA komut SIZDI!"
+    ok("SCALP: öneki onay turunda korunuyor [yanlış pozisyon kapanmıyor]")
+
+    # Öneksiz "BTCUSDT" ANA kanalı hedeflemeli (belirsizlikte ana kanal önce)
+    state.set_kv("scmd_BTCUSDT", "")
+    tk._bekleyen = None
+    tk._cevapla("/kapat BTCUSDT")
+    assert tk._bekleyen["sembol"] == "BTCUSDT"
+    tk._isle(f"/onay {tk._bekleyen['kod']}")
+    assert ana.get_kv("cmd_BTCUSDT") == "CLOSE"
+    assert state.get_kv("scmd_BTCUSDT", "") == "", "öneksiz komut scalp'e sızdı!"
+    ok("öneksiz sembol ANA kanalı hedefliyor [belirsizlik yok]")
+
+    # Pozisyon seçici scalp'i ÖNEKLİ listelemeli
+    tk._bekleyen = None
+    _, dug = tk._cevapla("/kapat")
+    etiketler = [s[0]["callback_data"] for s in dug["inline_keyboard"]]
+    assert "kapat:SCALP:BTCUSDT" in etiketler, etiketler
+    assert "kapat:BTCUSDT" in etiketler, etiketler
+    ok("/kapat listesi scalp'i önekli, ana kanalı öneksiz gösteriyor")
+
+    d2 = tk._isle("/durum")
+    assert "SCALP" in d2 and "şimdi stop olursa" in d2, d2[:400]
+    ok("/durum scalp bloğunu ve 'şimdi stop olursa' tutarını içeriyor")
+
+
 def main() -> int:
     print("=" * 74)
     print("  KRİTİK TESTLER — geçici DB, gerçek pozisyona DOKUNULMAZ")
@@ -1833,7 +2101,8 @@ def main() -> int:
                test_borsa_kanali,
                test_telegram_saglik, test_canli_altyapi, test_canli_trader, test_canli_kapisi,
                test_performans_karnesi, test_telegram_komut,
-               test_tek_ornek, test_bildirim_dayanikliligi]
+               test_tek_ornek, test_bildirim_dayanikliligi,
+               test_scalp_kanali]
     for fn in testler:
         try:
             fn()

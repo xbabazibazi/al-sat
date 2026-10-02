@@ -87,10 +87,12 @@ class TelegramKomut:
     """Telegram'ı dinler, yetkiyi denetler, komutu kuyruğa bırakır."""
 
     def __init__(self, cfg: Config, state: StateStore,
-                 borsa_state: StateStore | None, market) -> None:
+                 borsa_state: StateStore | None, market,
+                 scalp_state: StateStore | None = None) -> None:
         self.cfg = cfg
         self.state = state
         self.borsa_state = borsa_state
+        self.scalp_state = scalp_state
         self.market = market
         self.sahip = str(cfg.telegram_chat_id or "").strip()
         self._bekleyen: dict | None = None      # {kod, tur, sembol, fiyat, son}
@@ -236,14 +238,66 @@ class TelegramKomut:
         return "\n\n*BORSA* (sanal cüzdan)\n" + (
             "\n".join(satirlar) if satirlar else "_açık pozisyon yok_")
 
+    def _scalp_blok(self) -> str:
+        """SCALP kanalı — kendi cüzdanı, kendi karnesi. Ana kanalla karışmaz."""
+        if self.scalp_state is None:
+            return ""
+        bakiye = float(self.scalp_state.get_kv("scalp_usdt",
+                                               str(self.cfg.scalp_baslangic_usdt)))
+        varlik = bakiye
+        satirlar = []
+        for p in self.scalp_state.all_positions():
+            fiyat = self._fiyat(p.symbol)
+            if fiyat is None:
+                satirlar.append(f"• `{p.symbol}` {p.side} — fiyat okunamadı")
+                continue
+            yon = 1 if p.side == "LONG" else -1
+            upnl = (fiyat - p.entry_price) * yon * p.qty
+            varlik += p.margin + upnl
+            r = ((fiyat - p.entry_price) * yon / p.risk_unit) if p.risk_unit > 0 else None
+            stop_pnl = (p.trailing_stop - p.entry_price) * yon * p.qty
+            yari = " _(yarısı alındı)_" if self.scalp_state.get_kv(
+                f"syari_{p.symbol}", "") == "1" else ""
+            satirlar.append(
+                f"• `{p.symbol}` {p.side} `{fiyat:,.6g}`{yari}\n"
+                f"   anlık `{upnl:+,.2f}` USDT" +
+                (f" · `{r:+.2f}R`" if r is not None else "") + "\n"
+                f"   stop `{p.trailing_stop:,.6g}` → *şimdi stop olursa* "
+                f"`{stop_pnl:+,.2f}` USDT")
+        o = ozet(self.scalp_state.pnl_sirali())
+        bugun = datetime.now(timezone.utc).date().isoformat()
+        gun_pnl = float(self.scalp_state.get_kv(f"spnl_{bugun}", "0") or 0)
+        gun_islem = int(float(self.scalp_state.get_kv(f"sislem_{bugun}", "0") or 0))
+        return ("\n\n⚡ *SCALP* (sanal) — varlık `{:,.2f}` USDT\n".format(varlik)
+                + f"bugün `{gun_pnl:+,.2f}` · {gun_islem}/{self.cfg.scalp_max_gunluk_islem} işlem\n"
+                + ("\n".join(satirlar) if satirlar else "_açık pozisyon yok_")
+                + f"\nkarne: {o['n']} işlem · kazanma %{o['kazanma_orani']} · "
+                  f"beklenti `{o['beklenti']:+.2f}`/işlem")
+
     def _durum(self) -> str:
         simdi = datetime.now(timezone.utc).strftime("%d.%m %H:%M UTC")
-        return f"📊 *DURUM* · {simdi}\n\n" + self._kripto_blok() + self._borsa_blok()
+        return (f"📊 *DURUM* · {simdi}\n\n" + self._kripto_blok()
+                + self._borsa_blok() + self._scalp_blok())
 
     # ------------------------------------------------- yıkıcı komutlar + onay
     def _hedef_bul(self, sembol: str):
-        """Sembol hangi kanala ait? (durum_deposu, komut_ön_eki) döndürür."""
+        """Sembol hangi kanala ait? (depo, komut_öneki, DB_sembolü) döndürür.
+
+        DİKKAT — "SCALP:BTCUSDT" biçimi: BTCUSDT hem ana kanalda hem scalp'te
+        olabilir. Önek olmadan hangisini kastettiğini bilemeyiz ve yanlış
+        tahmin, YANLIŞ POZİSYONU KAPATMAK demektir. Bu yüzden scalp'e
+        erişim açıkça öneklidir; önek yoksa ana kanal kastedilmiştir.
+
+        Dönen üçüncü değer DB'de kullanılacak SAF sembol (öneksiz). Çağıran
+        katman onay beklentisini kurarken ÖNEKLİ hâli saklamak zorundadır,
+        yoksa onay turunda sembol ana kanala yönlenir.
+        """
         sembol = sembol.upper()
+        if sembol.startswith("SCALP:"):
+            saf = sembol[6:]
+            if self.scalp_state is not None and saf in self.cfg.scalp_symbols:
+                return self.scalp_state, "scmd_", saf
+            return None, None, sembol
         if sembol in self.cfg.symbols:
             return self.state, "cmd_", sembol
         if self.borsa_state is not None and sembol in self.cfg.borsa_symbols:
@@ -258,31 +312,36 @@ class TelegramKomut:
                 f"_{BEKLEYEN_TTL_S // 60} dakika geçerli. Düğme çalışmazsa "
                 f"elle: _`/onay {kod}`")
 
-    def _kapat_iste(self, sembol: str) -> str:
-        depo, _, sembol = self._hedef_bul(sembol)
+    def _kapat_iste(self, ham_sembol: str) -> str:
+        # ham_sembol GÖLGELENMEZ: onay beklentisine ÖNEKLİ hâli yazılır. Yoksa
+        # onay turunda "SCALP:BTCUSDT" → "BTCUSDT" olup ANA KANALA yönlenir ve
+        # yanlış pozisyon kapanır. Bu, sessiz ve pahalı bir hata olurdu.
+        depo, _, db_sembol = self._hedef_bul(ham_sembol)
         if depo is None:
-            return f"❓ `{sembol}` takip listesinde yok."
-        pos = depo.get_position(sembol)
+            return f"❓ `{ham_sembol}` takip listesinde yok."
+        pos = depo.get_position(db_sembol)
         if pos is None:
-            return f"⛔ `{sembol}` için açık pozisyon yok."
+            return f"⛔ `{ham_sembol}` için açık pozisyon yok."
+        gosterim = ham_sembol.upper()
         return self._bekleyeni_kur(
-            "kapat", sembol, None,
-            f"⚠️ *KAPATMA ONAYI*\n`{sembol}` {pos.side} · giriş `{pos.entry_price:,.6g}`\n"
+            "kapat", gosterim, None,
+            f"⚠️ *KAPATMA ONAYI*\n`{gosterim}` {pos.side} · giriş `{pos.entry_price:,.6g}`\n"
             f"Piyasa emriyle KAPANACAK — geri alınamaz.")
 
-    def _stop_iste(self, sembol: str, ham: str) -> str:
-        depo, _, sembol = self._hedef_bul(sembol)
+    def _stop_iste(self, ham_sembol: str, ham: str) -> str:
+        depo, _, db_sembol = self._hedef_bul(ham_sembol)
         if depo is None:
-            return f"❓ `{sembol}` takip listesinde yok."
+            return f"❓ `{ham_sembol}` takip listesinde yok."
         try:
             fiyat = float(ham.replace(",", "."))
         except ValueError:
             return f"❓ Fiyat sayıya çevrilemedi: `{ham}`"
         if fiyat <= 0:
             return "⛔ Stop 0 veya negatif olamaz."
-        pos = depo.get_position(sembol)
+        pos = depo.get_position(db_sembol)
         if pos is None:
-            return f"⛔ `{sembol}` için açık pozisyon yok."
+            return f"⛔ `{ham_sembol}` için açık pozisyon yok."
+        sembol = ham_sembol.upper()     # onay turunda önek korunsun
         # Gevşetme mi sıkma mı — kullanıcı ne yaptığını GÖRSÜN diye yazılır.
         gevsiyor = (fiyat < pos.trailing_stop) if pos.side == "LONG" else (fiyat > pos.trailing_stop)
         yon = "GEVŞETME ⚠️ (riski artırır)" if gevsiyor else "sıkma (riski azaltır)"
@@ -336,9 +395,14 @@ class TelegramKomut:
         return cevap, None
 
     def _acik_pozisyonlar(self) -> list[tuple[StateStore, str]]:
+        """Tüm kanalların açık pozisyonları. Scalp ÖNEKLİ döner (SCALP:BTCUSDT)
+        çünkü aynı sembol iki kanalda birden olabilir."""
         acik = [(self.state, p.symbol) for p in self.state.all_positions()]
         if self.borsa_state is not None:
             acik += [(self.borsa_state, p.symbol) for p in self.borsa_state.all_positions()]
+        if self.scalp_state is not None:
+            acik += [(self.scalp_state, f"SCALP:{p.symbol}")
+                     for p in self.scalp_state.all_positions()]
         return acik
 
     def _pozisyon_secimi(self) -> tuple[str, dict | None]:

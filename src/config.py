@@ -6,7 +6,7 @@ değerleri kullanır ki backtest ile canlı davranış birbirinden sapmasın.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -189,11 +189,84 @@ class Config:
     borsa_max_positions: int = int(_env("BORSA_MAX_POSITIONS", "3"))  # cüzdan başına eşzamanlı tavan
     borsa_db_path: Path = DATA_DIR / "borsa_state.db"
 
+    # ---- SCALP kanalı (kısa süreli kaldıraçlı gir-çık) ----
+    # Ana kanaldan TAM YALITIM: ayrı DB, ayrı cüzdan, ayrı istatistik, ayrı
+    # iş parçacığı. İki parametre (Donchian + ATR) ve 15 dakikalık mum.
+    # Kapatmak için .env'e SCALP_ENABLED=false.
+    scalp_enabled: bool = _env("SCALP_ENABLED", "true").lower() == "true"
+    # paper | testnet | live — KagitBroker mı FuturesBroker mı kullanılacağını
+    # bu belirler. Trader hangisi olduğunu bilmez (bkz. kagit_broker.py).
+    scalp_mode: str = _env("SCALP_MODE", "paper").lower()
+    scalp_symbols: tuple[str, ...] = tuple(
+        s.strip().upper() for s in _env(
+            "SCALP_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,DOGEUSDT"
+        ).split(",") if s.strip())
+
+    # ZAMAN DİLİMİ — 2026-10-01 canlı ölçümü (5 parite, son 100 mum):
+    #   1dk ATR %0.111 · 5dk %0.208 · 15dk %0.458 · 1sa %1.056
+    # Gidiş-dönüş sürtünme ≈ %0.20. Yani 1dk'da sürtünme 1R hedefin %135'i.
+    # 15dk, matematiksel olarak kazanma şansı olan en hızlı seçenek.
+    scalp_timeframe: str = _env("SCALP_TIMEFRAME", "15m")
+
+    # İKİ PARAMETRE. Donchian = zamanlama, ATR çarpanı = stop mesafesi.
+    # Ana kanalın 3.0'ı burada fazla geniş olurdu (hedef sürtünmeyi karşılamaz).
+    scalp_donchian: int = int(_env("SCALP_DONCHIAN", "20"))
+    scalp_atr_carpani: float = float(_env("SCALP_ATR_CARPANI", "1.0"))
+
+    # ÇIKIŞ: hedefte YARISI kapanır, kalan iz süren stopla devam eder ve
+    # stop en az girişe çekilir (koşan yarı zarar edemez).
+    scalp_kar_hedefi_r: float = float(_env("SCALP_KAR_HEDEFI_R", "1.5"))
+
+    # MALİYET KAPISI — bu kanalın yaşam savaşı. Hedef, gidiş-dönüş
+    # sürtünmenin en az bu kadar katı olmalı; değilse işleme GİRİLMEZ.
+    # Projenin kendi notu: "1h backtestte komisyona yenildi" — orada sürtünme
+    # hedefin %14'üydü. Bu kapı aynı hatayı sessizce tekrarlamayı yasaklar.
+    scalp_min_hedef_kat: float = float(_env("SCALP_MIN_HEDEF_KAT", "3.0"))
+    scalp_taker_fee: float = float(_env("SCALP_TAKER_FEE", "0.0005"))
+    scalp_slippage: float = float(_env("SCALP_SLIPPAGE", "0.0005"))
+
+    # RİSK VE FRENLER. Scalp ana kanaldan çok daha sık işlem açar; işlem
+    # başına risk bu yüzden daha küçük, frenler daha sıkı.
+    scalp_risk_pct: float = float(_env("SCALP_RISK_PCT", "0.005"))      # %0.5
+    scalp_kaldirac: float = float(_env("SCALP_KALDIRAC", "3"))
+    scalp_max_pozisyon: int = int(_env("SCALP_MAX_POZISYON", "2"))
+    # Dar stop + sabit %risk, farkında olmadan çok büyük notional üretir
+    # (küçük bölen). Tek bir scalp hesabın tamamını kilitlemesin.
+    scalp_max_notional_pct: float = float(_env("SCALP_MAX_NOTIONAL_PCT", "1.5"))
+    scalp_max_gunluk_zarar: float = float(_env("SCALP_MAX_GUNLUK_ZARAR", "0.03"))
+    scalp_max_gunluk_islem: int = int(_env("SCALP_MAX_GUNLUK_ISLEM", "20"))
+    # Üst üste N zarar = rejim değişmiş olabilir; devam etmek komisyon bağışı.
+    scalp_max_zarar_serisi: int = int(_env("SCALP_MAX_ZARAR_SERISI", "5"))
+    scalp_allow_short: bool = _env("SCALP_ALLOW_SHORT", "true").lower() == "true"
+    scalp_poll_seconds: int = int(_env("SCALP_POLL_SECONDS", "20"))
+    scalp_baslangic_usdt: float = float(_env("SCALP_BASLANGIC_USDT", "10000"))
+
+    # CANLI ALT HESAP ANAHTARLARI — ana hesaptan AYRI.
+    # Binance tek-yön modunda aynı sembolde iki pozisyon BİRLEŞİR; scalp ile
+    # trend aynı hesapta çalışırsa birbirinin pozisyonunu bozar. Çözüm: ayrı
+    # alt hesap, ayrı anahtar. Bu alanlar boşsa canlı scalp BAŞLAMAZ.
+    scalp_live_key: str = _env("SCALP_BINANCE_KEY")
+    scalp_live_secret: str = _env("SCALP_BINANCE_SECRET")
+    scalp_db_path: Path = DATA_DIR / "scalp_state.db"
+
     # Dosyalar
     db_path: Path = DATA_DIR / "bot_state.db"
     log_path: Path = DATA_DIR / "bot.log"
 
     strategy: StrategyParams = field(default_factory=StrategyParams)
+
+    @property
+    def scalp_strategy(self) -> StrategyParams:
+        """Scalp'in kendi indikatör parametreleri.
+
+        compute_indicators() StrategyParams bekliyor; ana kanalın nesnesini
+        verirsek Donchian 20/4saat ve ATR×3 kullanılır — scalp'in istediği
+        bu değil. Ayrı nesne, aynı hesap kodu: tek indikatör uygulaması
+        kalsın ki iki kanal arasında sapma olmasın.
+        """
+        return replace(self.strategy,
+                       donchian_period=self.scalp_donchian,
+                       atr_multiplier=self.scalp_atr_carpani)
 
     def validate(self) -> None:
         gecerli = ("dry_run", "testnet", "live", "futures_paper",
@@ -231,6 +304,31 @@ class Config:
                     f"({self.canli_risk_tavani:.3f}) aşıyor. Kâğıttaki risk "
                     f"canlıya olduğu gibi taşınmaz; CANLI_RISK_TAVANI ile "
                     f"bilinçli olarak yükseltilebilir.")
+
+        # ---------------- SCALP KANALI KAPILARI ----------------
+        if self.scalp_mode not in ("paper", "testnet", "live"):
+            raise ValueError(f"Geçersiz SCALP_MODE: {self.scalp_mode}")
+        if self.scalp_mode == "live":
+            # AYRI ALT HESAP ŞART. Binance tek-yön modunda aynı sembolde iki
+            # pozisyon BİRLEŞİR: scalp, trend kanalının pozisyonunu bozar ve
+            # bunu kimse fark etmez (iki ayrı DB kendi doğrusunu yazar).
+            # Ana hesabın anahtarını buraya yazmak da bu yüzden yasak.
+            if not (self.scalp_live_key and self.scalp_live_secret):
+                raise ValueError(
+                    "Canlı scalp için SCALP_BINANCE_KEY/SECRET gerekli — ve bu "
+                    "anahtar AYRI BİR BİNANCE ALT HESABINA ait olmalı. Ana "
+                    "hesapla paylaşılırsa trend pozisyonlarıyla birleşir.")
+            if self.scalp_live_key == self.live_key:
+                raise ValueError(
+                    "SCALP_BINANCE_KEY, BINANCE_LIVE_KEY ile AYNI. Aynı hesapta "
+                    "iki kanal çalıştırmak pozisyonları birleştirir; alt hesap aç.")
+            if self.canli_onay != "EVET_GERCEK_PARA":
+                raise ValueError(
+                    "Canlı scalp KİLİTLİ. .env'e CANLI_ONAY=EVET_GERCEK_PARA ekle.")
+        if self.scalp_min_hedef_kat < 1.0:
+            raise ValueError(
+                "SCALP_MIN_HEDEF_KAT 1'in altında olamaz: hedefin sürtünmeden "
+                "küçük olmasına izin vermek, bilerek komisyon bağışlamaktır.")
 
 
 CONFIG = Config()

@@ -33,6 +33,8 @@ state = StateStore(CONFIG.db_path)
 # BORSA kanalının ayrı DB'si. Panel yalnızca OKUR + komut kuyruğuna yazar;
 # pozisyonlara tek yazıcı borsa iş parçacığıdır (kripto ile aynı ilke).
 borsa_state = StateStore(CONFIG.borsa_db_path)
+# SCALP kanalının ayrı DB'si — aynı ilke: panel okur ve komut kuyruğuna yazar.
+scalp_state = StateStore(CONFIG.scalp_db_path)
 
 _trigger_cache: dict[str, tuple[float, float, float]] = {}  # symbol -> (ts, long_trig, short_trig)
 TRIGGER_TTL = 300  # mum 4 saatte bir değişir; 5 dakikada bir yenilemek fazlasıyla yeterli
@@ -702,6 +704,107 @@ def build_borsa_state() -> dict:
     }
 
 
+def build_scalp_state() -> dict:
+    """SCALP sekmesinin verisi — kendi cüzdanı, kendi karnesi, kendi frenleri.
+
+    Fiyatlar scalp iş parçacığının kv'ye bıraktığı son değerden okunur
+    (sfiyat_<SEMBOL>); panel ağ beklemez ve bayat fiyatı taze göstermez.
+    """
+    bugun = datetime.now(timezone.utc).date().isoformat()
+    bakiye = float(scalp_state.get_kv("scalp_usdt", str(CONFIG.scalp_baslangic_usdt)))
+    varlik = bakiye
+    positions = []
+    for p in scalp_state.all_positions():
+        ham = scalp_state.get_kv(f"sfiyat_{p.symbol}", "")
+        f, _, ts = ham.partition("|")
+        try:
+            fiyat = float(f)
+        except ValueError:
+            fiyat = p.entry_price
+            ts = ""
+        yon = 1 if p.side == "LONG" else -1
+        upnl = (fiyat - p.entry_price) * yon * p.qty
+        varlik += p.margin + upnl
+        r = ((fiyat - p.entry_price) * yon / p.risk_unit) if p.risk_unit > 0 else None
+        positions.append({
+            "symbol": p.symbol, "side": p.side, "qty": p.qty,
+            "entry": p.entry_price, "price": fiyat, "stop": p.trailing_stop,
+            "margin": round(p.margin, 2), "upnl": round(upnl, 2),
+            "notional": round(p.qty * p.entry_price, 2),
+            "since": p.entry_time, "fiyat_zamani": ts,
+            "r_simdi": None if r is None else round(r, 2),
+            # Stop şimdi tetiklenirse bankaya girecek olan — "anlık" ile aynı değil.
+            "stop_pnl": round((p.trailing_stop - p.entry_price) * yon * p.qty, 2),
+            "stop_kilit": p.stop_manual_ref,
+            "yari_alindi": scalp_state.get_kv(f"syari_{p.symbol}", "") == "1",
+            "hedef": (p.entry_price + CONFIG.scalp_kar_hedefi_r * p.risk_unit * yon
+                      if p.risk_unit > 0 else None),
+        })
+
+    komutlar = []
+    for sym in CONFIG.scalp_symbols:
+        bekleyen = scalp_state.get_kv(f"scmd_{sym}", "")
+        sonuc = scalp_state.get_kv(f"scmdres_{sym}", "")
+        if bekleyen:
+            komutlar.append({"symbol": sym, "durum": "bekliyor", "mesaj": bekleyen})
+        elif sonuc:
+            durum, _, kalan = sonuc.partition("|")
+            ts, _, mesaj = kalan.partition("|")
+            yas = 0
+            try:
+                yas = int((datetime.now(timezone.utc)
+                           - datetime.fromisoformat(ts)).total_seconds())
+            except ValueError:
+                pass
+            if yas < 600:        # eski sonuçları şeritte tutmayalım
+                komutlar.append({"symbol": sym, "durum": durum,
+                                 "mesaj": mesaj, "yas": yas})
+
+    gun_pnl = float(scalp_state.get_kv(f"spnl_{bugun}", "0") or 0)
+    gun_islem = int(float(scalp_state.get_kv(f"sislem_{bugun}", "0") or 0))
+    zarar_serisi = int(float(scalp_state.get_kv(f"szarar_serisi_{bugun}", "0") or 0))
+    hb = scalp_state.get_kv("scalp_heartbeat", "")
+    canli = False
+    try:
+        canli = (datetime.now(timezone.utc)
+                 - datetime.fromisoformat(hb)).total_seconds() < 180
+    except ValueError:
+        pass
+
+    return {
+        "now": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "canli": canli,
+        "mode": CONFIG.scalp_mode,
+        "timeframe": CONFIG.scalp_timeframe,
+        "donchian": CONFIG.scalp_donchian,
+        "atr_carpani": CONFIG.scalp_atr_carpani,
+        "hedef_r": CONFIG.scalp_kar_hedefi_r,
+        "kaldirac": CONFIG.scalp_kaldirac,
+        "bakiye": round(bakiye, 2), "varlik": round(varlik, 2),
+        "baslangic": CONFIG.scalp_baslangic_usdt,
+        "pnl_pct": round((varlik / CONFIG.scalp_baslangic_usdt - 1) * 100, 2),
+        "positions": positions,
+        "komutlar": komutlar,
+        "symbols": list(CONFIG.scalp_symbols),
+        "trades": scalp_state.recent_trades(20),
+        "performans": ozet(scalp_state.pnl_sirali()),
+        # FRENLER panelde görünür olmalı: "neden işlem açmıyor?" sorusunun
+        # cevabı log'da kalmasın.
+        "frenler": {
+            "gun_pnl": round(gun_pnl, 2),
+            "gun_islem": gun_islem,
+            "max_gun_islem": CONFIG.scalp_max_gunluk_islem,
+            "zarar_serisi": zarar_serisi,
+            "max_zarar_serisi": CONFIG.scalp_max_zarar_serisi,
+            "max_gun_zarar_pct": CONFIG.scalp_max_gunluk_zarar * 100,
+            "max_pozisyon": CONFIG.scalp_max_pozisyon,
+            "surtunme_pct": round((CONFIG.scalp_taker_fee + CONFIG.scalp_slippage) * 200, 3),
+            "min_hedef_kat": CONFIG.scalp_min_hedef_kat,
+        },
+        "assessments": scalp_state.latest_assessments(),
+    }
+
+
 PAGE = """<!doctype html>
 <html lang="tr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -822,6 +925,7 @@ PAGE = """<!doctype html>
 <div class="tabs">
   <button class="tab aktif" id="tabKripto" onclick="sekme('kripto')">KRİPTO</button>
   <button class="tab" id="tabBorsa" onclick="sekme('borsa')">BORSA <span style="font-weight:400">ABD+BIST</span></button>
+  <button class="tab" id="tabScalp" onclick="sekme('scalp')">⚡ SCALP <span style="font-weight:400">15dk</span></button>
 </div>
 <div id="sayfaKripto">
 <div class="grid" id="stats"></div>
@@ -839,6 +943,13 @@ PAGE = """<!doctype html>
 <div class="card"><h2>Açık Pozisyonlar — hisse (sanal cüzdan)</h2><div id="bKomutlar"></div><div id="bPositions"></div></div>
 <div class="card"><h2>Ön Değerlendirme — günlük mum + haftalık teyit</h2><div id="bAssess"></div></div>
 <div class="card"><h2>Son İşlemler — hisse</h2><div id="bTrades"></div></div>
+</div>
+<div id="sayfaScalp" style="display:none">
+<div class="grid" id="sStats"></div>
+<div class="card"><h2>Frenler — "neden işlem açmıyor?" sorusunun cevabı burada</h2><div id="sFrenler"></div></div>
+<div class="card"><h2>Sistem Karnesi — scalp (ana kanaldan ayrı)</h2><div id="sPerf"></div></div>
+<div class="card"><h2>Açık Pozisyonlar — scalp</h2><div id="sKomutlar"></div><div id="sPositions"></div></div>
+<div class="card"><h2>Son İşlemler — scalp</h2><div id="sTrades"></div></div>
 </div>
 <script>
 const $ = id => document.getElementById(id);
@@ -1165,14 +1276,20 @@ async function ctrl(action) {
   setTimeout(refresh, 1500);
 }
 
-// ---------------------------------------------------------------- BORSA sekmesi
+// ------------------------------------------------- sekmeler: KRIPTO/BORSA/SCALP
+// Uc sayfa icin ad->(sayfa,tab) eslemesi; iki boolean'la yonetmek ucuncu
+// sekmede bozulurdu.
+const SAYFALAR = {kripto: ["sayfaKripto","tabKripto"],
+                  borsa:  ["sayfaBorsa","tabBorsa"],
+                  scalp:  ["sayfaScalp","tabScalp"]};
 function sekme(ad) {
-  const borsa = ad === "borsa";
-  $("sayfaKripto").style.display = borsa ? "none" : "";
-  $("sayfaBorsa").style.display = borsa ? "" : "none";
-  $("tabKripto").className = "tab" + (borsa ? "" : " aktif");
-  $("tabBorsa").className = "tab" + (borsa ? " aktif" : "");
-  if (borsa) refreshBorsa();
+  for (const [k, [sayfa, tab]] of Object.entries(SAYFALAR)) {
+    const aktif = k === ad;
+    $(sayfa).style.display = aktif ? "" : "none";
+    $(tab).className = "tab" + (aktif ? " aktif" : "");
+  }
+  if (ad === "borsa") refreshBorsa();
+  if (ad === "scalp") refreshScalp();
 }
 // Para birimi sembole gore: ".IS" = BIST (TL), digeri ABD ($).
 const bPara = (v, cur) => (v<0 ? "−" : "") + (cur === "TRY" ? "₺" : "$") +
@@ -1312,9 +1429,106 @@ async function borsaKapat(sembol, pnl, cur) {
   setTimeout(refreshBorsa, 2000);
 }
 
+// Son cekilen scalp verisi — STOP prompt'u mevcut seviyeyi gosterebilsin.
+// Tanim KULLANIMDAN ONCE: `let` hoist edilmez, sonra tanimlanirsa TDZ hatasi.
+let _sSon = null;
+function d_sPos(sym) { return (_sSon && _sSon.positions || []).find(p => p.symbol === sym); }
+
+// ---------------------------------------------------------------- SCALP sekmesi
+async function refreshScalp() {
+  let d;
+  try { d = await (await fetch("/api/scalp")).json(); }
+  catch { return; }
+  if (d.error) return;
+  _sSon = d;        // STOP prompt'u mevcut seviyeyi gosterebilsin
+
+  $("sStats").innerHTML = [
+    ["Scalp Cüzdanı (sanal)", money(d.varlik), sign(d.pnl_pct) + "% başlangıçtan", d.varlik - d.baslangic],
+    ["Serbest Bakiye", money(d.bakiye), "marjin dışı", 0],
+    ["Bugün", money(d.frenler.gun_pnl), d.frenler.gun_islem + "/" + d.frenler.max_gun_islem + " işlem", d.frenler.gun_pnl],
+    ["Ayarlar", d.timeframe + " · " + d.kaldirac + "x",
+     "Donchian " + d.donchian + " · ATR×" + d.atr_carpani + " · hedef " + d.hedef_r + "R", 0],
+    ["Döngü", d.canli ? "ÇALIŞIYOR" : "BEKLEMEDE", d.mode + " · " + d.symbols.length + " parite", d.canli ? 1 : -1],
+  ].map(([l,v,s,c]) =>
+    `<div class="stat"><div class="l">${l}</div><div class="v ${cls(c)}">${v}</div><div class="s">${s}</div></div>`
+  ).join("");
+
+  // FRENLER gorunur olmali: scalp islem acmiyorsa sebebi log'da kalmasin.
+  const f = d.frenler;
+  $("sFrenler").innerHTML = `<div class="grid">` + [
+    ["Zarar serisi", f.zarar_serisi + "/" + f.max_zarar_serisi,
+     f.zarar_serisi >= f.max_zarar_serisi ? "FREN DEVREDE — bugün giriş yok" : "üst üste zarar",
+     f.zarar_serisi >= f.max_zarar_serisi ? -1 : 0],
+    ["Günlük işlem", f.gun_islem + "/" + f.max_gun_islem,
+     f.gun_islem >= f.max_gun_islem ? "TAVAN DOLDU" : "bugün açılan", f.gun_islem >= f.max_gun_islem ? -1 : 0],
+    ["Günlük zarar sınırı", "%" + f.max_gun_zarar_pct, "bugün " + money(f.gun_pnl), f.gun_pnl],
+    ["Maliyet kapısı", f.min_hedef_kat + "×", "sürtünme %" + f.surtunme_pct + " — hedef bunun katı olmalı", 0],
+  ].map(([l,v,s,c]) =>
+    `<div class="stat"><div class="l">${l}</div><div class="v ${cls(c)}">${v}</div><div class="s">${s}</div></div>`
+  ).join("") + `</div>`;
+
+  $("sPerf").innerHTML = perfKart(d.performans, "USDT");
+
+  $("sKomutlar").innerHTML = (d.komutlar || []).map(k => {
+    const s = k.durum === "bekliyor" ? ["⏳", "var(--amber)"]
+            : k.durum === "ok"       ? ["✅", "var(--up)"]
+            : k.durum === "red"      ? ["⛔", "var(--down)"]
+            :                          ["ℹ️", "var(--mut)"];
+    const yas = k.durum === "bekliyor" ? "" : `<span class="yas">${k.yas} sn önce</span>`;
+    return `<div class="komut" style="color:${s[1]}">${s[0]} <b>${k.symbol}</b> ${k.mesaj} ${yas}</div>`;
+  }).join("");
+
+  $("sPositions").innerHTML = d.positions.length ? "<table><tr>" +
+    "<th>Parite</th><th>Yön</th><th>Giriş</th><th>Fiyat</th><th>Anlık</th><th>R</th>" +
+    "<th>Stop</th><th>Stop olursa</th><th>Hedef</th><th></th></tr>" +
+    d.positions.map(p => `<tr>
+      <td><b>${p.symbol}</b>${p.yari_alindi ? ' <span style="color:var(--up);font-size:11px">yarısı alındı</span>' : ''}</td>
+      <td class="${p.side === "LONG" ? "up" : "down"}">${p.side}</td>
+      <td>${kisa(p.entry)}</td><td>${kisa(p.price)}</td>
+      <td class="${cls(p.upnl)}">${money(p.upnl)}</td>
+      <td class="${cls(p.r_simdi)}">${p.r_simdi === null ? "—" : (p.r_simdi>0?"+":"") + p.r_simdi + "R"}</td>
+      <td>${kisa(p.stop)}${p.stop_kilit > 0 ? " 🔓" : ""}</td>
+      <td class="${cls(p.stop_pnl)}">${money(p.stop_pnl)}</td>
+      <td>${p.hedef === null ? "—" : kisa(p.hedef)}</td>
+      <td style="white-space:nowrap">
+        <button onclick="scalpStop('${p.symbol}')" style="background:var(--card2)">STOP</button>
+        <button onclick="scalpKapat('${p.symbol}')" style="background:var(--down)">KAPAT</button>
+      </td></tr>`).join("") + "</table>"
+    : `<div class="empty">Açık scalp pozisyonu yok</div>`;
+
+  $("sTrades").innerHTML = d.trades.length ? "<table><tr>" +
+    "<th>Parite</th><th>Yön</th><th>Giriş</th><th>Çıkış</th><th>PnL</th><th>Sebep</th><th>Kapanış</th></tr>" +
+    d.trades.map(t => `<tr><td><b>${t.symbol}</b></td>
+      <td class="${t.side === "LONG" ? "up" : "down"}">${t.side}</td>
+      <td>${kisa(t.entry_price)}</td><td>${kisa(t.exit_price)}</td>
+      <td class="${cls(t.pnl_usdt)}">${money(t.pnl_usdt)}</td>
+      <td style="color:var(--ink2);font-size:12px">${t.exit_reason || ""}</td>
+      <td style="color:var(--mut)">${saat(t.exit_time)}</td></tr>`).join("") + "</table>"
+    : `<div class="empty">Henüz kapanmış scalp işlemi yok</div>`;
+}
+
+async function scalpKapat(sym) {
+  if (!confirm(`${sym} scalp pozisyonunu KAPAT?\n\nPiyasa emriyle kapanır, geri alınamaz.`)) return;
+  try { await fetch("/api/scalp/kapat/" + sym, {method:"POST"}); }
+  catch { alert("Komut gönderilemedi."); }
+  setTimeout(refreshScalp, 2000);
+}
+
+async function scalpStop(sym) {
+  const p = d_sPos(sym);
+  const v = prompt(`${sym} yeni stop seviyesi\n\nşu anki: ${p ? kisa(p.stop) : "?"}`,
+                   p ? p.stop : "");
+  if (!v) return;
+  const f = parseFloat(String(v).replace(",", "."));
+  if (!(f > 0)) { alert("Geçersiz fiyat."); return; }
+  try { await fetch("/api/scalp/stop/" + sym + "/" + f, {method:"POST"}); }
+  catch { alert("Komut gönderilemedi."); }
+  setTimeout(refreshScalp, 2000);
+}
 refresh();
 setInterval(refresh, 5000);
 setInterval(() => { if ($("sayfaBorsa").style.display !== "none") refreshBorsa(); }, 15000);
+setInterval(() => { if ($("sayfaScalp").style.display !== "none") refreshScalp(); }, 10000);
 </script></body></html>"""
 
 
@@ -1345,6 +1559,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:  # noqa: BLE001
                 log.error("borsa state hatası: %s", e)
                 self._send(500, "application/json", b'{"error":"borsa"}')
+        elif self.path == "/api/scalp":
+            try:
+                body = json.dumps(build_scalp_state(), ensure_ascii=False).encode("utf-8")
+                self._send(200, "application/json", body)
+            except Exception as e:  # noqa: BLE001
+                log.error("scalp state hatası: %s", e)
+                self._send(500, "application/json", b'{"error":"scalp"}')
         elif self.path == "/api/deploy-durum":
             # Teşhis ucu: cron kurulu mu, betik çalışmış mı, neden ertelemiş.
             try:
@@ -1415,6 +1636,34 @@ class Handler(BaseHTTPRequestHandler):
                 if sembol in CONFIG.borsa_symbols and fiyat > 0:
                     borsa_state.set_kv(f"bcmd_{sembol}", f"STOP:{fiyat!r}")
                     log.info("BORSA manuel STOP kuyruğa alındı: %s → %s", sembol, fiyat)
+                    self._send(200, "application/json", b'{"ok":true}')
+                    return
+            self._send(400, "application/json", b'{"ok":false}')
+            return
+
+        # SCALP manuel müdahale — kripto/borsa ile aynı desen: komut kuyruğa,
+        # uygulama scalp iş parçacığında, sonuç scmdres'ten şeride.
+        if self.path.startswith("/api/scalp/kapat/"):
+            sembol = self.path.rsplit("/", 1)[-1].upper()
+            if sembol in CONFIG.scalp_symbols:
+                scalp_state.set_kv(f"scmd_{sembol}", "CLOSE")
+                log.info("SCALP manuel kapatma kuyruğa alındı: %s", sembol)
+                self._send(200, "application/json", b'{"ok":true}')
+            else:
+                self._send(400, "application/json", b'{"ok":false}')
+            return
+
+        if self.path.startswith("/api/scalp/stop/"):
+            parts = self.path.split("/")   # ['', 'api', 'scalp', 'stop', sembol, fiyat]
+            if len(parts) == 6:
+                sembol = parts[4].upper()
+                try:
+                    fiyat = float(parts[5])
+                except ValueError:
+                    fiyat = 0.0
+                if sembol in CONFIG.scalp_symbols and fiyat > 0:
+                    scalp_state.set_kv(f"scmd_{sembol}", f"STOP:{fiyat!r}")
+                    log.info("SCALP manuel STOP kuyruğa alındı: %s → %s", sembol, fiyat)
                     self._send(200, "application/json", b'{"ok":true}')
                     return
             self._send(400, "application/json", b'{"ok":false}')
