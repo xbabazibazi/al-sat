@@ -275,6 +275,31 @@ class StateStore:
             toplam[k] += float(pnl)
         return [toplam[k] for k in sira]
 
+    def pnl_pozisyon_bazli_rejimli(self, baslangic: str) -> tuple[list[float], list[float]]:
+        """(yeni_rejim, arşiv) — giriş zamanı `baslangic`tan önce/sonra.
+
+        NEDEN (2026-10-05): geniş kanal üç kural rejimi değiştirdi (15dk →
+        1sa → 4sa). Üçünün zararını tek karnede toplamak, ölü planların
+        faturasını yürürlükteki plana kesmek demekti — kullanıcı haklı
+        olarak "sürekli zarar yazıyorsun" diye okudu. Oysa o anki planın
+        kapanmış işlemi SIFIRDI. Arşiv GİZLENMEZ, ayrı satırda gösterilir;
+        toplam K/Z iki parçanın toplamına her zaman eşittir.
+        ISO-8601 UTC damgalar sözlük sırasıyla doğru karşılaştırılır.
+        """
+        cur = self._conn.execute(
+            "SELECT symbol, entry_time, pnl_usdt FROM trades ORDER BY id ASC")
+        toplam: dict[tuple[str, str], float] = {}
+        sira: list[tuple[str, str]] = []
+        for sembol, giris, pnl in cur.fetchall():
+            k = (sembol, giris)
+            if k not in toplam:
+                sira.append(k)
+                toplam[k] = 0.0
+            toplam[k] += float(pnl)
+        yeni = [toplam[k] for k in sira if k[1] >= baslangic]
+        eski = [toplam[k] for k in sira if k[1] < baslangic]
+        return yeni, eski
+
     def pozisyon_pnl_sembollu(self) -> list[tuple[str, float]]:
         """pnl_pozisyon_bazli ile aynı gruplama, ama SEMBOLÜ de verir.
 

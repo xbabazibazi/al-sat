@@ -335,6 +335,28 @@ class Config:
     # Canlıda zorunlu: validate() 0'ı reddeder.
     scalp_max_zarar_serisi: int = int(_env("SCALP_MAX_ZARAR_SERISI", "0"))
     scalp_allow_short: bool = _env("SCALP_ALLOW_SHORT", "true").lower() == "true"
+    # YÖN KARARI (2026-10-05) — kullanıcı "plan uymuyor, başka plan çıkar"
+    # dedi; beş strateji ailesi 1.8 yıl × 20 paritede yarıştırıldı:
+    #   Donchian kırılım (bu plan)   +0.036R  (ilk yarı +0.069 · son yarı −0.001)
+    #   EMA 20/50 kesişimi           +0.038R  (ilk +0.159 · son −0.105) → tek yarı
+    #   RSI14 ortalamaya dönüş       −0.088R  (iki yarı da eksi)
+    #   RSI2 dip alımı               −0.043R  (iki yarı da eksi)
+    #   Bollinger dönüşü             −0.088R  (iki yarı da eksi)
+    # DİKKAT: kazanma oranı en yüksek olanlar (%49-58, "hep kazanıyormuş
+    # hissi") en çok KAYBEDENLER. His ile ölçüm ters düşüyor.
+    # İki yarıda da artı kalan TEK varyant: Donchian YALNIZ-SHORT, 20 parite
+    # (+0.128R · ilk +0.163 · son +0.067). Ana kanal ölçümü de aynı şeyi
+    # buldu (short +0.113R, long −0.059R) ve projenin eski notuyla tutarlı
+    # ("short tarafı getirinin ana kaynağı"). Bu yüzden long varsayılan
+    # KAPALI. Boğa rejiminde tersine dönebilir — tek satırla geri açılır:
+    # SCALP_ALLOW_LONG=true. Açık pozisyonlara dokunulmaz.
+    scalp_allow_long: bool = _env("SCALP_ALLOW_LONG", "false").lower() == "true"
+    # KARNE REJİM SINIRI: bu andan önce girilen pozisyonlar eski planların
+    # (15dk, 1sa, 4sa long+short) mirasıdır; karnede AYRI "arşiv" satırında
+    # gösterilir, yeni planın notuna karışmaz. Üç ölü rejimi tek karnede
+    # toplamak, borsadaki para-birimi karıştırma hatasının kardeşiydi.
+    scalp_rejim_baslangic: str = _env("SCALP_REJIM_BASLANGIC",
+                                      "2026-10-05T04:00:00+00:00")
     # RUTİN BİLDİRİM KAPALI (2026-10-03, kullanıcı: "çok uyarı alıyorum").
     # 20 parite × açılış+kapanış+yarı kâr = günde 15-20 mesaj ediyordu.
     # Bu bayrak YALNIZCA rutin açılış/kapanış mesajlarını susturur;

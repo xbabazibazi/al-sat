@@ -63,10 +63,16 @@ def gunluk_ozet_metni(cfg) -> str:
             sc = StateStore(cfg.scalp_db_path)
             bak = float(sc.get_kv("scalp_usdt", str(cfg.scalp_baslangic_usdt)))
             var = bak + sum(p.margin for p in sc.all_positions())
-            bolum.append(_kanal_satiri(
+            # Karne yalnızca yürürlükteki planın işlemleri; ölü rejimlerin
+            # faturası arşiv satırında (ne karışır ne gizlenir).
+            yeni, eski = sc.pnl_pozisyon_bazli_rejimli(cfg.scalp_rejim_baslangic)
+            satir = _kanal_satiri(
                 f"GENİŞ ({cfg.scalp_timeframe}, {len(cfg.scalp_symbols)} parite)",
-                var, cfg.scalp_baslangic_usdt, sc.pnl_pozisyon_bazli(),
-                len(sc.all_positions())))
+                var, cfg.scalp_baslangic_usdt, yeni, len(sc.all_positions()))
+            if eski:
+                satir += (f"\n  arşiv (eski planlar): {len(eski)} pozisyon · "
+                          f"`{sum(eski):+,.2f}`")
+            bolum.append(satir)
         except Exception as e:  # noqa: BLE001
             bolum.append(f"*GENİŞ* — özet alınamadı: {str(e)[:60]}")
 

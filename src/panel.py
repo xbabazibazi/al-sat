@@ -726,6 +726,8 @@ def build_scalp_state() -> dict:
     bugun = datetime.now(timezone.utc).date().isoformat()
     bakiye = float(scalp_state.get_kv("scalp_usdt", str(CONFIG.scalp_baslangic_usdt)))
     varlik = bakiye
+    yeni_pnl, eski_pnl = scalp_state.pnl_pozisyon_bazli_rejimli(
+        CONFIG.scalp_rejim_baslangic)
     positions = []
     for p in scalp_state.all_positions():
         ham = scalp_state.get_kv(f"sfiyat_{p.symbol}", "")
@@ -803,7 +805,12 @@ def build_scalp_state() -> dict:
         # POZİSYON BAZLI: scalp hedefte yarıyı kapatıp kalanı taşıdığı için
         # tek pozisyon iki kapanış kaydı üretir. Kayıt bazlı saymak kazanma
         # oranını şişirip ödeme oranını düşürüyordu ve ZIT teşhis veriyordu.
-        "performans": ozet(scalp_state.pnl_pozisyon_bazli()),
+        # REJİM AYRIMLI: karne yalnızca YÜRÜRLÜKTEKİ planın işlemlerini not
+        # eder; ölü rejimlerin (15dk/1sa/4sa-long) faturası "eski_rejim"
+        # arşiv satırında AYRICA görünür — ne plana karışır ne gizlenir.
+        "performans": ozet(yeni_pnl),
+        "eski_rejim": {"n": len(eski_pnl), "toplam": round(sum(eski_pnl), 2),
+                       "sinir": CONFIG.scalp_rejim_baslangic[:16]},
         # Gizlemiyoruz: kaç kapanış kaydı kaç pozisyona denk geliyor.
         "kayit_sayisi": len(scalp_state.pnl_sirali()),
         # FRENLER panelde görünür olmalı: "neden işlem açmıyor?" sorusunun
@@ -1498,7 +1505,12 @@ async function refreshScalp() {
     `<div class="stat"><div class="l">${l}</div><div class="v ${cls(c)}">${v}</div><div class="s">${s}</div></div>`
   ).join("") + `</div>`;
 
-  $("sPerf").innerHTML = perfKart(d.performans, "USDT");
+  // Olu rejimlerin faturasi ARSIV satirinda: yururlukteki planin karnesine
+  // karismaz ama GIZLENMEZ de — toplam K/Z iki parcanin toplamidir.
+  const arsiv = d.eski_rejim && d.eski_rejim.n
+    ? `<div style="color:var(--mut);font-size:12px;margin-bottom:8px">arşiv (eski planlar, ${d.eski_rejim.sinir} öncesi): ${d.eski_rejim.n} pozisyon · ${money(d.eski_rejim.toplam)} — karneye dahil değil</div>`
+    : "";
+  $("sPerf").innerHTML = arsiv + perfKart(d.performans, "USDT");
 
   $("sKomutlar").innerHTML = (d.komutlar || []).map(k => {
     const s = k.durum === "bekliyor" ? ["⏳", "var(--amber)"]

@@ -277,17 +277,21 @@ class TelegramKomut:
                 (f" · `{r:+.2f}R`" if r is not None else "") + "\n"
                 f"   stop `{p.trailing_stop:,.6g}` → *şimdi stop olursa* "
                 f"`{stop_pnl:+,.2f}` USDT")
-        # POZİSYON BAZLI — kısmi kapanışlar tek pozisyon sayılır (bkz.
-        # state.pnl_pozisyon_bazli; kayıt bazlı sayım zıt teşhis veriyordu).
-        o = ozet(self.scalp_state.pnl_pozisyon_bazli())
+        # POZİSYON BAZLI + REJİM AYRIMLI — yalnızca yürürlükteki planın
+        # işlemleri; ölü rejimler arşiv satırında (bkz. state).
+        yeni_pnl, eski_pnl = self.scalp_state.pnl_pozisyon_bazli_rejimli(
+            self.cfg.scalp_rejim_baslangic)
+        o = ozet(yeni_pnl)
         bugun = datetime.now(timezone.utc).date().isoformat()
         gun_pnl = float(self.scalp_state.get_kv(f"spnl_{bugun}", "0") or 0)
         gun_islem = int(float(self.scalp_state.get_kv(f"sislem_{bugun}", "0") or 0))
-        return ("\n\n⚡ *SCALP* (sanal) — varlık `{:,.2f}` USDT\n".format(varlik)
+        arsiv = (f"\narşiv (eski planlar): {len(eski_pnl)} pozisyon · "
+                 f"`{sum(eski_pnl):+,.2f}`" if eski_pnl else "")
+        return ("\n\n⚡ *GENİŞ* (sanal) — varlık `{:,.2f}` USDT\n".format(varlik)
                 + f"bugün `{gun_pnl:+,.2f}` · {gun_islem}/{self.cfg.scalp_max_gunluk_islem} işlem\n"
                 + ("\n".join(satirlar) if satirlar else "_açık pozisyon yok_")
-                + f"\nkarne: {o['n']} işlem · kazanma %{o['kazanma_orani']} · "
-                  f"beklenti `{o['beklenti']:+.2f}`/işlem")
+                + f"\nkarne (yeni plan): {o['n']} işlem · kazanma %{o['kazanma_orani']} · "
+                  f"beklenti `{o['beklenti']:+.2f}`/işlem" + arsiv)
 
     def _durum(self) -> str:
         simdi = datetime.now(timezone.utc).strftime("%d.%m %H:%M UTC")

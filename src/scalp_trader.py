@@ -483,7 +483,11 @@ class ScalpTrader:
         kapanis = float(son["close"])
         ust, alt = son.get("donchian_high"), son.get("donchian_low")
         yon = None
-        if ust is not None and ust == ust and kapanis > float(ust):
+        # Yön kapıları: 2026-10-05 taramasında iki yarıda da artı kalan tek
+        # varyant YALNIZ-SHORT çıktı (long tarafı 1.8 yılda −0.059R sürükleme).
+        # Varsayılan long kapalı; gerekçe ve geri açma yolu config'de.
+        if (self.cfg.scalp_allow_long and ust is not None and ust == ust
+                and kapanis > float(ust)):
             yon = "LONG"
         elif (self.cfg.scalp_allow_short and alt is not None and alt == alt
               and kapanis < float(alt)):

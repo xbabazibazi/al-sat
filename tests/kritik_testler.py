@@ -2257,13 +2257,44 @@ def test_scalp_kanali():
         "pozisyon bazlı ödeme oranı daha yüksek olmalıydı")
     ok("kayıt bazlı sayım kazanma oranını şişirip ödemeyi düşürüyor [kanıt]")
 
-    with patch.object(panel_mod := __import__("src.panel", fromlist=["x"]),
-                      "scalp_state", s8):
+    panel_mod = __import__("src.panel", fromlist=["x"])
+    # Fikstür girişleri 2026-10-02; rejim sınırını öncesine alırsak İKİSİ de
+    # "yeni plan" sayılır — pozisyon bazlı sayım testi bunu bekliyor.
+    cfg_eski_sinir = replace(CONFIG, scalp_rejim_baslangic="2026-10-01T00:00:00+00:00")
+    with patch.object(panel_mod, "scalp_state", s8), \
+         patch.object(panel_mod, "CONFIG", cfg_eski_sinir):
         ds = panel_mod.build_scalp_state()
         assert ds["performans"]["n"] == 2, (
             f"panel karnesi hâlâ kayıt bazlı: n={ds['performans']['n']}")
         assert ds["kayit_sayisi"] == 3, "kapanış kaydı sayısı gizlenmiş"
     ok("panel karnesi pozisyon bazlı, kayıt sayısı da ayrıca gösteriliyor")
+
+    # --- REJİM AYRIMI: ölü planların faturası yeni plana kesilmez.
+    # 2026-10-05: üç rejimin zararı tek karnede toplanıyordu ve kullanıcı
+    # haklı olarak "sürekli zarar" okudu — oysa yürürlükteki planın kapanmış
+    # işlemi SIFIRDI. Arşiv ayrı gösterilir, toplam korunur.
+    cfg_ara_sinir = replace(CONFIG, scalp_rejim_baslangic="2026-10-02T06:15:00+00:00")
+    yeni_p, eski_p = s8.pnl_pozisyon_bazli_rejimli("2026-10-02T06:15:00+00:00")
+    # Fikstür: BTC girişi ~06:00 öncesi değil — giriş zamanına göre böl
+    assert len(yeni_p) + len(eski_p) == 2
+    assert abs(sum(yeni_p) + sum(eski_p) - 60.0) < 1e-9, "toplam K/Z korunmadı"
+    with patch.object(panel_mod, "scalp_state", s8), \
+         patch.object(panel_mod, "CONFIG", cfg_ara_sinir):
+        ds = panel_mod.build_scalp_state()
+        assert ds["performans"]["n"] == len(yeni_p)
+        assert ds["eski_rejim"]["n"] == len(eski_p)
+        assert abs(ds["eski_rejim"]["toplam"] - round(sum(eski_p), 2)) < 1e-6
+    assert 'd.eski_rejim' in panel_mod.PAGE, "arşiv satırı panelde çizilmiyor"
+    ok("karne rejim ayrımlı: eski planların zararı arşivde, toplam korunuyor")
+
+    # --- YÖN KAPISI: yeni plan YALNIZ-SHORT (tarama: long 1.8 yılda −0.059R
+    # sürükleme; iki yarıda da artı kalan tek varyant short'tu).
+    assert CONFIG.scalp_allow_long is False, (
+        "scalp_allow_long varsayılanı açılmış — tarama gerekçesi config'de")
+    kaynak_sc = Path("src/scalp_trader.py").read_text(encoding="utf-8")
+    assert "self.cfg.scalp_allow_long and ust" in kaynak_sc, (
+        "LONG girişi scalp_allow_long kapısına bağlı değil")
+    ok("yeni plan yalnız-short: LONG girişler kapıya bağlı, tek satırla geri açılır")
 
     # --- PANEL sözleşmesi ve sekme kimlikleri
     from src import panel
@@ -2327,8 +2358,9 @@ def test_scalp_kanali():
     ok("/kapat listesi scalp'i önekli, ana kanalı öneksiz gösteriyor")
 
     d2 = tk._isle("/durum")
-    assert "SCALP" in d2 and "şimdi stop olursa" in d2, d2[:400]
-    ok("/durum scalp bloğunu ve 'şimdi stop olursa' tutarını içeriyor")
+    assert "GENİŞ" in d2 and "şimdi stop olursa" in d2, d2[:400]
+    assert "karne (yeni plan)" in d2, "rejim ayrımlı karne /durum'da yok"
+    ok("/durum geniş kanal bloğunu rejim ayrımlı karneyle içeriyor")
 
 
 def main() -> int:
